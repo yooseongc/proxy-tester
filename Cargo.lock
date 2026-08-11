@@ -1676,6 +1676,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "proxy-tester-capture",
  "proxy-tester-domain",
  "proxy-tester-proto",
  "rand 0.9.5",

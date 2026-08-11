@@ -13,7 +13,7 @@ use chrono::Utc;
 use clap::Parser;
 use futures::{Stream, StreamExt};
 use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
-use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Scenario};
+use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Protocol, Scenario};
 use proxy_tester_proto::v1::{
     AgentMessage, ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
@@ -558,6 +558,13 @@ async fn start_run(
         .filter(|payload| payload.kind == PayloadKind::File)
         .filter_map(|payload| payload.artifact_id)
         .collect();
+    let mut artifact_ids = artifact_ids;
+    if let Some(capture_id) = sc
+        .capture_artifact_id
+        .filter(|_| sc.payload_mode == PayloadMode::CaptureReplay)
+    {
+        artifact_ids.insert(capture_id);
+    }
     let mut active = s.active_run.lock().await;
     if active.is_some() {
         return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
@@ -683,6 +690,11 @@ async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Resu
     if scenario.payload_mode != PayloadMode::CaptureReplay {
         return Ok(());
     }
+    if scenario.protocol != Protocol::Tcp {
+        return Err(ApiError::bad(
+            "HTTP capture replay will be enabled in milestone M4",
+        ));
+    }
     let id = scenario
         .capture_artifact_id
         .ok_or_else(|| ApiError::bad("capture replay requires capture_artifact_id"))?;
@@ -705,9 +717,7 @@ async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Resu
             "capture has no supported bidirectional plaintext TCP flows",
         ));
     }
-    Err(ApiError::bad(
-        "capture replay execution will be enabled in milestone M3",
-    ))
+    Ok(())
 }
 
 async fn send_artifacts(
@@ -724,15 +734,20 @@ async fn send_artifacts(
                 ApiError::bad(format!("payload artifact {artifact_id} does not exist"))
             })?;
         let kind: String = row.get("kind");
-        if kind != "payload" {
+        if kind != "payload" && kind != "pcap" {
             return Err(ApiError::bad(format!(
-                "artifact {artifact_id} is not a payload artifact"
+                "artifact {artifact_id} has unsupported kind {kind}"
             )));
         }
         let total_size = row.get::<i64, _>("size_bytes") as u64;
-        if total_size > 64 * 1024 * 1024 {
+        let limit = if kind == "pcap" {
+            512 * 1024 * 1024
+        } else {
+            64 * 1024 * 1024
+        };
+        if total_size > limit {
             return Err(ApiError::bad(format!(
-                "payload artifact {artifact_id} exceeds 64 MiB"
+                "{kind} artifact {artifact_id} exceeds its size limit"
             )));
         }
         let sha256: String = row.get("sha256");
@@ -759,6 +774,7 @@ async fn send_artifacts(
                         total_size,
                         sha256: sha256.clone(),
                         eof,
+                        artifact_kind: kind.clone(),
                     })),
                 }))
                 .await

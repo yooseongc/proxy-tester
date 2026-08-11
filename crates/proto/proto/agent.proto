@@ -22,5 +22,6 @@ message ArtifactChunk {
   uint64 total_size = 4;
   string sha256 = 5;
   bool eof = 6;
+  string artifact_kind = 7;
 }
 message ControlMessage { oneof body { PrepareRun prepare = 1; StartRun start = 2; StopRun stop = 3; SetPaused set_paused = 4; ArtifactChunk artifact_chunk = 5; } }
