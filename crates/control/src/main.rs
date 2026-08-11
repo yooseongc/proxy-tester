@@ -2,7 +2,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Multipart, Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Multipart, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
             ServeDir::new(&static_dir)
                 .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
         )
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(513 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -212,6 +212,9 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     // SQLite has no portable ADD COLUMN IF NOT EXISTS; duplicate-column errors
     // are expected for databases that already contain this migration.
     let _ = sqlx::query("ALTER TABLE runs ADD COLUMN run_name TEXT")
+        .execute(db)
+        .await;
+    let _ = sqlx::query("ALTER TABLE artifacts ADD COLUMN kind TEXT NOT NULL DEFAULT 'pcap'")
         .execute(db)
         .await;
     Ok(())
@@ -289,8 +292,14 @@ async fn preflight(
     ))
 }
 
+#[derive(Deserialize)]
+struct ArtifactUpload {
+    kind: Option<String>,
+}
+
 async fn upload_artifact(
     State(s): State<AppState>,
+    Query(upload): Query<ArtifactUpload>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let mut name = "capture.pcap".to_string();
@@ -312,7 +321,18 @@ async fn upload_artifact(
         }
     }
     let data = data.ok_or_else(|| ApiError::bad("file field가 필요합니다"))?;
-    let analysis = analyze_capture(&data)?;
+    let kind = upload.kind.as_deref().unwrap_or("pcap");
+    let (limit, analysis) = match kind {
+        "payload" => (64 * 1024 * 1024, ("raw".into(), 0, data.len() as u64)),
+        "pcap" => (512 * 1024 * 1024, analyze_capture(&data)?),
+        _ => return Err(ApiError::bad("kind must be payload or pcap")),
+    };
+    if data.len() > limit {
+        return Err(ApiError::bad(format!(
+            "{kind} artifact exceeds {} MiB",
+            limit / 1024 / 1024
+        )));
+    }
     let sha = format!("{:x}", Sha256::digest(&data));
     let id = Uuid::new_v4();
     let path = s.artifact_dir.join(&sha);
@@ -321,12 +341,28 @@ async fn upload_artifact(
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
-    sqlx::query("INSERT INTO artifacts(id,name,sha256,size_bytes,format,packet_count,captured_bytes,path,created_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(sha256) DO NOTHING")
-        .bind(id.to_string()).bind(&name).bind(&sha).bind(data.len() as i64).bind(&analysis.0).bind(analysis.1 as i64).bind(analysis.2 as i64).bind(path.to_string_lossy().to_string()).bind(Utc::now().to_rfc3339()).execute(&s.db).await?;
+    let inserted = sqlx::query("INSERT INTO artifacts(id,name,sha256,size_bytes,format,packet_count,captured_bytes,path,created_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sha256) DO NOTHING")
+        .bind(id.to_string()).bind(&name).bind(&sha).bind(data.len() as i64).bind(&analysis.0).bind(analysis.1 as i64).bind(analysis.2 as i64).bind(path.to_string_lossy().to_string()).bind(Utc::now().to_rfc3339()).bind(kind).execute(&s.db).await?;
+    let id = if inserted.rows_affected() == 0 {
+        let existing = sqlx::query("SELECT id,kind FROM artifacts WHERE sha256=?")
+            .bind(&sha)
+            .fetch_one(&s.db)
+            .await?;
+        let existing_kind: String = existing.get("kind");
+        if existing_kind != kind {
+            return Err(ApiError::conflict(
+                "identical bytes already exist under a different artifact kind",
+            ));
+        }
+        Uuid::parse_str(existing.get::<String, _>("id").as_str())
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        id
+    };
     Ok((
         StatusCode::CREATED,
         Json(
-            serde_json::json!({"id":id,"name":name,"sha256":sha,"size_bytes":data.len(),"format":analysis.0,"packet_count":analysis.1,"captured_bytes":analysis.2,"status":"validated"}),
+            serde_json::json!({"id":id,"kind":kind,"name":name,"sha256":sha,"size_bytes":data.len(),"format":analysis.0,"packet_count":analysis.1,"captured_bytes":analysis.2,"status":"validated"}),
         ),
     ))
 }
@@ -334,8 +370,8 @@ async fn upload_artifact(
 async fn list_artifacts(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let rows = sqlx::query("SELECT id,name,sha256,size_bytes,format,packet_count,captured_bytes,created_at FROM artifacts ORDER BY created_at DESC").fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r| serde_json::json!({"id":r.get::<String,_>("id"),"name":r.get::<String,_>("name"),"sha256":r.get::<String,_>("sha256"),"size_bytes":r.get::<i64,_>("size_bytes"),"format":r.get::<String,_>("format"),"packet_count":r.get::<i64,_>("packet_count"),"captured_bytes":r.get::<i64,_>("captured_bytes"),"created_at":r.get::<String,_>("created_at")})).collect()))
+    let rows = sqlx::query("SELECT id,kind,name,sha256,size_bytes,format,packet_count,captured_bytes,created_at FROM artifacts ORDER BY created_at DESC").fetch_all(&s.db).await?;
+    Ok(Json(rows.into_iter().map(|r| serde_json::json!({"id":r.get::<String,_>("id"),"kind":r.get::<String,_>("kind"),"name":r.get::<String,_>("name"),"sha256":r.get::<String,_>("sha256"),"size_bytes":r.get::<i64,_>("size_bytes"),"format":r.get::<String,_>("format"),"packet_count":r.get::<i64,_>("packet_count"),"captured_bytes":r.get::<i64,_>("captured_bytes"),"created_at":r.get::<String,_>("created_at")})).collect()))
 }
 
 fn analyze_capture(data: &[u8]) -> Result<(String, u64, u64), ApiError> {

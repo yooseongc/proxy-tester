@@ -59,7 +59,7 @@ npm run test:e2e
 - `GET|POST /api/scenarios`
 - `GET|POST /api/runs`, `POST /api/runs/{id}/pause|resume|stop`
 - `GET /api/runs/{id}`
-- `GET|POST /api/artifacts` (`multipart/form-data`의 `file` 필드)
+- `GET|POST /api/artifacts?kind=payload|pcap` (`multipart/form-data`의 `file` 필드, 각각 최대 64 MiB/512 MiB)
 - `GET /api/events/ws`
 
 PCAP/PCAPNG 업로드는 형식, record 완결성, packet/byte 수와 SHA-256을 검증·저장합니다. 현재 자동 실행 엔진은 합성 TCP/HTTP/CONNECT workload를 사용합니다.
