@@ -16,7 +16,7 @@ def tcp_packet(src, dst, sport, dport, seq, ack, flags="PA", payload=b"", ipv6=F
 
 def main():
     OUT.mkdir(exist_ok=True)
-    request = b"POST /scan HTTP/1.1\r\nHost: dlp.test\r\nContent-Length: 9\r\n\r\nDLP-SECRET"
+    request = b"POST /scan HTTP/1.1\r\nHost: dlp.test\r\nContent-Length: 10\r\n\r\nDLP-SECRET"
     response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
     packets = [
         # Intentionally out of order; the parser must order by TCP sequence.
@@ -38,6 +38,22 @@ def main():
     for packet in packets:
         writer.write(packet)
     writer.close()
+
+    request_one = b"POST /first?source=pcap HTTP/1.1\r\nHost: captured.test\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nalpha"
+    response_one = b"HTTP/1.1 201 Created\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nbeta"
+    request_two = b"GET /second HTTP/1.1\r\nHost: captured.test\r\nConnection: close\r\n\r\n"
+    response_two = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\ngamma\r\n0\r\n\r\n"
+    client_seq = 1001
+    server_seq = 9001
+    http_packets = []
+    for request_message, response_message in ((request_one, response_one), (request_two, response_two)):
+        http_packets.append(tcp_packet("203.0.113.10", "203.0.113.20", 43000, 8080, client_seq, server_seq, payload=request_message))
+        client_seq += len(request_message)
+        http_packets.append(tcp_packet("203.0.113.20", "203.0.113.10", 8080, 43000, server_seq, client_seq, payload=response_message))
+        server_seq += len(response_message)
+    for index, packet in enumerate(http_packets):
+        packet.time = 1_700_000_100 + index / 1_000
+    wrpcap(str(OUT / "http_transactions.pcap"), http_packets)
 
 
 if __name__ == "__main__":

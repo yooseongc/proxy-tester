@@ -20,6 +20,13 @@ pub struct ReassembledFlow {
     pub server_to_client: Vec<u8>,
     pub retransmitted_bytes: u64,
     pub turns: Vec<ReplayTurn>,
+    pub http_transactions: Vec<HttpTransaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpTransaction {
+    pub request: Vec<u8>,
+    pub response: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,13 +162,173 @@ fn finish_analysis(
             analysis.exclusions.encrypted_tls_flows += 1;
             continue;
         }
+        let http_transactions =
+            extract_http_transactions(&client_to_server, &server_to_client).unwrap_or_default();
         analysis.flows.push(ReassembledFlow {
             key,
             client_to_server,
             server_to_client,
             retransmitted_bytes: parts.duplicate_bytes + client_dup + server_dup,
             turns: build_turns(parts.events),
+            http_transactions,
         });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMessageKind {
+    Request,
+    Response,
+}
+
+pub fn extract_http_transactions(
+    client_to_server: &[u8],
+    server_to_client: &[u8],
+) -> Option<Vec<HttpTransaction>> {
+    let requests = split_http_messages(client_to_server, HttpMessageKind::Request)?;
+    let responses = split_http_messages(server_to_client, HttpMessageKind::Response)?;
+    if requests.is_empty() || requests.len() != responses.len() {
+        return None;
+    }
+    Some(
+        requests
+            .into_iter()
+            .zip(responses)
+            .map(|(request, response)| HttpTransaction { request, response })
+            .collect(),
+    )
+}
+
+fn split_http_messages(stream: &[u8], kind: HttpMessageKind) -> Option<Vec<Vec<u8>>> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset < stream.len() {
+        let header_relative = stream[offset..]
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")?;
+        let header_end = offset + header_relative + 4;
+        let headers = &stream[offset..header_end];
+        let first_line_end = headers.windows(2).position(|part| part == b"\r\n")?;
+        let first_line = &headers[..first_line_end];
+        match kind {
+            HttpMessageKind::Request if !valid_request_line(first_line) => return None,
+            HttpMessageKind::Response if !valid_status_line(first_line) => return None,
+            _ => {}
+        }
+        if header_value(headers, b"upgrade").is_some()
+            || header_tokens(headers, b"connection")
+                .any(|token| token.eq_ignore_ascii_case(b"upgrade"))
+        {
+            return None;
+        }
+        let message_end = if header_tokens(headers, b"transfer-encoding")
+            .any(|token| token.eq_ignore_ascii_case(b"chunked"))
+        {
+            chunked_end(stream, header_end)?
+        } else if let Some(value) = header_value(headers, b"content-length") {
+            let length = std::str::from_utf8(trim_ascii(value))
+                .ok()?
+                .parse::<usize>()
+                .ok()?;
+            header_end
+                .checked_add(length)
+                .filter(|end| *end <= stream.len())?
+        } else if response_has_no_body(first_line) || kind == HttpMessageKind::Request {
+            header_end
+        } else {
+            return None;
+        };
+        messages.push(stream[offset..message_end].to_vec());
+        offset = message_end;
+    }
+    Some(messages)
+}
+
+fn valid_request_line(line: &[u8]) -> bool {
+    let mut fields = line.split(|byte| *byte == b' ');
+    let method = fields.next().unwrap_or_default();
+    let target = fields.next().unwrap_or_default();
+    let version = fields.next().unwrap_or_default();
+    !method.is_empty()
+        && method
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || *byte == b'-')
+        && !target.is_empty()
+        && version == b"HTTP/1.1"
+        && fields.next().is_none()
+}
+
+fn valid_status_line(line: &[u8]) -> bool {
+    line.starts_with(b"HTTP/1.1 ")
+        && line
+            .get(9..12)
+            .is_some_and(|status| status.iter().all(u8::is_ascii_digit))
+}
+
+fn response_has_no_body(line: &[u8]) -> bool {
+    let status = line
+        .get(9..12)
+        .and_then(|status| std::str::from_utf8(status).ok())
+        .and_then(|status| status.parse::<u16>().ok());
+    matches!(status, Some(100..=199 | 204 | 304))
+}
+
+fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    headers
+        .split(|byte| *byte == b'\n')
+        .skip(1)
+        .find_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let colon = line.iter().position(|byte| *byte == b':')?;
+            line[..colon]
+                .eq_ignore_ascii_case(name)
+                .then(|| trim_ascii(&line[colon + 1..]))
+        })
+}
+
+fn header_tokens<'a>(headers: &'a [u8], name: &'a [u8]) -> impl Iterator<Item = &'a [u8]> {
+    header_value(headers, name)
+        .into_iter()
+        .flat_map(|value| value.split(|byte| *byte == b',').map(trim_ascii))
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn chunked_end(stream: &[u8], mut offset: usize) -> Option<usize> {
+    loop {
+        let line_relative = stream[offset..]
+            .windows(2)
+            .position(|part| part == b"\r\n")?;
+        let line_end = offset + line_relative;
+        let size_field = stream[offset..line_end]
+            .split(|byte| *byte == b';')
+            .next()?;
+        let size =
+            usize::from_str_radix(std::str::from_utf8(trim_ascii(size_field)).ok()?, 16).ok()?;
+        offset = line_end + 2;
+        if size == 0 {
+            let trailers_relative = stream[offset..]
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n");
+            return if stream.get(offset..offset + 2) == Some(b"\r\n") {
+                Some(offset + 2)
+            } else {
+                trailers_relative.map(|relative| offset + relative + 4)
+            };
+        }
+        offset = offset.checked_add(size)?;
+        if stream.get(offset..offset + 2) != Some(b"\r\n") {
+            return None;
+        }
+        offset += 2;
     }
 }
 
@@ -451,8 +618,9 @@ mod tests {
         );
         assert_eq!(
             analysis.flows[0].client_to_server,
-            b"POST /scan HTTP/1.1\r\nHost: dlp.test\r\nContent-Length: 9\r\n\r\nDLP-SECRET"
+            b"POST /scan HTTP/1.1\r\nHost: dlp.test\r\nContent-Length: 10\r\n\r\nDLP-SECRET"
         );
+        assert_eq!(analysis.flows[0].http_transactions.len(), 1);
         assert_eq!(
             analysis.flows[0].server_to_client,
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
@@ -477,6 +645,26 @@ mod tests {
     }
 
     #[test]
+    fn scapy_http_fixture_extracts_message_transactions() {
+        let analysis = analyze_pcap(include_bytes!(
+            "../../../tests/pcap/fixtures/http_transactions.pcap"
+        ))
+        .unwrap();
+        assert_eq!(analysis.flows.len(), 1);
+        assert_eq!(analysis.flows[0].http_transactions.len(), 2);
+        assert!(
+            analysis.flows[0].http_transactions[0]
+                .request
+                .ends_with(b"alpha")
+        );
+        assert!(
+            analysis.flows[0].http_transactions[1]
+                .response
+                .ends_with(b"0\r\n\r\n")
+        );
+    }
+
+    #[test]
     fn recognizes_tls_record_payloads() {
         assert!(looks_like_tls(&[0x16, 0x03, 0x03, 0, 4, 1, 2, 3, 4]));
         assert!(!looks_like_tls(b"GET / HTTP/1.1\r\n"));
@@ -489,5 +677,47 @@ mod tests {
         assert_eq!(payload, b"abcd");
         assert_eq!(duplicate, 0);
         assert!(gap);
+    }
+
+    #[test]
+    fn extracts_content_length_and_chunked_keep_alive_transactions() {
+        let requests = b"POST /one HTTP/1.1\r\nHost: old.test\r\nContent-Length: 3\r\n\r\noneGET /two HTTP/1.1\r\nHost: old.test\r\n\r\n";
+        let responses = b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\ntwoHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nend\r\n0\r\n\r\n";
+        let transactions = extract_http_transactions(requests, responses).unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(
+            transactions[0].request,
+            b"POST /one HTTP/1.1\r\nHost: old.test\r\nContent-Length: 3\r\n\r\none"
+        );
+        assert_eq!(
+            transactions[0].response,
+            b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\ntwo"
+        );
+        assert_eq!(
+            transactions[1].request,
+            b"GET /two HTTP/1.1\r\nHost: old.test\r\n\r\n"
+        );
+        assert_eq!(
+            transactions[1].response,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nend\r\n0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn rejects_upgrade_and_close_delimited_http_flows() {
+        assert!(
+            extract_http_transactions(
+                b"GET /chat HTTP/1.1\r\nHost: old.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            )
+            .is_none()
+        );
+        assert!(
+            extract_http_transactions(
+                b"GET / HTTP/1.1\r\nHost: old.test\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody"
+            )
+            .is_none()
+        );
     }
 }
