@@ -6,6 +6,6 @@ Scenario v2는 장비 유형 대신 생성할 트래픽을 중심으로 구성�
 
 기존 version 1 JSON은 control plane과 agent에서 자동으로 version 2로 승격한다. HTTP의 `request_body_bytes`/`response_body_bytes`, TCP의 `tx_bytes`/`rx_bytes`는 각각 v2 fixed payload로 변환된다. 저장된 구성과 기존 Run JSON을 읽을 때에도 같은 변환을 적용한다.
 
-현재 PCAP 업로드는 형식과 packet record 무결성 분석까지만 제공한다. TCP flow 재조립 및 gRPC artifact 전송은 아직 실행 경로에 연결되지 않았으므로 `capture_replay`는 validation에서 명시적으로 차단된다. file payload도 artifact ID validation은 수행하지만 agent 전송이 구현되기 전까지 PrepareRun에서 실패한다. 지원되지 않는 구성을 조용히 zero-fill로 실행하지 않기 위한 동작이다.
+현재 PCAP 업로드는 형식과 packet record 무결성 분석까지만 제공하므로 `capture_replay`는 validation에서 명시적으로 차단된다. file payload는 payload artifact를 256 KiB gRPC chunk로 양쪽 Agent에 전송하며, Agent가 offset·전체 크기·SHA-256을 검증한 뒤 공유 buffer로 준비한다. 지원되지 않거나 손상된 구성을 조용히 zero-fill로 실행하지 않는다.
 
 빌드 환경에는 시스템 `protoc`가 없어도 되도록 vendored protoc를 사용한다.

@@ -255,6 +255,9 @@ fn accept_artifact_chunk(
     chunk: proxy_tester_proto::v1::ArtifactChunk,
 ) -> anyhow::Result<()> {
     let id = Uuid::parse_str(&chunk.artifact_id)?;
+    if chunk.total_size > proxy_tester_domain::MAX_PAYLOAD_BYTES as u64 {
+        bail!("artifact {id} exceeds the 64 MiB agent limit");
+    }
     if completed.contains_key(&id) {
         bail!("artifact {id} was transferred more than once");
     }
