@@ -1,0 +1,37 @@
+services:
+  control:
+    image: ${PROXY_TESTER_CONTROL_IMAGE:-proxy-tester-control:local}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: sqlite:///data/proxy-tester.db?mode=rwc
+      PROXY_TESTER_STATIC_DIR: /frontend/dist
+      PROXY_TESTER_ARTIFACT_DIR: /data/artifacts
+      RUST_LOG: proxy_control=info
+    ports:
+      - "${PROXY_TESTER_PORT:-18080}:8080"
+      - "${PROXY_TESTER_GRPC_PORT:-50051}:50051"
+    volumes:
+      - proxy-data:/data
+
+  client:
+    image: ${PROXY_TESTER_AGENT_IMAGE:-proxy-tester-agent:local}
+    restart: unless-stopped
+    environment:
+      PROXY_TESTER_CONTROL: http://control:50051
+      PROXY_TESTER_AGENT_ID: client-1
+      PROXY_TESTER_ROLE: client
+      RUST_LOG: proxy_agent=info
+    depends_on: [control]
+
+  server:
+    image: ${PROXY_TESTER_AGENT_IMAGE:-proxy-tester-agent:local}
+    restart: unless-stopped
+    environment:
+      PROXY_TESTER_CONTROL: http://control:50051
+      PROXY_TESTER_AGENT_ID: server-1
+      PROXY_TESTER_ROLE: server
+      RUST_LOG: proxy_agent=info
+    depends_on: [control]
+
+volumes:
+  proxy-data: {}

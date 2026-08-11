@@ -1,0 +1,16 @@
+[Unit]
+Description=Proxy Tester traffic agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/proxy-tester/agent.env
+ExecStart=/usr/local/bin/proxy-agent
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

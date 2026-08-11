@@ -1,0 +1,24 @@
+services:
+  control:
+    build: {context: ., target: control}
+    environment:
+      DATABASE_URL: sqlite:///data/proxy-tester.db?mode=rwc
+      PROXY_TESTER_STATIC_DIR: /frontend/dist
+    ports: ["${PROXY_TESTER_PORT:-18080}:8080"]
+    volumes: [proxy-data:/data]
+  client:
+    build: {context: ., target: client}
+    environment:
+      PROXY_TESTER_CONTROL: http://control:50051
+      PROXY_TESTER_AGENT_ID: client-1
+    depends_on: [control]
+  server:
+    build: {context: ., target: server}
+    environment:
+      PROXY_TESTER_CONTROL: http://control:50051
+      PROXY_TESTER_AGENT_ID: server-1
+    depends_on: [control]
+  proxy:
+    build: {context: tests/fixture-proxy}
+    depends_on: [server]
+volumes: {proxy-data: {}}

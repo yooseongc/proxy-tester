@@ -1,0 +1,25 @@
+[package]
+name = "proxy-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+proxy-tester-domain = { path = "../domain" }
+proxy-tester-proto = { path = "../proto" }
+rand = "0.9"
+sha2.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
