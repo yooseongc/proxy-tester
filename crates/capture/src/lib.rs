@@ -145,9 +145,9 @@ fn finish_analysis(
 ) {
     for key in flow_order {
         let parts = segments.remove(&key).unwrap_or_default();
-        let (client_to_server, client_dup) = reassemble(parts.client);
-        let (server_to_client, server_dup) = reassemble(parts.server);
-        if client_to_server.is_empty() || server_to_client.is_empty() {
+        let (client_to_server, client_dup, client_gap) = reassemble(parts.client);
+        let (server_to_client, server_dup, server_gap) = reassemble(parts.server);
+        if client_to_server.is_empty() || server_to_client.is_empty() || client_gap || server_gap {
             analysis.exclusions.incomplete_flows += 1;
             continue;
         }
@@ -334,8 +334,8 @@ fn build_turns(events: Vec<(Direction, u32, Vec<u8>)>) -> Vec<ReplayTurn> {
     groups
         .into_iter()
         .filter_map(|(direction, segments)| {
-            let (payload, _) = reassemble(segments);
-            (!payload.is_empty()).then_some(ReplayTurn { direction, payload })
+            let (payload, _, gap) = reassemble(segments);
+            (!payload.is_empty() && !gap).then_some(ReplayTurn { direction, payload })
         })
         .collect()
 }
@@ -405,15 +405,17 @@ fn parse_tcp<'a>(
     ))
 }
 
-fn reassemble(segments: BTreeMap<u32, Vec<u8>>) -> (Vec<u8>, u64) {
+fn reassemble(segments: BTreeMap<u32, Vec<u8>>) -> (Vec<u8>, u64, bool) {
     let mut output = Vec::new();
     let Some(first) = segments.keys().next().copied() else {
-        return (output, 0);
+        return (output, 0, false);
     };
     let mut next = first;
     let mut duplicate = 0;
+    let mut gap = false;
     for (sequence, payload) in segments {
         if sequence > next {
+            gap = true;
             next = sequence;
         }
         let overlap = next.saturating_sub(sequence) as usize;
@@ -423,7 +425,7 @@ fn reassemble(segments: BTreeMap<u32, Vec<u8>>) -> (Vec<u8>, u64) {
             next = sequence.wrapping_add(payload.len() as u32);
         }
     }
-    (output, duplicate)
+    (output, duplicate, gap)
 }
 
 #[cfg(test)]
@@ -478,5 +480,14 @@ mod tests {
     fn recognizes_tls_record_payloads() {
         assert!(looks_like_tls(&[0x16, 0x03, 0x03, 0, 4, 1, 2, 3, 4]));
         assert!(!looks_like_tls(b"GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn sequence_gaps_are_marked_incomplete() {
+        let segments = BTreeMap::from([(10, b"ab".to_vec()), (20, b"cd".to_vec())]);
+        let (payload, duplicate, gap) = reassemble(segments);
+        assert_eq!(payload, b"abcd");
+        assert_eq!(duplicate, 0);
+        assert!(gap);
     }
 }
