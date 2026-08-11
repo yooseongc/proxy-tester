@@ -247,7 +247,7 @@ struct PreparedPayloads {
     response: Arc<[u8]>,
 }
 impl PreparedPayloads {
-    fn new(sc: &Scenario, artifacts: &HashMap<Uuid, Arc<[u8]>>) -> anyhow::Result<Self> {
+    fn new(sc: &Scenario, artifacts: &HashMap<Uuid, CompletedArtifact>) -> anyhow::Result<Self> {
         Ok(Self {
             request: materialize(&sc.request_payload(), artifacts)?,
             response: materialize(&sc.response_payload(), artifacts)?,
@@ -256,7 +256,7 @@ impl PreparedPayloads {
 }
 fn materialize(
     profile: &PayloadProfile,
-    artifacts: &HashMap<Uuid, Arc<[u8]>>,
+    artifacts: &HashMap<Uuid, CompletedArtifact>,
 ) -> anyhow::Result<Arc<[u8]>> {
     let bytes = match profile.kind {
         PayloadKind::Empty => Vec::new(),
@@ -276,7 +276,10 @@ fn materialize(
             let id = profile.artifact_id.context("file payload artifact ID")?;
             return artifacts
                 .get(&id)
-                .cloned()
+                .and_then(|artifact| match artifact {
+                    CompletedArtifact::Payload(bytes) => Some(bytes.clone()),
+                    _ => None,
+                })
                 .with_context(|| format!("artifact {id} was not transferred"));
         }
     };
@@ -284,17 +287,24 @@ fn materialize(
     Ok(bytes.into())
 }
 
-#[derive(Default)]
 struct IncomingArtifact {
-    data: Vec<u8>,
+    path: std::path::PathBuf,
+    file: tokio::fs::File,
+    received: u64,
+    digest: Sha256,
     total_size: u64,
     sha256: String,
     kind: String,
 }
 
-fn accept_artifact_chunk(
+enum CompletedArtifact {
+    Payload(Arc<[u8]>),
+    Capture(std::path::PathBuf),
+}
+
+async fn accept_artifact_chunk(
     incoming: &mut HashMap<Uuid, IncomingArtifact>,
-    completed: &mut HashMap<Uuid, Arc<[u8]>>,
+    completed: &mut HashMap<Uuid, CompletedArtifact>,
     chunk: proxy_tester_proto::v1::ArtifactChunk,
 ) -> anyhow::Result<()> {
     let id = Uuid::parse_str(&chunk.artifact_id)?;
@@ -309,35 +319,64 @@ fn accept_artifact_chunk(
     if completed.contains_key(&id) {
         bail!("artifact {id} was transferred more than once");
     }
-    let state = incoming.entry(id).or_insert_with(|| IncomingArtifact {
-        data: Vec::with_capacity(chunk.total_size.min(64 * 1024 * 1024) as usize),
-        total_size: chunk.total_size,
-        sha256: chunk.sha256.clone(),
-        kind: chunk.artifact_kind.clone(),
-    });
+    if !incoming.contains_key(&id) && chunk.offset != 0 {
+        bail!("artifact {id} first chunk offset must be zero");
+    }
+    if !incoming.contains_key(&id) {
+        let path = std::env::temp_dir().join(format!("proxy-tester-{id}.artifact.part"));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("create temporary artifact {path:?}"))?;
+        incoming.insert(
+            id,
+            IncomingArtifact {
+                path,
+                file,
+                received: 0,
+                digest: Sha256::new(),
+                total_size: chunk.total_size,
+                sha256: chunk.sha256.clone(),
+                kind: chunk.artifact_kind.clone(),
+            },
+        );
+    }
+    let state = incoming.get_mut(&id).context("artifact transfer state")?;
     if state.total_size != chunk.total_size
         || state.sha256 != chunk.sha256
         || state.kind != chunk.artifact_kind
     {
         bail!("artifact {id} metadata changed during transfer");
     }
-    if chunk.offset != state.data.len() as u64 {
+    if chunk.offset != state.received {
         bail!("artifact {id} chunk offset mismatch");
     }
-    if state.data.len().saturating_add(chunk.data.len()) as u64 > state.total_size {
+    if state.received.saturating_add(chunk.data.len() as u64) > state.total_size {
         bail!("artifact {id} exceeds declared size");
     }
-    state.data.extend_from_slice(&chunk.data);
+    state.file.write_all(&chunk.data).await?;
+    state.digest.update(&chunk.data);
+    state.received += chunk.data.len() as u64;
     if chunk.eof {
-        if state.data.len() as u64 != state.total_size {
+        if state.received != state.total_size {
             bail!("artifact {id} ended before declared size");
         }
-        let actual = format!("{:x}", Sha256::digest(&state.data));
-        if actual != state.sha256 {
+        state.file.flush().await?;
+        let finished = incoming.remove(&id).context("artifact transfer state")?;
+        let actual = format!("{:x}", finished.digest.finalize());
+        if actual != finished.sha256 {
+            let _ = tokio::fs::remove_file(&finished.path).await;
             bail!("artifact {id} SHA-256 mismatch");
         }
-        let finished = incoming.remove(&id).context("artifact transfer state")?;
-        completed.insert(id, finished.data.into());
+        if finished.kind == "pcap" {
+            completed.insert(id, CompletedArtifact::Capture(finished.path));
+        } else {
+            let bytes = tokio::fs::read(&finished.path).await?;
+            tokio::fs::remove_file(&finished.path).await?;
+            completed.insert(id, CompletedArtifact::Payload(bytes.into()));
+        }
     }
     Ok(())
 }
@@ -498,10 +537,17 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                     let id = scenario
                         .capture_artifact_id
                         .context("capture artifact ID")?;
-                    let bytes = completed_artifacts
+                    let path = completed_artifacts
                         .get(&id)
+                        .and_then(|artifact| match artifact {
+                            CompletedArtifact::Capture(path) => Some(path),
+                            _ => None,
+                        })
                         .with_context(|| format!("capture artifact {id} was not transferred"))?;
-                    Some(Arc::new(ReplayPlan::from_capture(bytes)?))
+                    let bytes = tokio::fs::read(path).await?;
+                    let replay = ReplayPlan::from_capture(&bytes)?;
+                    tokio::fs::remove_file(path).await?;
+                    Some(Arc::new(replay))
                 } else {
                     None
                 };
@@ -515,7 +561,8 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                 info!(run=%p.run_id,"prepared");
             }
             Some(control_message::Body::ArtifactChunk(chunk)) => {
-                accept_artifact_chunk(&mut incoming_artifacts, &mut completed_artifacts, chunk)?;
+                accept_artifact_chunk(&mut incoming_artifacts, &mut completed_artifacts, chunk)
+                    .await?;
             }
             Some(control_message::Body::Start(s)) => {
                 let Some(job) = prepared.lock().await.clone() else {
@@ -1491,8 +1538,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn artifact_chunks_are_assembled_and_verified() {
+    #[tokio::test]
+    async fn artifact_chunks_are_assembled_and_verified() {
         let id = Uuid::new_v4();
         let bytes = b"request payload";
         let sha = format!("{:x}", Sha256::digest(bytes));
@@ -1503,18 +1550,23 @@ mod tests {
             &mut completed,
             chunk(id, 0, &bytes[..4], bytes.len() as u64, &sha, false),
         )
+        .await
         .unwrap();
         accept_artifact_chunk(
             &mut incoming,
             &mut completed,
             chunk(id, 4, &bytes[4..], bytes.len() as u64, &sha, true),
         )
+        .await
         .unwrap();
-        assert_eq!(completed[&id].as_ref(), bytes);
+        let CompletedArtifact::Payload(completed) = &completed[&id] else {
+            panic!("payload expected")
+        };
+        assert_eq!(completed.as_ref(), bytes);
     }
 
-    #[test]
-    fn artifact_chunk_rejects_bad_offset_and_digest() {
+    #[tokio::test]
+    async fn artifact_chunk_rejects_bad_offset_and_digest() {
         let id = Uuid::new_v4();
         let mut incoming = HashMap::new();
         let mut completed = HashMap::new();
@@ -1524,6 +1576,7 @@ mod tests {
                 &mut completed,
                 chunk(id, 1, b"x", 1, "bad", true)
             )
+            .await
             .is_err()
         );
         incoming.clear();
@@ -1533,8 +1586,28 @@ mod tests {
                 &mut completed,
                 chunk(id, 0, b"x", 1, "bad", true)
             )
+            .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn capture_artifact_stays_on_disk_until_prepare() {
+        let id = Uuid::new_v4();
+        let bytes = b"pcap bytes";
+        let sha = format!("{:x}", Sha256::digest(bytes));
+        let mut message = chunk(id, 0, bytes, bytes.len() as u64, &sha, true);
+        message.artifact_kind = "pcap".into();
+        let mut incoming = HashMap::new();
+        let mut completed = HashMap::new();
+        accept_artifact_chunk(&mut incoming, &mut completed, message)
+            .await
+            .unwrap();
+        let CompletedArtifact::Capture(path) = &completed[&id] else {
+            panic!("capture file expected")
+        };
+        assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[tokio::test]
