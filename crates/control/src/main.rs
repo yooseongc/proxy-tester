@@ -12,6 +12,7 @@ use axum::{
 use chrono::Utc;
 use clap::Parser;
 use futures::{Stream, StreamExt};
+use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
 use proxy_tester_domain::{MetricsSnapshot, PayloadKind, Scenario};
 use proxy_tester_proto::v1::{
     AgentMessage, ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
@@ -224,6 +225,9 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE artifacts ADD COLUMN kind TEXT NOT NULL DEFAULT 'pcap'")
         .execute(db)
         .await;
+    let _ = sqlx::query("ALTER TABLE artifacts ADD COLUMN analysis_json TEXT")
+        .execute(db)
+        .await;
     Ok(())
 }
 
@@ -362,13 +366,46 @@ async fn upload_artifact(
     }
     let data = data.ok_or_else(|| ApiError::bad("file field가 필요합니다"))?;
     let (temporary_path, size, sha) = data;
-    let analysis = match kind {
-        "payload" => ("raw".into(), 0, size),
+    let (analysis, analysis_json): ((String, u64, u64), serde_json::Value) = match kind {
+        "payload" => (
+            ("raw".into(), 0, size),
+            serde_json::json!({"supported_flow_count":0,"exclusions":{}}),
+        ),
         "pcap" => {
             let capture = tokio::fs::read(&temporary_path)
                 .await
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            analyze_capture(&capture)?
+            let (format, analyzed) = match analyze_tcp_capture(&capture) {
+                Ok(analyzed) => analyzed,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&temporary_path).await;
+                    return Err(ApiError::bad(error.to_string()));
+                }
+            };
+            let format = match format {
+                CaptureFormat::Pcap => "pcap",
+                CaptureFormat::PcapNg => "pcapng",
+            };
+            let summary = serde_json::json!({
+                "supported_flow_count": analyzed.flows.len(),
+                "retransmitted_bytes": analyzed.flows.iter().map(|flow|flow.retransmitted_bytes).sum::<u64>(),
+                "exclusions": {
+                    "non_tcp_packets": analyzed.exclusions.non_tcp_packets,
+                    "fragmented_packets": analyzed.exclusions.fragmented_packets,
+                    "truncated_packets": analyzed.exclusions.truncated_packets,
+                    "unsupported_link_packets": analyzed.exclusions.unsupported_link_packets,
+                    "incomplete_flows": analyzed.exclusions.incomplete_flows,
+                    "encrypted_tls_flows": analyzed.exclusions.encrypted_tls_flows,
+                }
+            });
+            (
+                (
+                    format.into(),
+                    analyzed.packet_count,
+                    analyzed.captured_bytes,
+                ),
+                summary,
+            )
         }
         _ => unreachable!(),
     };
@@ -383,8 +420,8 @@ async fn upload_artifact(
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
-    let inserted = sqlx::query("INSERT INTO artifacts(id,name,sha256,size_bytes,format,packet_count,captured_bytes,path,created_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sha256) DO NOTHING")
-        .bind(id.to_string()).bind(&name).bind(&sha).bind(size as i64).bind(&analysis.0).bind(analysis.1 as i64).bind(analysis.2 as i64).bind(path.to_string_lossy().to_string()).bind(Utc::now().to_rfc3339()).bind(kind).execute(&s.db).await?;
+    let inserted = sqlx::query("INSERT INTO artifacts(id,name,sha256,size_bytes,format,packet_count,captured_bytes,path,created_at,kind,analysis_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sha256) DO NOTHING")
+        .bind(id.to_string()).bind(&name).bind(&sha).bind(size as i64).bind(&analysis.0).bind(analysis.1 as i64).bind(analysis.2 as i64).bind(path.to_string_lossy().to_string()).bind(Utc::now().to_rfc3339()).bind(kind).bind(analysis_json.to_string()).execute(&s.db).await?;
     let id = if inserted.rows_affected() == 0 {
         let existing = sqlx::query("SELECT id,kind FROM artifacts WHERE sha256=?")
             .bind(&sha)
@@ -404,7 +441,7 @@ async fn upload_artifact(
     Ok((
         StatusCode::CREATED,
         Json(
-            serde_json::json!({"id":id,"kind":kind,"name":name,"sha256":sha,"size_bytes":size,"format":analysis.0,"packet_count":analysis.1,"captured_bytes":analysis.2,"status":"validated"}),
+            serde_json::json!({"id":id,"kind":kind,"name":name,"sha256":sha,"size_bytes":size,"format":analysis.0,"packet_count":analysis.1,"captured_bytes":analysis.2,"analysis":analysis_json,"status":"validated"}),
         ),
     ))
 }
@@ -412,10 +449,11 @@ async fn upload_artifact(
 async fn list_artifacts(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let rows = sqlx::query("SELECT id,kind,name,sha256,size_bytes,format,packet_count,captured_bytes,created_at FROM artifacts ORDER BY created_at DESC").fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r| serde_json::json!({"id":r.get::<String,_>("id"),"kind":r.get::<String,_>("kind"),"name":r.get::<String,_>("name"),"sha256":r.get::<String,_>("sha256"),"size_bytes":r.get::<i64,_>("size_bytes"),"format":r.get::<String,_>("format"),"packet_count":r.get::<i64,_>("packet_count"),"captured_bytes":r.get::<i64,_>("captured_bytes"),"created_at":r.get::<String,_>("created_at")})).collect()))
+    let rows = sqlx::query("SELECT id,kind,name,sha256,size_bytes,format,packet_count,captured_bytes,analysis_json,created_at FROM artifacts ORDER BY created_at DESC").fetch_all(&s.db).await?;
+    Ok(Json(rows.into_iter().map(|r| { let analysis=r.get::<Option<String>,_>("analysis_json").and_then(|v|serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default(); serde_json::json!({"id":r.get::<String,_>("id"),"kind":r.get::<String,_>("kind"),"name":r.get::<String,_>("name"),"sha256":r.get::<String,_>("sha256"),"size_bytes":r.get::<i64,_>("size_bytes"),"format":r.get::<String,_>("format"),"packet_count":r.get::<i64,_>("packet_count"),"captured_bytes":r.get::<i64,_>("captured_bytes"),"analysis":analysis,"created_at":r.get::<String,_>("created_at")})}).collect()))
 }
 
+#[cfg(test)]
 fn analyze_capture(data: &[u8]) -> Result<(String, u64, u64), ApiError> {
     if data.len() < 12 {
         return Err(ApiError::bad("capture 파일이 너무 작습니다"));

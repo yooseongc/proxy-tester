@@ -4,7 +4,7 @@ Run: python tests/pcap/generate_fixtures.py
 """
 from pathlib import Path
 
-from scapy.all import Ether, IP, IPv6, TCP, UDP, Raw, wrpcap
+from scapy.all import Ether, IP, IPv6, TCP, UDP, Raw, PcapNgWriter, wrpcap
 
 OUT = Path(__file__).parent / "fixtures"
 
@@ -31,7 +31,13 @@ def main():
         # Unsupported UDP traffic used to verify exclusion accounting.
         Ether() / IP(src="198.51.100.1", dst="198.51.100.2") / UDP(sport=1, dport=2) / Raw(b"ignore"),
     ]
+    for index, packet in enumerate(packets):
+        packet.time = 1_700_000_000 + index / 1_000
     wrpcap(str(OUT / "plaintext_flows.pcap"), packets)
+    writer = PcapNgWriter(str(OUT / "plaintext_flows.pcapng"))
+    for packet in packets:
+        writer.write(packet)
+    writer.close()
 
 
 if __name__ == "__main__":

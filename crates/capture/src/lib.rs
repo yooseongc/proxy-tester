@@ -27,6 +27,14 @@ pub struct Exclusions {
     pub fragmented_packets: u64,
     pub truncated_packets: u64,
     pub unsupported_link_packets: u64,
+    pub incomplete_flows: u64,
+    pub encrypted_tls_flows: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFormat {
+    Pcap,
+    PcapNg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +53,14 @@ pub enum CaptureError {
     UnsupportedFormat,
     #[error("unsupported PCAP link type {0}")]
     UnsupportedLinkType(u32),
+}
+
+pub fn analyze_capture(data: &[u8]) -> Result<(CaptureFormat, CaptureAnalysis), CaptureError> {
+    if data.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]) {
+        analyze_pcapng(data).map(|analysis| (CaptureFormat::PcapNg, analysis))
+    } else {
+        analyze_pcap(data).map(|analysis| (CaptureFormat::Pcap, analysis))
+    }
 }
 
 #[derive(Default)]
@@ -104,10 +120,27 @@ pub fn analyze_pcap(data: &[u8]) -> Result<CaptureAnalysis, CaptureError> {
         );
         offset += included;
     }
+    finish_analysis(&mut analysis, flow_order, segments);
+    Ok(analysis)
+}
+
+fn finish_analysis(
+    analysis: &mut CaptureAnalysis,
+    flow_order: Vec<FlowKey>,
+    mut segments: HashMap<FlowKey, Segments>,
+) {
     for key in flow_order {
         let parts = segments.remove(&key).unwrap_or_default();
         let (client_to_server, client_dup) = reassemble(parts.client);
         let (server_to_client, server_dup) = reassemble(parts.server);
+        if client_to_server.is_empty() || server_to_client.is_empty() {
+            analysis.exclusions.incomplete_flows += 1;
+            continue;
+        }
+        if looks_like_tls(&client_to_server) || looks_like_tls(&server_to_client) {
+            analysis.exclusions.encrypted_tls_flows += 1;
+            continue;
+        }
         analysis.flows.push(ReassembledFlow {
             key,
             client_to_server,
@@ -115,6 +148,84 @@ pub fn analyze_pcap(data: &[u8]) -> Result<CaptureAnalysis, CaptureError> {
             retransmitted_bytes: parts.duplicate_bytes + client_dup + server_dup,
         });
     }
+}
+
+fn looks_like_tls(data: &[u8]) -> bool {
+    data.len() >= 5 && matches!(data[0], 0x14..=0x17) && data[1] == 0x03 && data[2] <= 0x04
+}
+
+pub fn analyze_pcapng(data: &[u8]) -> Result<CaptureAnalysis, CaptureError> {
+    if data.len() < 28 || !data.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]) {
+        return Err(CaptureError::UnsupportedFormat);
+    }
+    let little = match &data[8..12] {
+        [0x4d, 0x3c, 0x2b, 0x1a] => true,
+        [0x1a, 0x2b, 0x3c, 0x4d] => false,
+        _ => return Err(CaptureError::UnsupportedFormat),
+    };
+    let read_u32 = |bytes: &[u8]| {
+        if little {
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        } else {
+            u32::from_be_bytes(bytes.try_into().unwrap())
+        }
+    };
+    let read_u16 = |bytes: &[u8]| {
+        if little {
+            u16::from_le_bytes(bytes.try_into().unwrap())
+        } else {
+            u16::from_be_bytes(bytes.try_into().unwrap())
+        }
+    };
+    let mut analysis = CaptureAnalysis {
+        packet_count: 0,
+        captured_bytes: 0,
+        flows: Vec::new(),
+        exclusions: Exclusions::default(),
+    };
+    let mut flow_order = Vec::new();
+    let mut segments = HashMap::new();
+    let mut interfaces = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        if offset + 12 > data.len() {
+            return Err(CaptureError::Truncated);
+        }
+        let block_type = read_u32(&data[offset..offset + 4]);
+        let length = read_u32(&data[offset + 4..offset + 8]) as usize;
+        if length < 12 || length % 4 != 0 || offset + length > data.len() {
+            return Err(CaptureError::Truncated);
+        }
+        if read_u32(&data[offset + length - 4..offset + length]) as usize != length {
+            return Err(CaptureError::Truncated);
+        }
+        match block_type {
+            1 if length >= 20 => interfaces.push(read_u16(&data[offset + 8..offset + 10]) as u32),
+            6 if length >= 32 => {
+                let interface = read_u32(&data[offset + 8..offset + 12]) as usize;
+                let captured = read_u32(&data[offset + 20..offset + 24]) as usize;
+                let original = read_u32(&data[offset + 24..offset + 28]) as u64;
+                if 28 + captured + 4 > length {
+                    return Err(CaptureError::Truncated);
+                }
+                analysis.packet_count += 1;
+                analysis.captured_bytes += original;
+                if interfaces.get(interface) == Some(&1) {
+                    parse_ethernet(
+                        &data[offset + 28..offset + 28 + captured],
+                        &mut flow_order,
+                        &mut segments,
+                        &mut analysis.exclusions,
+                    );
+                } else {
+                    analysis.exclusions.unsupported_link_packets += 1;
+                }
+            }
+            _ => {}
+        }
+        offset += length;
+    }
+    finish_analysis(&mut analysis, flow_order, segments);
     Ok(analysis)
 }
 
@@ -289,5 +400,26 @@ mod tests {
         );
         assert_eq!(analysis.flows[1].client_to_server, b"PING");
         assert_eq!(analysis.flows[1].server_to_client, b"PONG");
+    }
+
+    #[test]
+    fn pcapng_fixture_matches_classic_pcap_analysis() {
+        let classic = analyze_capture(include_bytes!(
+            "../../../tests/pcap/fixtures/plaintext_flows.pcap"
+        ))
+        .unwrap();
+        let pcapng = analyze_capture(include_bytes!(
+            "../../../tests/pcap/fixtures/plaintext_flows.pcapng"
+        ))
+        .unwrap();
+        assert_eq!(classic.0, CaptureFormat::Pcap);
+        assert_eq!(pcapng.0, CaptureFormat::PcapNg);
+        assert_eq!(classic.1, pcapng.1);
+    }
+
+    #[test]
+    fn recognizes_tls_record_payloads() {
+        assert!(looks_like_tls(&[0x16, 0x03, 0x03, 0, 4, 1, 2, 3, 4]));
+        assert!(!looks_like_tls(b"GET / HTTP/1.1\r\n"));
     }
 }
