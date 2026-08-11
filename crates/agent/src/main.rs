@@ -323,7 +323,11 @@ async fn accept_artifact_chunk(
         bail!("artifact {id} first chunk offset must be zero");
     }
     if !incoming.contains_key(&id) {
-        let path = std::env::temp_dir().join(format!("proxy-tester-{id}.artifact.part"));
+        let temporary_dir = std::env::temp_dir();
+        tokio::fs::create_dir_all(&temporary_dir)
+            .await
+            .with_context(|| format!("create temporary directory {temporary_dir:?}"))?;
+        let path = temporary_dir.join(format!("proxy-tester-{id}.artifact.part"));
         let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
