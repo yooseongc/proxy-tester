@@ -1718,6 +1718,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-tester-capture"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "proxy-tester-domain"
 version = "0.1.0"
 dependencies = [

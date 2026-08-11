@@ -20,7 +20,7 @@ def main():
     response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
     packets = [
         # Intentionally out of order; the parser must order by TCP sequence.
-        tcp_packet("192.0.2.10", "192.0.2.20", 41000, 8080, 1030, 5001, payload=request[30:]),
+        tcp_packet("192.0.2.10", "192.0.2.20", 41000, 8080, 1031, 5001, payload=request[30:]),
         tcp_packet("192.0.2.10", "192.0.2.20", 41000, 8080, 1001, 5001, payload=request[:30]),
         # Exact retransmission of the first request segment.
         tcp_packet("192.0.2.10", "192.0.2.20", 41000, 8080, 1001, 5001, payload=request[:30]),
