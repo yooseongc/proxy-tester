@@ -15,6 +15,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     io::Cursor,
     net::SocketAddr,
     sync::{
@@ -204,14 +205,17 @@ struct PreparedPayloads {
     response: Arc<[u8]>,
 }
 impl PreparedPayloads {
-    fn new(sc: &Scenario) -> anyhow::Result<Self> {
+    fn new(sc: &Scenario, artifacts: &HashMap<Uuid, Arc<[u8]>>) -> anyhow::Result<Self> {
         Ok(Self {
-            request: materialize(&sc.request_payload())?,
-            response: materialize(&sc.response_payload())?,
+            request: materialize(&sc.request_payload(), artifacts)?,
+            response: materialize(&sc.response_payload(), artifacts)?,
         })
     }
 }
-fn materialize(profile: &PayloadProfile) -> anyhow::Result<Arc<[u8]>> {
+fn materialize(
+    profile: &PayloadProfile,
+    artifacts: &HashMap<Uuid, Arc<[u8]>>,
+) -> anyhow::Result<Arc<[u8]>> {
     let bytes = match profile.kind {
         PayloadKind::Empty => Vec::new(),
         PayloadKind::Fixed => vec![0; profile.size_bytes],
@@ -226,10 +230,61 @@ fn materialize(profile: &PayloadProfile) -> anyhow::Result<Arc<[u8]>> {
             }
             data
         }
-        PayloadKind::File => bail!("file artifact transfer is unavailable on this agent"),
+        PayloadKind::File => {
+            let id = profile.artifact_id.context("file payload artifact ID")?;
+            return artifacts
+                .get(&id)
+                .cloned()
+                .with_context(|| format!("artifact {id} was not transferred"));
+        }
     };
     info!(kind=?profile.kind, bytes=bytes.len(), sha256=%format!("{:x}", Sha256::digest(&bytes)), "payload prepared");
     Ok(bytes.into())
+}
+
+#[derive(Default)]
+struct IncomingArtifact {
+    data: Vec<u8>,
+    total_size: u64,
+    sha256: String,
+}
+
+fn accept_artifact_chunk(
+    incoming: &mut HashMap<Uuid, IncomingArtifact>,
+    completed: &mut HashMap<Uuid, Arc<[u8]>>,
+    chunk: proxy_tester_proto::v1::ArtifactChunk,
+) -> anyhow::Result<()> {
+    let id = Uuid::parse_str(&chunk.artifact_id)?;
+    if completed.contains_key(&id) {
+        bail!("artifact {id} was transferred more than once");
+    }
+    let state = incoming.entry(id).or_insert_with(|| IncomingArtifact {
+        data: Vec::with_capacity(chunk.total_size.min(64 * 1024 * 1024) as usize),
+        total_size: chunk.total_size,
+        sha256: chunk.sha256.clone(),
+    });
+    if state.total_size != chunk.total_size || state.sha256 != chunk.sha256 {
+        bail!("artifact {id} metadata changed during transfer");
+    }
+    if chunk.offset != state.data.len() as u64 {
+        bail!("artifact {id} chunk offset mismatch");
+    }
+    if state.data.len().saturating_add(chunk.data.len()) as u64 > state.total_size {
+        bail!("artifact {id} exceeds declared size");
+    }
+    state.data.extend_from_slice(&chunk.data);
+    if chunk.eof {
+        if state.data.len() as u64 != state.total_size {
+            bail!("artifact {id} ended before declared size");
+        }
+        let actual = format!("{:x}", Sha256::digest(&state.data));
+        if actual != state.sha256 {
+            bail!("artifact {id} SHA-256 mismatch");
+        }
+        let finished = incoming.remove(&id).context("artifact transfer state")?;
+        completed.insert(id, finished.data.into());
+    }
+    Ok(())
 }
 
 trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -370,21 +425,30 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
         }
     });
     let prepared: Arc<Mutex<Option<Prepared>>> = Default::default();
+    let mut incoming_artifacts = HashMap::new();
+    let mut completed_artifacts = HashMap::new();
     type ActiveRun = (Uuid, Arc<AtomicBool>, Arc<AtomicBool>);
     let active_run: Arc<Mutex<Option<ActiveRun>>> = Default::default();
     while let Some(cmd) = commands.next().await {
         match cmd?.body {
             Some(control_message::Body::Prepare(p)) => {
+                if !incoming_artifacts.is_empty() {
+                    bail!("PrepareRun arrived before artifact transfer completed");
+                }
                 let scenario: Scenario =
                     serde_json::from_str::<Scenario>(&p.scenario_json)?.migrate();
                 scenario.validate()?;
-                let payloads = Arc::new(PreparedPayloads::new(&scenario)?);
+                let payloads = Arc::new(PreparedPayloads::new(&scenario, &completed_artifacts)?);
+                completed_artifacts.clear();
                 *prepared.lock().await = Some(Prepared {
                     run_id: Uuid::parse_str(&p.run_id)?,
                     scenario,
                     payloads,
                 });
                 info!(run=%p.run_id,"prepared");
+            }
+            Some(control_message::Body::ArtifactChunk(chunk)) => {
+                accept_artifact_chunk(&mut incoming_artifacts, &mut completed_artifacts, chunk)?;
             }
             Some(control_message::Body::Start(s)) => {
                 let Some(job) = prepared.lock().await.clone() else {
@@ -1230,6 +1294,76 @@ async fn read_exact_count(
         n -= size;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proxy_tester_proto::v1::ArtifactChunk;
+
+    fn chunk(
+        id: Uuid,
+        offset: u64,
+        data: &[u8],
+        total: u64,
+        sha256: &str,
+        eof: bool,
+    ) -> ArtifactChunk {
+        ArtifactChunk {
+            artifact_id: id.to_string(),
+            offset,
+            data: data.to_vec(),
+            total_size: total,
+            sha256: sha256.into(),
+            eof,
+        }
+    }
+
+    #[test]
+    fn artifact_chunks_are_assembled_and_verified() {
+        let id = Uuid::new_v4();
+        let bytes = b"request payload";
+        let sha = format!("{:x}", Sha256::digest(bytes));
+        let mut incoming = HashMap::new();
+        let mut completed = HashMap::new();
+        accept_artifact_chunk(
+            &mut incoming,
+            &mut completed,
+            chunk(id, 0, &bytes[..4], bytes.len() as u64, &sha, false),
+        )
+        .unwrap();
+        accept_artifact_chunk(
+            &mut incoming,
+            &mut completed,
+            chunk(id, 4, &bytes[4..], bytes.len() as u64, &sha, true),
+        )
+        .unwrap();
+        assert_eq!(completed[&id].as_ref(), bytes);
+    }
+
+    #[test]
+    fn artifact_chunk_rejects_bad_offset_and_digest() {
+        let id = Uuid::new_v4();
+        let mut incoming = HashMap::new();
+        let mut completed = HashMap::new();
+        assert!(
+            accept_artifact_chunk(
+                &mut incoming,
+                &mut completed,
+                chunk(id, 1, b"x", 1, "bad", true)
+            )
+            .is_err()
+        );
+        incoming.clear();
+        assert!(
+            accept_artifact_chunk(
+                &mut incoming,
+                &mut completed,
+                chunk(id, 0, b"x", 1, "bad", true)
+            )
+            .is_err()
+        );
+    }
 }
 async fn send_event(
     tx: &mpsc::Sender<AgentMessage>,

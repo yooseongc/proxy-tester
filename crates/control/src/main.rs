@@ -12,9 +12,9 @@ use axum::{
 use chrono::Utc;
 use clap::Parser;
 use futures::{Stream, StreamExt};
-use proxy_tester_domain::{MetricsSnapshot, Scenario};
+use proxy_tester_domain::{MetricsSnapshot, PayloadKind, Scenario};
 use proxy_tester_proto::v1::{
-    AgentMessage, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
+    AgentMessage, ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -22,8 +22,15 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
-use std::{collections::HashMap, pin::Pin, sync::Arc};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::Arc,
+};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Mutex, RwLock, broadcast, mpsc},
+};
 use tonic::{Request, Response as GrpcResponse, Status};
 use tower_http::{
     cors::CorsLayer,
@@ -470,6 +477,11 @@ async fn start_run(
     };
     let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
+    let artifact_ids: HashSet<Uuid> = [sc.request_payload(), sc.response_payload()]
+        .into_iter()
+        .filter(|payload| payload.kind == PayloadKind::File)
+        .filter_map(|payload| payload.artifact_id)
+        .collect();
     let mut active = s.active_run.lock().await;
     if active.is_some() {
         return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
@@ -511,6 +523,8 @@ async fn start_run(
             scenario_json: json,
         })),
     };
+    send_artifacts(&s.db, &client, &artifact_ids).await?;
+    send_artifacts(&s.db, &server, &artifact_ids).await?;
     client
         .tx
         .send(Ok(prepare.clone()))
@@ -551,6 +565,75 @@ async fn start_run(
         StatusCode::CREATED,
         Json(serde_json::json!({"id":run_id,"status":"running"})),
     ))
+}
+
+const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
+
+async fn send_artifacts(
+    db: &SqlitePool,
+    agent: &AgentSession,
+    artifact_ids: &HashSet<Uuid>,
+) -> Result<(), ApiError> {
+    for artifact_id in artifact_ids {
+        let row = sqlx::query("SELECT kind,sha256,size_bytes,path FROM artifacts WHERE id=?")
+            .bind(artifact_id.to_string())
+            .fetch_optional(db)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad(format!("payload artifact {artifact_id} does not exist"))
+            })?;
+        let kind: String = row.get("kind");
+        if kind != "payload" {
+            return Err(ApiError::bad(format!(
+                "artifact {artifact_id} is not a payload artifact"
+            )));
+        }
+        let total_size = row.get::<i64, _>("size_bytes") as u64;
+        if total_size > 64 * 1024 * 1024 {
+            return Err(ApiError::bad(format!(
+                "payload artifact {artifact_id} exceeds 64 MiB"
+            )));
+        }
+        let sha256: String = row.get("sha256");
+        let path: String = row.get("path");
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| ApiError::internal(format!("open artifact {artifact_id}: {e}")))?;
+        let mut offset = 0_u64;
+        loop {
+            let mut data = vec![0; ARTIFACT_CHUNK_BYTES];
+            let read = file
+                .read(&mut data)
+                .await
+                .map_err(|e| ApiError::internal(format!("read artifact {artifact_id}: {e}")))?;
+            data.truncate(read);
+            let eof = offset + read as u64 == total_size;
+            agent
+                .tx
+                .send(Ok(ControlMessage {
+                    body: Some(control_message::Body::ArtifactChunk(ArtifactChunk {
+                        artifact_id: artifact_id.to_string(),
+                        offset,
+                        data,
+                        total_size,
+                        sha256: sha256.clone(),
+                        eof,
+                    })),
+                }))
+                .await
+                .map_err(|_| ApiError::internal("agent channel closed during artifact transfer"))?;
+            offset += read as u64;
+            if eof {
+                break;
+            }
+            if read == 0 {
+                return Err(ApiError::internal(format!(
+                    "artifact {artifact_id} is shorter than database metadata"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 async fn stop_run(
     State(s): State<AppState>,
