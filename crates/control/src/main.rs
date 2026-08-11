@@ -389,6 +389,8 @@ async fn upload_artifact(
             };
             let summary = serde_json::json!({
                 "supported_flow_count": analyzed.flows.len(),
+                "http_flow_count": analyzed.flows.iter().filter(|flow| !flow.http_transactions.is_empty()).count(),
+                "http_transaction_count": analyzed.flows.iter().map(|flow| flow.http_transactions.len()).sum::<usize>(),
                 "retransmitted_bytes": analyzed.flows.iter().map(|flow|flow.retransmitted_bytes).sum::<u64>(),
                 "exclusions": {
                     "non_tcp_packets": analyzed.exclusions.non_tcp_packets,
@@ -690,11 +692,6 @@ async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Resu
     if scenario.payload_mode != PayloadMode::CaptureReplay {
         return Ok(());
     }
-    if scenario.protocol != Protocol::Tcp {
-        return Err(ApiError::bad(
-            "HTTP capture replay will be enabled in milestone M4",
-        ));
-    }
     let id = scenario
         .capture_artifact_id
         .ok_or_else(|| ApiError::bad("capture replay requires capture_artifact_id"))?;
@@ -712,10 +709,17 @@ async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Resu
         .get::<Option<String>, _>("analysis_json")
         .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
         .unwrap_or_default();
-    if analysis["supported_flow_count"].as_u64().unwrap_or(0) == 0 {
-        return Err(ApiError::bad(
-            "capture has no supported bidirectional plaintext TCP flows",
-        ));
+    let count_key = if scenario.protocol == Protocol::Http1 {
+        "http_flow_count"
+    } else {
+        "supported_flow_count"
+    };
+    if analysis[count_key].as_u64().unwrap_or(0) == 0 {
+        return Err(ApiError::bad(if scenario.protocol == Protocol::Http1 {
+            "capture has no supported HTTP/1.1 request/response transactions"
+        } else {
+            "capture has no supported bidirectional plaintext TCP flows"
+        }));
     }
     Ok(())
 }

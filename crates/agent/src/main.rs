@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
-use proxy_tester_capture::{Direction, ReplayTurn, analyze_capture};
+use proxy_tester_capture::{Direction, HttpTransaction, ReplayTurn, analyze_capture};
 use proxy_tester_domain::{
     MetricsSnapshot, PayloadKind, PayloadMode, PayloadProfile, Protocol, RandomFormat, Scenario,
     Topology,
@@ -208,7 +208,7 @@ struct ReplayPlan {
 }
 
 impl ReplayPlan {
-    fn from_capture(bytes: &[u8]) -> anyhow::Result<Self> {
+    fn from_capture(bytes: &[u8], scenario: &Scenario, role: Role) -> anyhow::Result<Self> {
         let (_, analysis) = analyze_capture(bytes)?;
         if analysis.flows.is_empty() {
             bail!("capture contains no supported flows");
@@ -216,9 +216,24 @@ impl ReplayPlan {
         let flows: Arc<[Arc<[ReplayTurn]>]> = analysis
             .flows
             .into_iter()
-            .map(|flow| Arc::<[ReplayTurn]>::from(flow.turns))
+            .filter_map(|flow| {
+                let turns = if scenario.protocol == Protocol::Http1 {
+                    (!flow.http_transactions.is_empty()).then(|| {
+                        flow.http_transactions
+                            .into_iter()
+                            .flat_map(|transaction| http_replay_turns(transaction, scenario, role))
+                            .collect()
+                    })
+                } else {
+                    Some(flow.turns)
+                }?;
+                Some(Arc::<[ReplayTurn]>::from(turns))
+            })
             .collect::<Vec<_>>()
             .into();
+        if flows.is_empty() {
+            bail!("capture contains no supported HTTP/1.1 transactions");
+        }
         for (index, flow) in flows.iter().enumerate() {
             let Some(first) = flow.first() else {
                 bail!("flow {index} has no replay turns");
@@ -239,6 +254,94 @@ impl ReplayPlan {
         }
         Ok(Self { flows })
     }
+}
+
+fn http_replay_turns(
+    transaction: HttpTransaction,
+    scenario: &Scenario,
+    role: Role,
+) -> [ReplayTurn; 2] {
+    [
+        ReplayTurn {
+            direction: Direction::ClientToServer,
+            payload: rewrite_http_request(&transaction.request, scenario, role),
+        },
+        ReplayTurn {
+            direction: Direction::ServerToClient,
+            payload: transaction.response,
+        },
+    ]
+}
+
+fn rewrite_http_request(request: &[u8], scenario: &Scenario, role: Role) -> Vec<u8> {
+    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+        return request.to_vec();
+    };
+    let header_end = header_end + 4;
+    let headers = &request[..header_end];
+    let Some(line_end) = headers.windows(2).position(|part| part == b"\r\n") else {
+        return request.to_vec();
+    };
+    let mut fields = headers[..line_end].splitn(3, |byte| *byte == b' ');
+    let (Some(method), Some(target), Some(version)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return request.to_vec();
+    };
+    let path = if target.starts_with(b"http://") {
+        target
+            .windows(1)
+            .enumerate()
+            .skip(7)
+            .find(|(_, byte)| *byte == b"/")
+            .map(|(index, _)| &target[index..])
+            .unwrap_or(b"/")
+    } else {
+        target
+    };
+    let absolute = role == Role::Client
+        && scenario.topology == Topology::ExplicitProxy
+        && !scenario.tls.enabled;
+    let target = if absolute {
+        format!(
+            "http://{}{}",
+            scenario.target_addr,
+            String::from_utf8_lossy(path)
+        )
+        .into_bytes()
+    } else {
+        path.to_vec()
+    };
+    let mut output = Vec::with_capacity(request.len() + target.len());
+    output.extend_from_slice(method);
+    output.push(b' ');
+    output.extend_from_slice(&target);
+    output.push(b' ');
+    output.extend_from_slice(version);
+    output.extend_from_slice(b"\r\n");
+    let mut replaced_host = false;
+    for line in headers[line_end + 2..header_end - 2].split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if line
+            .split(|byte| *byte == b':')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"host"))
+        {
+            output.extend_from_slice(format!("Host: {}\r\n", scenario.request.host).as_bytes());
+            replaced_host = true;
+        } else {
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    if !replaced_host {
+        output.extend_from_slice(format!("Host: {}\r\n", scenario.request.host).as_bytes());
+    }
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(&request[header_end..]);
+    output
 }
 
 #[derive(Clone)]
@@ -549,7 +652,7 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                         })
                         .with_context(|| format!("capture artifact {id} was not transferred"))?;
                     let bytes = tokio::fs::read(path).await?;
-                    let replay = ReplayPlan::from_capture(&bytes)?;
+                    let replay = ReplayPlan::from_capture(&bytes, &scenario, role)?;
                     tokio::fs::remove_file(path).await?;
                     Some(Arc::new(replay))
                 } else {
@@ -1112,9 +1215,13 @@ async fn replay_client(
     sc: &Scenario,
     c: &Counters,
 ) -> anyhow::Result<()> {
+    let mut transaction_started = None;
     for turn in turns {
         match turn.direction {
             Direction::ClientToServer => {
+                if sc.protocol == Protocol::Http1 {
+                    transaction_started = Some(Instant::now());
+                }
                 stream.write_all(&turn.payload).await?;
                 c.tx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
             }
@@ -1125,6 +1232,15 @@ async fn replay_client(
                 )
                 .await??;
                 c.rx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
+                if sc.protocol == Protocol::Http1 {
+                    c.transaction_completed();
+                    if let Some(started) = transaction_started.take() {
+                        c.http_latencies_us
+                            .lock()
+                            .await
+                            .push(started.elapsed().as_micros() as u64);
+                    }
+                }
             }
         }
     }
@@ -1150,6 +1266,9 @@ async fn replay_server(
             Direction::ServerToClient => {
                 stream.write_all(&turn.payload).await?;
                 c.tx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
+                if sc.protocol == Protocol::Http1 {
+                    c.transaction_completed();
+                }
             }
         }
     }
@@ -1653,10 +1772,45 @@ mod tests {
     #[test]
     fn replay_plan_is_built_from_scapy_fixture() {
         let capture = include_bytes!("../../../tests/pcap/fixtures/plaintext_flows.pcap");
-        let plan = ReplayPlan::from_capture(capture).unwrap();
+        let plan = ReplayPlan::from_capture(capture, &Scenario::default(), Role::Client).unwrap();
         assert_eq!(plan.flows.len(), 2);
         assert_eq!(plan.flows[0].len(), 2);
         assert_eq!(plan.flows[1].len(), 2);
+    }
+
+    #[test]
+    fn http_replay_plan_filters_flows_and_rewrites_endpoint() {
+        let capture = include_bytes!("../../../tests/pcap/fixtures/plaintext_flows.pcap");
+        let mut scenario = Scenario::default();
+        scenario.protocol = Protocol::Http1;
+        scenario.topology = Topology::ExplicitProxy;
+        scenario.target_addr = "origin.test:8080".into();
+        scenario.request.host = "origin.test".into();
+        let plan = ReplayPlan::from_capture(capture, &scenario, Role::Client).unwrap();
+        assert_eq!(plan.flows.len(), 1);
+        assert_eq!(plan.flows[0].len(), 2);
+        assert!(
+            plan.flows[0][0]
+                .payload
+                .starts_with(b"POST http://origin.test:8080/scan HTTP/1.1\r\n")
+        );
+        assert!(
+            plan.flows[0][0]
+                .payload
+                .windows(b"Host: origin.test\r\n".len())
+                .any(|window| window == b"Host: origin.test\r\n")
+        );
+        assert!(plan.flows[0][0].payload.ends_with(b"DLP-SECRET"));
+        assert_eq!(
+            plan.flows[0][1].payload,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+        );
+        let server_plan = ReplayPlan::from_capture(capture, &scenario, Role::Server).unwrap();
+        assert!(
+            server_plan.flows[0][0]
+                .payload
+                .starts_with(b"POST /scan HTTP/1.1\r\n")
+        );
     }
 
     #[tokio::test]
