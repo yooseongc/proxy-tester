@@ -28,7 +28,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, RwLock, broadcast, mpsc},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
@@ -309,6 +309,12 @@ async fn upload_artifact(
     Query(upload): Query<ArtifactUpload>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let kind = upload.kind.as_deref().unwrap_or("pcap");
+    let limit = match kind {
+        "payload" => 64 * 1024 * 1024_u64,
+        "pcap" => 512 * 1024 * 1024_u64,
+        _ => return Err(ApiError::bad("kind must be payload or pcap")),
+    };
     let mut name = "capture.pcap".to_string();
     let mut data = None;
     while let Some(field) = multipart
@@ -318,38 +324,66 @@ async fn upload_artifact(
     {
         if field.name() == Some("file") {
             name = field.file_name().unwrap_or("capture.pcap").to_string();
-            data = Some(
-                field
-                    .bytes()
+            let temporary_path = s.artifact_dir.join(format!(".upload-{}", Uuid::new_v4()));
+            let mut temporary = tokio::fs::File::create(&temporary_path)
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            let mut field = field;
+            let mut size = 0_u64;
+            let mut digest = Sha256::new();
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| ApiError::bad(e.to_string()))?
+            {
+                size = size.saturating_add(chunk.len() as u64);
+                if size > limit {
+                    drop(temporary);
+                    let _ = tokio::fs::remove_file(&temporary_path).await;
+                    return Err(ApiError::bad(format!(
+                        "{kind} artifact exceeds {} MiB",
+                        limit / 1024 / 1024
+                    )));
+                }
+                digest.update(&chunk);
+                temporary
+                    .write_all(&chunk)
                     .await
-                    .map_err(|e| ApiError::bad(e.to_string()))?,
-            );
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            }
+            temporary
+                .flush()
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            data = Some((temporary_path, size, format!("{:x}", digest.finalize())));
             break;
         }
     }
     let data = data.ok_or_else(|| ApiError::bad("file field가 필요합니다"))?;
-    let kind = upload.kind.as_deref().unwrap_or("pcap");
-    let (limit, analysis) = match kind {
-        "payload" => (64 * 1024 * 1024, ("raw".into(), 0, data.len() as u64)),
-        "pcap" => (512 * 1024 * 1024, analyze_capture(&data)?),
-        _ => return Err(ApiError::bad("kind must be payload or pcap")),
+    let (temporary_path, size, sha) = data;
+    let analysis = match kind {
+        "payload" => ("raw".into(), 0, size),
+        "pcap" => {
+            let capture = tokio::fs::read(&temporary_path)
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            analyze_capture(&capture)?
+        }
+        _ => unreachable!(),
     };
-    if data.len() > limit {
-        return Err(ApiError::bad(format!(
-            "{kind} artifact exceeds {} MiB",
-            limit / 1024 / 1024
-        )));
-    }
-    let sha = format!("{:x}", Sha256::digest(&data));
     let id = Uuid::new_v4();
     let path = s.artifact_dir.join(&sha);
     if tokio::fs::metadata(&path).await.is_err() {
-        tokio::fs::write(&path, &data)
+        tokio::fs::rename(&temporary_path, &path)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    } else {
+        tokio::fs::remove_file(&temporary_path)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
     let inserted = sqlx::query("INSERT INTO artifacts(id,name,sha256,size_bytes,format,packet_count,captured_bytes,path,created_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sha256) DO NOTHING")
-        .bind(id.to_string()).bind(&name).bind(&sha).bind(data.len() as i64).bind(&analysis.0).bind(analysis.1 as i64).bind(analysis.2 as i64).bind(path.to_string_lossy().to_string()).bind(Utc::now().to_rfc3339()).bind(kind).execute(&s.db).await?;
+        .bind(id.to_string()).bind(&name).bind(&sha).bind(size as i64).bind(&analysis.0).bind(analysis.1 as i64).bind(analysis.2 as i64).bind(path.to_string_lossy().to_string()).bind(Utc::now().to_rfc3339()).bind(kind).execute(&s.db).await?;
     let id = if inserted.rows_affected() == 0 {
         let existing = sqlx::query("SELECT id,kind FROM artifacts WHERE sha256=?")
             .bind(&sha)
@@ -369,7 +403,7 @@ async fn upload_artifact(
     Ok((
         StatusCode::CREATED,
         Json(
-            serde_json::json!({"id":id,"kind":kind,"name":name,"sha256":sha,"size_bytes":data.len(),"format":analysis.0,"packet_count":analysis.1,"captured_bytes":analysis.2,"status":"validated"}),
+            serde_json::json!({"id":id,"kind":kind,"name":name,"sha256":sha,"size_bytes":size,"format":analysis.0,"packet_count":analysis.1,"captured_bytes":analysis.2,"status":"validated"}),
         ),
     ))
 }
