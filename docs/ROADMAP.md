@@ -32,7 +32,7 @@
 
 완료 조건: fixture를 매번 동일하게 생성하고 Rust parser golden test가 모든 포함/제외 수와 byte stream을 검증함.
 
-## M3 — TCP capture replay 실행기 (진행 중)
+## M3 — TCP capture replay 실행기 (완료)
 
 - 재조립 stream을 방향 전환 기준 turn으로 변환
 - VU별 flow template round-robin scheduler
@@ -40,7 +40,9 @@
 - 원본 timing을 제거하고 turn 순서만 보존하여 최대속도 반복
 - 평문 payload를 선택한 새 TLS 세션에서 재암호화
 
-현재 완료: turn 생성, gRPC capture 전송, Agent 재분석, flow round-robin, 첫 client turn 기반 responder 매칭, 직접/TLS/CONNECT 실행 경로. 남은 작업: 대용량 capture 임시파일 처리와 실제 프로세스 lifecycle 통합시험.
+구현 완료: turn 생성, gRPC capture 전송, Agent 임시파일 저장·재분석, flow round-robin, 첫 client turn 기반 responder 매칭, 직접/TLS/CONNECT 실행 경로.
+
+검증: `tests/capture-replay-regression.ps1`가 Scapy 다중 flow fixture를 업로드한 뒤 Docker Compose의 실제 Control/Client/Server/Proxy 프로세스에서 직접 연결, HTTP CONNECT, TLS 재암호화 경로를 차례로 실행한다. 각 Run의 완료 상태, 0건의 client transaction error, 실제 transaction 발생 및 직접 연결의 endpoint byte 대칭을 확인한다.
 
 완료 조건: 다중 flow fixture를 직접/TLS/CONNECT 경로에서 재현하고 client/server transcript가 원본 turn과 일치함.
 
