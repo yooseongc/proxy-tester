@@ -13,7 +13,7 @@ use chrono::Utc;
 use clap::Parser;
 use futures::{Stream, StreamExt};
 use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
-use proxy_tester_domain::{MetricsSnapshot, PayloadKind, Scenario};
+use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Scenario};
 use proxy_tester_proto::v1::{
     AgentMessage, ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
@@ -285,6 +285,7 @@ async fn preflight(
     let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     validate_payload_artifacts(&s.db, &sc).await?;
+    validate_capture_artifact(&s.db, &sc).await?;
     let agents = s.agents.read().await;
     let client = agents.get(&sc.client_agent_id);
     let server = agents.get(&sc.server_agent_id);
@@ -510,6 +511,7 @@ async fn save_scenario(
     let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     validate_payload_artifacts(&s.db, &sc).await?;
+    validate_capture_artifact(&s.db, &sc).await?;
     let body = serde_json::to_string(&sc)?;
     let now = Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO scenarios(id,name,body,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,body=excluded.body,updated_at=excluded.updated_at")
@@ -675,6 +677,37 @@ async fn validate_payload_artifacts(db: &SqlitePool, scenario: &Scenario) -> Res
         }
     }
     Ok(())
+}
+
+async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Result<(), ApiError> {
+    if scenario.payload_mode != PayloadMode::CaptureReplay {
+        return Ok(());
+    }
+    let id = scenario
+        .capture_artifact_id
+        .ok_or_else(|| ApiError::bad("capture replay requires capture_artifact_id"))?;
+    let row = sqlx::query("SELECT kind,analysis_json FROM artifacts WHERE id=?")
+        .bind(id.to_string())
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| ApiError::bad(format!("capture artifact {id} does not exist")))?;
+    if row.get::<String, _>("kind") != "pcap" {
+        return Err(ApiError::bad(format!(
+            "artifact {id} is not a PCAP artifact"
+        )));
+    }
+    let analysis = row
+        .get::<Option<String>, _>("analysis_json")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .unwrap_or_default();
+    if analysis["supported_flow_count"].as_u64().unwrap_or(0) == 0 {
+        return Err(ApiError::bad(
+            "capture has no supported bidirectional plaintext TCP flows",
+        ));
+    }
+    Err(ApiError::bad(
+        "capture replay execution will be enabled in milestone M3",
+    ))
 }
 
 async fn send_artifacts(

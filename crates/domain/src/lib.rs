@@ -44,6 +44,7 @@ pub struct Scenario {
     pub request_payload: Option<PayloadProfile>,
     pub response_payload: Option<PayloadProfile>,
     pub payload_mode: PayloadMode,
+    pub capture_artifact_id: Option<Uuid>,
     pub tls: TlsProfile,
     pub timeouts: TimeoutProfile,
     pub observation_interfaces: Vec<String>,
@@ -71,6 +72,7 @@ impl Default for Scenario {
             request_payload: Some(PayloadProfile::fixed(64)),
             response_payload: Some(PayloadProfile::fixed(64)),
             payload_mode: PayloadMode::Manual,
+            capture_artifact_id: None,
             tls: TlsProfile::default(),
             timeouts: TimeoutProfile::default(),
             observation_interfaces: vec![],
@@ -268,6 +270,7 @@ impl Scenario {
             self.request_payload = Some(PayloadProfile::fixed(request));
             self.response_payload = Some(PayloadProfile::fixed(response));
             self.payload_mode = PayloadMode::Manual;
+            self.capture_artifact_id = None;
             self.version = SCENARIO_VERSION;
         }
         self
@@ -353,9 +356,11 @@ impl Scenario {
             )));
         }
         if self.payload_mode == PayloadMode::CaptureReplay {
-            return Err(ValidationError::Invalid(
-                "PCAP session replay requires an analyzed capture artifact".into(),
-            ));
+            if self.capture_artifact_id.is_none() {
+                return Err(ValidationError::Invalid(
+                    "PCAP session replay requires an analyzed capture artifact".into(),
+                ));
+            }
         }
         for (direction, payload) in [
             ("request", self.request_payload()),
@@ -588,6 +593,14 @@ mod tests {
                 .to_string()
                 .contains("64 MiB")
         );
+    }
+    #[test]
+    fn capture_replay_requires_an_artifact_reference() {
+        let mut scenario = Scenario::default();
+        scenario.payload_mode = PayloadMode::CaptureReplay;
+        assert!(scenario.validate().is_err());
+        scenario.capture_artifact_id = Some(Uuid::new_v4());
+        assert!(scenario.validate().is_ok());
     }
     #[test]
     fn explicit_requires_proxy() {
