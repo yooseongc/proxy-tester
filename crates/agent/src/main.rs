@@ -213,14 +213,31 @@ impl ReplayPlan {
         if analysis.flows.is_empty() {
             bail!("capture contains no supported flows");
         }
-        Ok(Self {
-            flows: analysis
-                .flows
-                .into_iter()
-                .map(|flow| Arc::<[ReplayTurn]>::from(flow.turns))
-                .collect::<Vec<_>>()
-                .into(),
-        })
+        let flows: Arc<[Arc<[ReplayTurn]>]> = analysis
+            .flows
+            .into_iter()
+            .map(|flow| Arc::<[ReplayTurn]>::from(flow.turns))
+            .collect::<Vec<_>>()
+            .into();
+        for (index, flow) in flows.iter().enumerate() {
+            let Some(first) = flow.first() else {
+                bail!("flow {index} has no replay turns");
+            };
+            if first.direction != Direction::ClientToServer || first.payload.is_empty() {
+                bail!("flow {index} must start with a non-empty client turn");
+            }
+            for (other_index, other) in flows.iter().enumerate() {
+                if index != other_index
+                    && other.first().is_some_and(|turn| {
+                        turn.payload.starts_with(&first.payload)
+                            || first.payload.starts_with(&turn.payload)
+                    })
+                {
+                    bail!("flows {index} and {other_index} have ambiguous first client turns");
+                }
+            }
+        }
+        Ok(Self { flows })
     }
 }
 
@@ -1087,6 +1104,36 @@ async fn replay_server(
     }
     Ok(())
 }
+
+async fn replay_server_detect(
+    stream: &mut (impl IoStream + ?Sized),
+    plan: &ReplayPlan,
+    sc: &Scenario,
+    c: &Counters,
+) -> anyhow::Result<()> {
+    let mut received = Vec::new();
+    let mut candidates: Vec<usize> = (0..plan.flows.len()).collect();
+    loop {
+        let mut byte = [0_u8; 1];
+        tokio::time::timeout(
+            Duration::from_millis(sc.timeouts.response_ms),
+            stream.read_exact(&mut byte),
+        )
+        .await??;
+        received.push(byte[0]);
+        candidates.retain(|index| plan.flows[*index][0].payload.starts_with(&received));
+        if candidates.is_empty() {
+            bail!("first client turn does not match any capture flow");
+        }
+        if candidates.len() == 1 {
+            let flow = &plan.flows[candidates[0]];
+            if flow[0].payload.len() == received.len() {
+                c.rx.fetch_add(received.len() as u64, Ordering::Relaxed);
+                return replay_server(stream, &flow[1..], sc, c).await;
+            }
+        }
+    }
+}
 async fn http_transactions(
     stream: &mut (impl IoStream + ?Sized),
     sc: &Scenario,
@@ -1228,7 +1275,6 @@ async fn run_server(
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let tls_acceptor = sc.tls.enabled.then(|| build_tls_acceptor(sc)).transpose()?;
     info!(port, "responder listening");
-    let next_flow = Arc::new(AtomicU64::new(0));
     let duration = Duration::from_millis(sc.effective_duration_secs() * 1000 + 700);
     let mut active_elapsed = Duration::ZERO;
     let mut last_tick = Instant::now();
@@ -1256,7 +1302,6 @@ async fn run_server(
         let tls_acceptor = tls_acceptor.clone();
         let payloads = payloads.clone();
         let replay = replay.clone();
-        let next_flow = next_flow.clone();
         tokio::spawn(async move {
             let _active_connection = c2.connection_opened();
             let mut stream: Box<dyn IoStream> = match tls_acceptor {
@@ -1269,12 +1314,8 @@ async fn run_server(
                 },
                 None => Box::new(stream),
             };
-            let flow = replay.as_ref().map(|plan| {
-                let index = next_flow.fetch_add(1, Ordering::Relaxed) as usize % plan.flows.len();
-                plan.flows[index].clone()
-            });
-            let r = if let Some(turns) = flow {
-                replay_server(&mut *stream, &turns, &sc, &c2).await
+            let r = if let Some(plan) = replay {
+                replay_server_detect(&mut *stream, &plan, &sc, &c2).await
             } else if sc.protocol == Protocol::Http1 {
                 serve_http_connection(&mut *stream, &payloads, &c2).await
             } else {
@@ -1539,6 +1580,47 @@ mod tests {
         assert_eq!(plan.flows.len(), 2);
         assert_eq!(plan.flows[0].len(), 2);
         assert_eq!(plan.flows[1].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn responder_detects_flow_from_first_client_turn() {
+        let first: Arc<[ReplayTurn]> = vec![
+            ReplayTurn {
+                direction: Direction::ClientToServer,
+                payload: b"alpha".to_vec(),
+            },
+            ReplayTurn {
+                direction: Direction::ServerToClient,
+                payload: b"A".to_vec(),
+            },
+        ]
+        .into();
+        let second: Arc<[ReplayTurn]> = vec![
+            ReplayTurn {
+                direction: Direction::ClientToServer,
+                payload: b"beta".to_vec(),
+            },
+            ReplayTurn {
+                direction: Direction::ServerToClient,
+                payload: b"B".to_vec(),
+            },
+        ]
+        .into();
+        let plan = ReplayPlan {
+            flows: vec![first, second.clone()].into(),
+        };
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(128);
+        let scenario = Scenario::default();
+        let client_counters = Counters::default();
+        let server_counters = Counters::default();
+        let (client, server) = tokio::join!(
+            replay_client(&mut client_stream, &second, &scenario, &client_counters),
+            replay_server_detect(&mut server_stream, &plan, &scenario, &server_counters),
+        );
+        client.unwrap();
+        server.unwrap();
+        assert_eq!(client_counters.rx.load(Ordering::Relaxed), 1);
+        assert_eq!(server_counters.rx.load(Ordering::Relaxed), 4);
     }
 }
 async fn send_event(
