@@ -19,6 +19,19 @@ pub struct ReassembledFlow {
     pub client_to_server: Vec<u8>,
     pub server_to_client: Vec<u8>,
     pub retransmitted_bytes: u64,
+    pub turns: Vec<ReplayTurn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayTurn {
+    pub direction: Direction,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,6 +81,7 @@ struct Segments {
     client: BTreeMap<u32, Vec<u8>>,
     server: BTreeMap<u32, Vec<u8>>,
     duplicate_bytes: u64,
+    events: Vec<(Direction, u32, Vec<u8>)>,
 }
 
 pub fn analyze_pcap(data: &[u8]) -> Result<CaptureAnalysis, CaptureError> {
@@ -146,6 +160,7 @@ fn finish_analysis(
             client_to_server,
             server_to_client,
             retransmitted_bytes: parts.duplicate_bytes + client_dup + server_dup,
+            turns: build_turns(parts.events),
         });
     }
 }
@@ -280,6 +295,14 @@ fn parse_ethernet(
         return;
     }
     let direction = flows.get_mut(&key).unwrap();
+    let event_direction = if from_client {
+        Direction::ClientToServer
+    } else {
+        Direction::ServerToClient
+    };
+    direction
+        .events
+        .push((event_direction, tcp.2, tcp.3.to_vec()));
     let target = if from_client {
         &mut direction.client
     } else {
@@ -290,6 +313,31 @@ fn parse_ethernet(
     } else {
         target.insert(tcp.2, tcp.3.to_vec());
     }
+}
+
+fn build_turns(events: Vec<(Direction, u32, Vec<u8>)>) -> Vec<ReplayTurn> {
+    let mut groups: Vec<(Direction, BTreeMap<u32, Vec<u8>>)> = Vec::new();
+    for (direction, sequence, payload) in events {
+        if payload.is_empty() {
+            continue;
+        }
+        if groups.last().is_none_or(|group| group.0 != direction) {
+            groups.push((direction, BTreeMap::new()));
+        }
+        groups
+            .last_mut()
+            .unwrap()
+            .1
+            .entry(sequence)
+            .or_insert(payload);
+    }
+    groups
+        .into_iter()
+        .filter_map(|(direction, segments)| {
+            let (payload, _) = reassemble(segments);
+            (!payload.is_empty()).then_some(ReplayTurn { direction, payload })
+        })
+        .collect()
 }
 
 type ParsedPacket<'a> = ([u8; 16], [u8; 16], (u16, u16, u32, &'a [u8]));
@@ -390,6 +438,15 @@ mod tests {
         assert_eq!(analysis.flows.len(), 2);
         assert_eq!(analysis.exclusions.non_tcp_packets, 1);
         assert_eq!(analysis.flows[0].retransmitted_bytes, 30);
+        assert_eq!(analysis.flows[0].turns.len(), 2);
+        assert_eq!(
+            analysis.flows[0].turns[0].direction,
+            Direction::ClientToServer
+        );
+        assert_eq!(
+            analysis.flows[0].turns[1].direction,
+            Direction::ServerToClient
+        );
         assert_eq!(
             analysis.flows[0].client_to_server,
             b"POST /scan HTTP/1.1\r\nHost: dlp.test\r\nContent-Length: 9\r\n\r\nDLP-SECRET"
