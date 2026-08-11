@@ -280,6 +280,7 @@ async fn preflight(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
+    validate_payload_artifacts(&s.db, &sc).await?;
     let agents = s.agents.read().await;
     let client = agents.get(&sc.client_agent_id);
     let server = agents.get(&sc.server_agent_id);
@@ -470,6 +471,7 @@ async fn save_scenario(
 ) -> Result<Json<Scenario>, ApiError> {
     let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
+    validate_payload_artifacts(&s.db, &sc).await?;
     let body = serde_json::to_string(&sc)?;
     let now = Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO scenarios(id,name,body,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,body=excluded.body,updated_at=excluded.updated_at")
@@ -602,6 +604,40 @@ async fn start_run(
 }
 
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
+
+async fn validate_payload_artifacts(db: &SqlitePool, scenario: &Scenario) -> Result<(), ApiError> {
+    for (direction, payload) in [
+        ("request", scenario.request_payload()),
+        ("response", scenario.response_payload()),
+    ] {
+        if payload.kind != PayloadKind::File {
+            continue;
+        }
+        let id = payload.artifact_id.ok_or_else(|| {
+            ApiError::bad(format!("{direction} file payload requires artifact_id"))
+        })?;
+        let row = sqlx::query("SELECT kind,size_bytes FROM artifacts WHERE id=?")
+            .bind(id.to_string())
+            .fetch_optional(db)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad(format!("{direction} payload artifact {id} does not exist"))
+            })?;
+        if row.get::<String, _>("kind") != "payload" {
+            return Err(ApiError::bad(format!(
+                "{direction} artifact {id} is not a payload artifact"
+            )));
+        }
+        let stored_size = row.get::<i64, _>("size_bytes") as usize;
+        if stored_size != payload.size_bytes {
+            return Err(ApiError::bad(format!(
+                "{direction} artifact size changed: scenario={}, stored={stored_size}",
+                payload.size_bytes
+            )));
+        }
+    }
+    Ok(())
+}
 
 async fn send_artifacts(
     db: &SqlitePool,
@@ -769,6 +805,14 @@ fn redacted_scenario(body: &str) -> serde_json::Value {
         .and_then(serde_json::Value::as_object_mut)
     {
         tls.insert("server_key_pem".into(), serde_json::Value::Null);
+    }
+    for direction in ["request_payload", "response_payload"] {
+        if let Some(payload) = value
+            .get_mut(direction)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            payload.insert("text".into(), serde_json::Value::String(String::new()));
+        }
     }
     value
 }
