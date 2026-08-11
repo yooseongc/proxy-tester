@@ -399,6 +399,9 @@ async fn upload_artifact(
                     "unsupported_link_packets": analyzed.exclusions.unsupported_link_packets,
                     "incomplete_flows": analyzed.exclusions.incomplete_flows,
                     "encrypted_tls_flows": analyzed.exclusions.encrypted_tls_flows,
+                    "non_http_flows": analyzed.exclusions.non_http_flows,
+                    "unsupported_http_flows": analyzed.exclusions.unsupported_http_flows,
+                    "http_upgrade_flows": analyzed.exclusions.http_upgrade_flows,
                 }
             });
             (

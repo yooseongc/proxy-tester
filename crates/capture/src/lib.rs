@@ -49,6 +49,9 @@ pub struct Exclusions {
     pub unsupported_link_packets: u64,
     pub incomplete_flows: u64,
     pub encrypted_tls_flows: u64,
+    pub non_http_flows: u64,
+    pub unsupported_http_flows: u64,
+    pub http_upgrade_flows: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +166,33 @@ fn finish_analysis(
             continue;
         }
         let http_transactions =
-            extract_http_transactions(&client_to_server, &server_to_client).unwrap_or_default();
+            match extract_http_transactions(&client_to_server, &server_to_client) {
+                Some(transactions) => transactions,
+                None if !client_to_server.starts_with(b"HTTP/")
+                    && !client_to_server.windows(6).any(|part| part == b" HTTP/") =>
+                {
+                    analysis.exclusions.non_http_flows += 1;
+                    Vec::new()
+                }
+                None if contains_ascii_case_insensitive(&client_to_server, b"upgrade:")
+                    || contains_ascii_case_insensitive(
+                        &client_to_server,
+                        b"connection: upgrade",
+                    )
+                    || contains_ascii_case_insensitive(&server_to_client, b"upgrade:")
+                    || contains_ascii_case_insensitive(
+                        &server_to_client,
+                        b"connection: upgrade",
+                    ) =>
+                {
+                    analysis.exclusions.http_upgrade_flows += 1;
+                    Vec::new()
+                }
+                None => {
+                    analysis.exclusions.unsupported_http_flows += 1;
+                    Vec::new()
+                }
+            };
         analysis.flows.push(ReassembledFlow {
             key,
             client_to_server,
@@ -173,6 +202,12 @@ fn finish_analysis(
             http_transactions,
         });
     }
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|part| part.eq_ignore_ascii_case(needle))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,6 +662,7 @@ mod tests {
         );
         assert_eq!(analysis.flows[1].client_to_server, b"PING");
         assert_eq!(analysis.flows[1].server_to_client, b"PONG");
+        assert_eq!(analysis.exclusions.non_http_flows, 1);
     }
 
     #[test]
@@ -719,5 +755,42 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn http_exclusion_reasons_are_counted_during_capture_analysis() {
+        let mut analysis = CaptureAnalysis {
+            packet_count: 0,
+            captured_bytes: 0,
+            flows: Vec::new(),
+            exclusions: Exclusions::default(),
+        };
+        let key = FlowKey {
+            client: Endpoint {
+                address: [0; 16],
+                port: 1,
+            },
+            server: Endpoint {
+                address: [1; 16],
+                port: 2,
+            },
+        };
+        let flows = HashMap::from([(
+            key.clone(),
+            Segments {
+                client: BTreeMap::from([(
+                    1,
+                    b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n\r\n".to_vec(),
+                )]),
+                server: BTreeMap::from([(
+                    1,
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n".to_vec(),
+                )]),
+                ..Default::default()
+            },
+        )]);
+        finish_analysis(&mut analysis, vec![key], flows);
+        assert_eq!(analysis.exclusions.http_upgrade_flows, 1);
+        assert!(analysis.flows[0].http_transactions.is_empty());
     }
 }
