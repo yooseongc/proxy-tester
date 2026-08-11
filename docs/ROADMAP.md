@@ -46,12 +46,16 @@
 
 완료 조건: 다중 flow fixture를 직접/TLS/CONNECT 경로에서 재현하고 client/server transcript가 원본 turn과 일치함.
 
-## M4 — HTTP/1.1 capture replay
+## M4 — HTTP/1.1 capture replay (완료)
 
 - request/status line, Content-Length, chunked body, keep-alive 메시지 경계 추출
 - capture endpoint를 현재 target/Host 정책에 맞게 재작성
 - request/response template transaction replay
 - 불완전·upgrade·암호화 메시지의 명시적 제외
+
+구현 완료: 재조립된 양방향 stream에서 `Content-Length`와 chunked framing을 포함한 HTTP/1.1 메시지를 추출하고 request/response transaction으로 대응시킨다. 캡처의 method·path·body는 유지하면서 현재 Host를 적용하고, 평문 forward proxy Client에서만 absolute-form target으로 변환한다. Agent는 응답마다 TPS와 HTTP latency를 계측한다.
+
+검증: `tests/http-capture-replay-regression.ps1`가 2개 keep-alive transaction을 담은 Scapy fixture를 업로드하고 직접 연결, 평문 HTTP forward proxy, TLS-over-CONNECT 경로를 실제 Compose 프로세스에서 반복 실행한다. 완료 상태, transaction 발생, HTTP latency, client 오류 0건과 직접 연결 endpoint byte 대칭을 확인한다.
 
 완료 조건: 다중 transaction/connection fixture가 메시지 단위로 재현되고 TPS·오류 계측이 일치함.
 
