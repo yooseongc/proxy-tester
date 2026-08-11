@@ -32,13 +32,15 @@
 
 완료 조건: fixture를 매번 동일하게 생성하고 Rust parser golden test가 모든 포함/제외 수와 byte stream을 검증함.
 
-## M3 — TCP capture replay 실행기
+## M3 — TCP capture replay 실행기 (진행 중)
 
 - 재조립 stream을 방향 전환 기준 turn으로 변환
 - VU별 flow template round-robin scheduler
 - VU가 flow보다 많거나 적은 경계조건
 - 원본 timing을 제거하고 turn 순서만 보존하여 최대속도 반복
 - 평문 payload를 선택한 새 TLS 세션에서 재암호화
+
+현재 완료: turn 생성, gRPC capture 전송, Agent 재분석, flow round-robin, 첫 client turn 기반 responder 매칭, 직접/TLS/CONNECT 실행 경로. 남은 작업: 대용량 capture 임시파일 처리와 실제 프로세스 lifecycle 통합시험.
 
 완료 조건: 다중 flow fixture를 직접/TLS/CONNECT 경로에서 재현하고 client/server transcript가 원본 turn과 일치함.
 
