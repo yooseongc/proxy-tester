@@ -30,7 +30,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock, broadcast, mpsc},
+    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
 use tower_http::{
@@ -63,10 +63,16 @@ struct Args {
     artifact_dir: String,
     #[arg(long, env = "PROXY_TESTER_RETENTION_DAYS", default_value_t = 90)]
     retention_days: i64,
+    #[arg(long, env = "PROXY_TESTER_AGENT_GRACE_SECS", default_value_t = 10)]
+    agent_grace_secs: u64,
+    #[arg(long, env = "PROXY_TESTER_COMMAND_TIMEOUT_SECS", default_value_t = 10)]
+    command_timeout_secs: u64,
 }
 
 #[derive(Clone)]
 struct AgentSession {
+    instance_id: String,
+    generation: Uuid,
     role: i32,
     hostname: String,
     interfaces: Vec<String>,
@@ -80,7 +86,19 @@ struct AppState {
     agents: Arc<RwLock<HashMap<String, AgentSession>>>,
     events: broadcast::Sender<String>,
     active_run: Arc<Mutex<Option<Uuid>>>,
+    run_agents: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
+    completed_agents: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
+    pending_acks: Arc<Mutex<HashMap<String, oneshot::Sender<CommandAckResult>>>>,
+    agent_grace_secs: u64,
+    command_timeout_secs: u64,
     artifact_dir: Arc<std::path::PathBuf>,
+}
+
+#[derive(Debug)]
+struct CommandAckResult {
+    agent_id: String,
+    ok: bool,
+    error: String,
 }
 
 #[tokio::main]
@@ -109,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("open sqlite")?;
     migrate(&db).await?;
+    sqlx::query("UPDATE runs SET status='failed',finished_at=?,error='control_restarted' WHERE status IN ('preparing','running','paused','degraded')")
+        .bind(Utc::now().to_rfc3339()).execute(&db).await?;
     if args.retention_days > 0 {
         apply_retention(&db, args.retention_days).await?;
         cleanup_orphan_artifacts(&db, args.retention_days).await?;
@@ -120,6 +140,11 @@ async fn main() -> anyhow::Result<()> {
         agents: Default::default(),
         events,
         active_run: Default::default(),
+        run_agents: Default::default(),
+        completed_agents: Default::default(),
+        pending_acks: Default::default(),
+        agent_grace_secs: args.agent_grace_secs,
+        command_timeout_secs: args.command_timeout_secs,
         artifact_dir: Arc::new(args.artifact_dir.into()),
     };
 
@@ -219,6 +244,7 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_metrics_run_time ON metric_samples(run_id,unix_ms)",
         "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,unix_ms INTEGER NOT NULL,level TEXT NOT NULL,message TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,name TEXT NOT NULL,sha256 TEXT NOT NULL UNIQUE,size_bytes INTEGER NOT NULL,format TEXT NOT NULL,packet_count INTEGER NOT NULL,captured_bytes INTEGER NOT NULL,path TEXT NOT NULL,created_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS run_participants(run_id TEXT NOT NULL,agent_id TEXT NOT NULL,instance_id TEXT NOT NULL,role INTEGER NOT NULL,phase TEXT NOT NULL,last_command_id TEXT,error TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(run_id,agent_id))",
     ] {
         sqlx::query(sql).execute(db).await?;
     }
@@ -620,12 +646,15 @@ async fn start_run(
         return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
     }
     let sessions = s.agents.read().await;
+    let online_cutoff = Utc::now().timestamp_millis() - 15_000;
     let client = sessions
         .get(&sc.client_agent_id)
+        .filter(|agent| agent.last_seen_ms >= online_cutoff)
         .ok_or_else(|| ApiError::bad("client agent가 연결되지 않았습니다"))?
         .clone();
     let server = sessions
         .get(&sc.server_agent_id)
+        .filter(|agent| agent.last_seen_ms >= online_cutoff)
         .ok_or_else(|| ApiError::bad("server agent가 연결되지 않았습니다"))?
         .clone();
     drop(sessions);
@@ -654,43 +683,86 @@ async fn start_run(
         body: Some(control_message::Body::Prepare(PrepareRun {
             run_id: run_id.to_string(),
             scenario_json: json,
+            command_id: String::new(),
         })),
     };
-    send_artifacts(&s.db, &client, &artifact_ids).await?;
-    send_artifacts(&s.db, &server, &artifact_ids).await?;
-    client
-        .tx
-        .send(Ok(prepare.clone()))
-        .await
-        .map_err(|_| ApiError::internal("client channel closed"))?;
-    server
-        .tx
-        .send(Ok(prepare))
-        .await
-        .map_err(|_| ApiError::internal("server channel closed"))?;
+    let preparation = async {
+        send_artifacts(&s.db, &client, &artifact_ids).await?;
+        send_artifacts(&s.db, &server, &artifact_ids).await?;
+        command_agent(
+            &s,
+            &sc.client_agent_id,
+            &client,
+            run_id,
+            "prepare",
+            prepare.clone(),
+        )
+        .await?;
+        command_agent(&s, &sc.server_agent_id, &server, run_id, "prepare", prepare).await?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(error) = preparation {
+        sqlx::query("UPDATE runs SET status='failed',finished_at=?,error=? WHERE id=?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(&error.1)
+            .bind(run_id.to_string())
+            .execute(&s.db)
+            .await?;
+        return Err(error);
+    }
     let start_at = Utc::now().timestamp_millis() + 1000;
     let start = ControlMessage {
         body: Some(control_message::Body::Start(StartRun {
             run_id: run_id.to_string(),
             start_unix_ms: start_at,
+            command_id: String::new(),
         })),
     };
-    client
-        .tx
-        .send(Ok(start.clone()))
-        .await
-        .map_err(|_| ApiError::internal("client channel closed"))?;
-    server
-        .tx
-        .send(Ok(start))
-        .await
-        .map_err(|_| ApiError::internal("server channel closed"))?;
+    let starting = async {
+        command_agent(
+            &s,
+            &sc.client_agent_id,
+            &client,
+            run_id,
+            "start",
+            start.clone(),
+        )
+        .await?;
+        command_agent(&s, &sc.server_agent_id, &server, run_id, "start", start).await?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(error) = starting {
+        for agent in [&client, &server] {
+            let _ = agent
+                .tx
+                .send(Ok(ControlMessage {
+                    body: Some(control_message::Body::Stop(StopRun {
+                        run_id: run_id.to_string(),
+                        command_id: Uuid::new_v4().to_string(),
+                    })),
+                }))
+                .await;
+        }
+        sqlx::query("UPDATE runs SET status='failed',finished_at=?,error=? WHERE id=?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(&error.1)
+            .bind(run_id.to_string())
+            .execute(&s.db)
+            .await?;
+        return Err(error);
+    }
     sqlx::query("UPDATE runs SET status='running',started_at=? WHERE id=?")
         .bind(started_at.to_rfc3339())
         .bind(run_id.to_string())
         .execute(&s.db)
         .await?;
     *active = Some(run_id);
+    s.run_agents.lock().await.insert(
+        run_id,
+        HashSet::from([sc.client_agent_id.clone(), sc.server_agent_id.clone()]),
+    );
     let _ = s
         .events
         .send(serde_json::json!({"type":"run_started","run_id":run_id}).to_string());
@@ -698,6 +770,73 @@ async fn start_run(
         StatusCode::CREATED,
         Json(serde_json::json!({"id":run_id,"status":"running"})),
     ))
+}
+
+fn with_command_id(mut message: ControlMessage, command_id: &str) -> ControlMessage {
+    match message.body.as_mut() {
+        Some(control_message::Body::Prepare(value)) => value.command_id = command_id.into(),
+        Some(control_message::Body::Start(value)) => value.command_id = command_id.into(),
+        Some(control_message::Body::Stop(value)) => value.command_id = command_id.into(),
+        Some(control_message::Body::SetPaused(value)) => value.command_id = command_id.into(),
+        _ => {}
+    }
+    message
+}
+
+async fn command_agent(
+    s: &AppState,
+    agent_id: &str,
+    agent: &AgentSession,
+    run_id: Uuid,
+    phase: &str,
+    message: ControlMessage,
+) -> Result<(), ApiError> {
+    let command_id = Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel();
+    s.pending_acks.lock().await.insert(command_id.clone(), tx);
+    sqlx::query("INSERT INTO run_participants(run_id,agent_id,instance_id,role,phase,last_command_id,error,updated_at) VALUES(?,?,?,?,?,?,NULL,?) ON CONFLICT(run_id,agent_id) DO UPDATE SET instance_id=excluded.instance_id,phase=excluded.phase,last_command_id=excluded.last_command_id,error=NULL,updated_at=excluded.updated_at")
+        .bind(run_id.to_string()).bind(agent_id).bind(&agent.instance_id).bind(agent.role).bind(phase).bind(&command_id).bind(Utc::now().to_rfc3339()).execute(&s.db).await?;
+    if agent
+        .tx
+        .send(Ok(with_command_id(message, &command_id)))
+        .await
+        .is_err()
+    {
+        s.pending_acks.lock().await.remove(&command_id);
+        return Err(ApiError::internal(format!(
+            "{agent_id} channel closed during {phase}"
+        )));
+    }
+    let ack = match tokio::time::timeout(std::time::Duration::from_secs(s.command_timeout_secs), rx)
+        .await
+    {
+        Ok(Ok(ack)) => ack,
+        Ok(Err(_)) => {
+            return Err(ApiError::internal(format!(
+                "{agent_id} {phase} acknowledgement channel closed"
+            )));
+        }
+        Err(_) => {
+            s.pending_acks.lock().await.remove(&command_id);
+            return Err(ApiError::internal(format!(
+                "{agent_id} {phase} acknowledgement timed out"
+            )));
+        }
+    };
+    if !ack.ok {
+        return Err(ApiError::internal(format!(
+            "{} {phase} failed: {}",
+            ack.agent_id, ack.error
+        )));
+    }
+    sqlx::query("UPDATE run_participants SET phase=?,updated_at=? WHERE run_id=? AND agent_id=?")
+        .bind(format!("{phase}_acked"))
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id.to_string())
+        .bind(agent_id)
+        .execute(&s.db)
+        .await?;
+    Ok(())
 }
 
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
@@ -852,14 +991,31 @@ async fn stop_run(
     if current != Some(id) {
         return Err(ApiError::bad("실행 중인 run이 아닙니다"));
     }
-    for a in s.agents.read().await.values() {
-        let _ =
-            a.tx.send(Ok(ControlMessage {
-                body: Some(control_message::Body::Stop(StopRun {
-                    run_id: id.to_string(),
-                })),
-            }))
+    let agents = s.agents.read().await.clone();
+    let participant_ids = s
+        .run_agents
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    for agent_id in participant_ids {
+        if let Some(agent) = agents.get(&agent_id) {
+            let _ = command_agent(
+                &s,
+                &agent_id,
+                agent,
+                id,
+                "stop",
+                ControlMessage {
+                    body: Some(control_message::Body::Stop(StopRun {
+                        run_id: id.to_string(),
+                        command_id: String::new(),
+                    })),
+                },
+            )
             .await;
+        }
     }
     finish_run(&s, id, "cancelled", None).await?;
     Ok(Json(serde_json::json!({"id":id,"status":"cancelled"})))
@@ -888,14 +1044,30 @@ async fn set_run_paused(
         body: Some(control_message::Body::SetPaused(SetPaused {
             run_id: id.to_string(),
             paused,
+            command_id: String::new(),
         })),
     };
-    for agent in s.agents.read().await.values() {
-        agent
-            .tx
-            .send(Ok(message.clone()))
-            .await
-            .map_err(|_| ApiError::internal("agent channel closed"))?;
+    let agents = s.agents.read().await.clone();
+    let participant_ids = s
+        .run_agents
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    for agent_id in participant_ids {
+        let agent = agents
+            .get(&agent_id)
+            .ok_or_else(|| ApiError::internal(format!("{agent_id} is disconnected")))?;
+        command_agent(
+            s,
+            &agent_id,
+            agent,
+            id,
+            if paused { "pause" } else { "resume" },
+            message.clone(),
+        )
+        .await?;
     }
     let status = if paused { "paused" } else { "running" };
     sqlx::query("UPDATE runs SET status=? WHERE id=?")
@@ -925,6 +1097,9 @@ async fn finish_run(
     if *active == Some(id) {
         *active = None;
     }
+    drop(active);
+    s.run_agents.lock().await.remove(&id);
+    s.completed_agents.lock().await.remove(&id);
     let _ = s
         .events
         .send(serde_json::json!({"type":"run_finished","run_id":id,"status":status}).to_string());
@@ -969,7 +1144,7 @@ async fn run_detail(
     let samples = samples.into_iter().map(|r|serde_json::json!({"agent_id":r.get::<String,_>("agent_id"),"role":r.get::<i64,_>("role"),"unix_ms":r.get::<i64,_>("unix_ms"),"metrics":serde_json::from_str::<serde_json::Value>(r.get("metrics_json")).unwrap_or_default()})).collect::<Vec<_>>();
     let payload_metadata = result_payload_metadata(&scenario_json, &samples);
     Ok(Json(
-        serde_json::json!({"id":run.get::<String,_>("id"),"run_name":run.get::<Option<String>,_>("run_name"),"started_at":run.get::<Option<String>,_>("started_at"),"status":run.get::<String,_>("status"),"scenario":redacted_scenario(&scenario_json),"payload_metadata":payload_metadata,"samples":samples }),
+        serde_json::json!({"id":run.get::<String,_>("id"),"run_name":run.get::<Option<String>,_>("run_name"),"started_at":run.get::<Option<String>,_>("started_at"),"finished_at":run.get::<Option<String>,_>("finished_at"),"status":run.get::<String,_>("status"),"error":run.get::<Option<String>,_>("error"),"scenario":redacted_scenario(&scenario_json),"payload_metadata":payload_metadata,"samples":samples }),
     ))
 }
 
@@ -1045,10 +1220,13 @@ impl AgentControl for ControlSvc {
         };
         let id = hello.agent_id.clone();
         let role = hello.role;
+        let generation = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(64);
         self.0.agents.write().await.insert(
             id.clone(),
             AgentSession {
+                instance_id: hello.instance_id,
+                generation,
                 role,
                 hostname: hello.hostname,
                 interfaces: hello.interfaces,
@@ -1060,9 +1238,27 @@ impl AgentControl for ControlSvc {
         tokio::spawn(async move {
             while let Some(Ok(msg)) = incoming.next().await {
                 match msg.body {
-                    Some(agent_message::Body::Heartbeat(h)) => {
-                        if let Some(a) = state.agents.write().await.get_mut(&id) {
-                            a.last_seen_ms = h.unix_ms;
+                    Some(agent_message::Body::Heartbeat(_)) => {
+                        if let Some(a) = state.agents.write().await.get_mut(&id)
+                            && a.generation == generation
+                        {
+                            a.last_seen_ms = Utc::now().timestamp_millis();
+                        }
+                    }
+                    Some(agent_message::Body::CommandAck(ack)) => {
+                        if let Some(waiter) =
+                            state.pending_acks.lock().await.remove(&ack.command_id)
+                        {
+                            let _ = waiter.send(CommandAckResult {
+                                agent_id: id.clone(),
+                                ok: ack.ok,
+                                error: ack.error,
+                            });
+                        }
+                    }
+                    Some(agent_message::Body::Status(status)) => {
+                        if !status.active_run_id.is_empty() {
+                            warn!(agent=%id, run=%status.active_run_id, "agent reconnected with orphan run; it will not be resumed");
                         }
                     }
                     Some(agent_message::Body::Telemetry(t)) => {
@@ -1085,19 +1281,103 @@ impl AgentControl for ControlSvc {
                             && let Ok(run_id) = Uuid::parse_str(&e.run_id)
                             && *state.active_run.lock().await == Some(run_id)
                         {
-                            let _ = finish_run(&state, run_id, "completed", None).await;
+                            let expected = state
+                                .run_agents
+                                .lock()
+                                .await
+                                .get(&run_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut completed = state.completed_agents.lock().await;
+                            completed.entry(run_id).or_default().insert(id.clone());
+                            let all_completed = !expected.is_empty()
+                                && completed
+                                    .get(&run_id)
+                                    .is_some_and(|items| expected.is_subset(items));
+                            drop(completed);
+                            if all_completed {
+                                let _ = finish_run(&state, run_id, "completed", None).await;
+                            }
                         }
                         let _=state.events.send(serde_json::json!({"type":"agent_event","agent_id":id,"run_id":e.run_id,"level":e.level,"message":e.message}).to_string());
                     }
                     _ => {}
                 }
             }
-            state.agents.write().await.remove(&id);
+            let removed = {
+                let mut agents = state.agents.write().await;
+                if agents
+                    .get(&id)
+                    .is_some_and(|session| session.generation == generation)
+                {
+                    agents.remove(&id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                schedule_disconnect_failure(state.clone(), id.clone()).await;
+            }
             warn!(agent=%id,"agent disconnected");
         });
         let output = async_stream::stream! {while let Some(msg)=rx.recv().await{yield msg;}};
         Ok(GrpcResponse::new(Box::pin(output)))
     }
+}
+
+async fn schedule_disconnect_failure(state: AppState, agent_id: String) {
+    let Some(run_id) = *state.active_run.lock().await else {
+        return;
+    };
+    let participates = state
+        .run_agents
+        .lock()
+        .await
+        .get(&run_id)
+        .is_some_and(|ids| ids.contains(&agent_id));
+    if !participates {
+        return;
+    }
+    let _ = sqlx::query("UPDATE runs SET status='degraded',error=? WHERE id=?")
+        .bind(format!(
+            "{agent_id} disconnected; waiting for reconnect grace"
+        ))
+        .bind(run_id.to_string())
+        .execute(&state.db)
+        .await;
+    let _ = state.events.send(serde_json::json!({"type":"run_state","run_id":run_id,"status":"degraded","agent_id":agent_id}).to_string());
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(state.agent_grace_secs)).await;
+        if *state.active_run.lock().await != Some(run_id) {
+            return;
+        }
+        let reconnected = state.agents.read().await.contains_key(&agent_id);
+        let reason = if reconnected {
+            "agent_reconnected_no_resume"
+        } else {
+            "agent_disconnected"
+        };
+        let peers: Vec<_> = state.agents.read().await.values().cloned().collect();
+        for peer in peers {
+            let _ = peer
+                .tx
+                .send(Ok(ControlMessage {
+                    body: Some(control_message::Body::Stop(StopRun {
+                        run_id: run_id.to_string(),
+                        command_id: Uuid::new_v4().to_string(),
+                    })),
+                }))
+                .await;
+        }
+        let _ = finish_run(
+            &state,
+            run_id,
+            "failed",
+            Some(&format!("{reason}: {agent_id}")),
+        )
+        .await;
+    });
 }
 
 #[derive(Debug)]

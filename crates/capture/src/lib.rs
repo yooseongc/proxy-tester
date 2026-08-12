@@ -410,7 +410,7 @@ pub fn analyze_pcapng(data: &[u8]) -> Result<CaptureAnalysis, CaptureError> {
         }
         let block_type = read_u32(&data[offset..offset + 4]);
         let length = read_u32(&data[offset + 4..offset + 8]) as usize;
-        if length < 12 || length % 4 != 0 || offset + length > data.len() {
+        if length < 12 || !length.is_multiple_of(4) || offset + length > data.len() {
             return Err(CaptureError::Truncated);
         }
         if read_u32(&data[offset + length - 4..offset + length]) as usize != length {

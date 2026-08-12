@@ -61,6 +61,8 @@ NIC wire 계측을 사용하려면 Agent가 해당 Linux interface의 `/sys/clas
 | Control | `PROXY_TESTER_STATIC_DIR` | `frontend/dist` | CSR 정적 자산 경로 |
 | Control | `PROXY_TESTER_ARTIFACT_DIR` | `data/artifacts` | 업로드 artifact 경로 |
 | Control | `PROXY_TESTER_RETENTION_DAYS` | `90` | 완료 Run과 참조되지 않은 artifact 보존 일수, 0 이하는 자동 정리 중지 |
+| Control | `PROXY_TESTER_AGENT_GRACE_SECS` | `10` | Agent 연결 단절 후 Run 안전 실패까지의 유예 시간 |
+| Control | `PROXY_TESTER_COMMAND_TIMEOUT_SECS` | `10` | Agent 상태 명령 ACK 제한 시간 |
 | Agent | `PROXY_TESTER_CONTROL` | `http://control:50051` | Control gRPC endpoint |
 | Agent | `PROXY_TESTER_AGENT_ID` | 역할 기반 `*-1` | UI와 시나리오에서 사용할 고유 ID |
 | Agent | `PROXY_TESTER_ROLE` | 실행 파일명에서 추론 | `client` 또는 `server` |

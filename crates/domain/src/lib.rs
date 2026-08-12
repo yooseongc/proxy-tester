@@ -392,12 +392,10 @@ impl Scenario {
                 self.version
             )));
         }
-        if self.payload_mode == PayloadMode::CaptureReplay {
-            if self.capture_artifact_id.is_none() {
-                return Err(ValidationError::Invalid(
-                    "PCAP session replay requires an analyzed capture artifact".into(),
-                ));
-            }
+        if self.payload_mode == PayloadMode::CaptureReplay && self.capture_artifact_id.is_none() {
+            return Err(ValidationError::Invalid(
+                "PCAP session replay requires an analyzed capture artifact".into(),
+            ));
         }
         for (direction, payload) in [
             ("request", self.request_payload()),

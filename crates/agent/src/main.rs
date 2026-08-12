@@ -8,7 +8,7 @@ use proxy_tester_domain::{
     TlsVersion, Topology,
 };
 use proxy_tester_proto::v1::{
-    AgentEvent, AgentHello, AgentMessage, AgentRole, Heartbeat, Telemetry,
+    AgentEvent, AgentHello, AgentMessage, AgentRole, AgentStatus, CommandAck, Heartbeat, Telemetry,
     agent_control_client::AgentControlClient, agent_message, control_message,
 };
 use rand::RngCore;
@@ -20,7 +20,7 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     io::Cursor,
     net::SocketAddr,
     sync::{
@@ -614,8 +614,9 @@ async fn main() -> anyhow::Result<()> {
             }
         )
     });
+    let instance_id = Uuid::new_v4().to_string();
     loop {
-        match run_connection(&args.control, &id, role).await {
+        match run_connection(&args.control, &id, &instance_id, role).await {
             Ok(()) => warn!("control stream ended"),
             Err(e) => error!(%e,"control connection failed"),
         };
@@ -623,7 +624,12 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<()> {
+async fn run_connection(
+    control: &str,
+    id: &str,
+    instance_id: &str,
+    role: Role,
+) -> anyhow::Result<()> {
     let mut client = AgentControlClient::connect(control.to_owned()).await?;
     let (tx, rx) = mpsc::channel(128);
     tx.send(AgentMessage {
@@ -633,6 +639,7 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
             hostname: hostname(),
             version: env!("CARGO_PKG_VERSION").into(),
             interfaces: list_interfaces(),
+            instance_id: instance_id.into(),
         })),
     })
     .await?;
@@ -662,9 +669,22 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
     let mut completed_artifacts = HashMap::new();
     type ActiveRun = (Uuid, Arc<AtomicBool>, Arc<AtomicBool>);
     let active_run: Arc<Mutex<Option<ActiveRun>>> = Default::default();
+    tx.send(AgentMessage {
+        body: Some(agent_message::Body::Status(AgentStatus {
+            active_run_id: String::new(),
+            phase: "idle".into(),
+        })),
+    })
+    .await?;
+    let mut completed_commands = HashSet::new();
+    let mut command_order = VecDeque::new();
     while let Some(cmd) = commands.next().await {
         match cmd?.body {
             Some(control_message::Body::Prepare(p)) => {
+                if command_seen(&completed_commands, &p.command_id) {
+                    send_ack(&tx, &p.command_id, &p.run_id, "prepare", true, "").await?;
+                    continue;
+                }
                 if !incoming_artifacts.is_empty() {
                     bail!("PrepareRun arrived before artifact transfer completed");
                 }
@@ -698,13 +718,28 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                     replay,
                 });
                 info!(run=%p.run_id,"prepared");
+                remember_command(&mut completed_commands, &mut command_order, &p.command_id);
+                send_ack(&tx, &p.command_id, &p.run_id, "prepare", true, "").await?;
             }
             Some(control_message::Body::ArtifactChunk(chunk)) => {
                 accept_artifact_chunk(&mut incoming_artifacts, &mut completed_artifacts, chunk)
                     .await?;
             }
             Some(control_message::Body::Start(s)) => {
+                if command_seen(&completed_commands, &s.command_id) {
+                    send_ack(&tx, &s.command_id, &s.run_id, "start", true, "").await?;
+                    continue;
+                }
                 let Some(job) = prepared.lock().await.clone() else {
+                    send_ack(
+                        &tx,
+                        &s.command_id,
+                        &s.run_id,
+                        "start",
+                        false,
+                        "run was not prepared",
+                    )
+                    .await?;
                     continue;
                 };
                 let mut active = active_run.lock().await;
@@ -712,12 +747,23 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                     .as_ref()
                     .is_some_and(|(_, running, _)| running.load(Ordering::SeqCst))
                 {
+                    send_ack(
+                        &tx,
+                        &s.command_id,
+                        &s.run_id,
+                        "start",
+                        false,
+                        "another run is active",
+                    )
+                    .await?;
                     continue;
                 }
                 let running = Arc::new(AtomicBool::new(true));
                 let paused = Arc::new(AtomicBool::new(false));
                 *active = Some((job.run_id, running.clone(), paused.clone()));
                 drop(active);
+                remember_command(&mut completed_commands, &mut command_order, &s.command_id);
+                send_ack(&tx, &s.command_id, &s.run_id, "start", true, "").await?;
                 let tx2 = tx.clone();
                 tokio::spawn(async move {
                     let delay = (s.start_unix_ms - Utc::now().timestamp_millis()).max(0) as u64;
@@ -731,6 +777,10 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                 });
             }
             Some(control_message::Body::Stop(command)) => {
+                if command_seen(&completed_commands, &command.command_id) {
+                    send_ack(&tx, &command.command_id, &command.run_id, "stop", true, "").await?;
+                    continue;
+                }
                 if let Ok(run_id) = Uuid::parse_str(&command.run_id)
                     && let Some((active_id, running, paused)) = active_run.lock().await.as_ref()
                     && *active_id == run_id
@@ -738,8 +788,18 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                     running.store(false, Ordering::SeqCst);
                     paused.store(false, Ordering::SeqCst);
                 }
+                remember_command(
+                    &mut completed_commands,
+                    &mut command_order,
+                    &command.command_id,
+                );
+                send_ack(&tx, &command.command_id, &command.run_id, "stop", true, "").await?;
             }
             Some(control_message::Body::SetPaused(command)) => {
+                if command_seen(&completed_commands, &command.command_id) {
+                    send_ack(&tx, &command.command_id, &command.run_id, "pause", true, "").await?;
+                    continue;
+                }
                 if let Ok(run_id) = Uuid::parse_str(&command.run_id)
                     && let Some((active_id, running, paused)) = active_run.lock().await.as_ref()
                     && *active_id == run_id
@@ -747,10 +807,57 @@ async fn run_connection(control: &str, id: &str, role: Role) -> anyhow::Result<(
                 {
                     paused.store(command.paused, Ordering::SeqCst);
                 }
+                remember_command(
+                    &mut completed_commands,
+                    &mut command_order,
+                    &command.command_id,
+                );
+                send_ack(&tx, &command.command_id, &command.run_id, "pause", true, "").await?;
             }
             None => {}
         }
     }
+    Ok(())
+}
+
+fn command_seen(completed: &HashSet<String>, command_id: &str) -> bool {
+    !command_id.is_empty() && completed.contains(command_id)
+}
+
+fn remember_command(
+    completed: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+    command_id: &str,
+) {
+    if command_id.is_empty() || !completed.insert(command_id.to_owned()) {
+        return;
+    }
+    order.push_back(command_id.to_owned());
+    if order.len() > 256
+        && let Some(oldest) = order.pop_front()
+    {
+        completed.remove(&oldest);
+    }
+}
+
+async fn send_ack(
+    tx: &mpsc::Sender<AgentMessage>,
+    command_id: &str,
+    run_id: &str,
+    phase: &str,
+    ok: bool,
+    error: &str,
+) -> anyhow::Result<()> {
+    tx.send(AgentMessage {
+        body: Some(agent_message::Body::CommandAck(CommandAck {
+            command_id: command_id.into(),
+            run_id: run_id.into(),
+            phase: phase.into(),
+            ok,
+            error: error.into(),
+        })),
+    })
+    .await?;
     Ok(())
 }
 
@@ -809,9 +916,9 @@ async fn run_job(
     if let Some(task) = interface_task {
         let _ = task.await;
     }
-    if role == Role::Client && result.is_ok() {
-        // Give the responder one telemetry interval to flush its final counters before
-        // control releases the global run lock.
+    if result.is_ok() {
+        // Give both endpoints one telemetry interval to flush final counters before
+        // control marks the run complete after receiving both completion reports.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         send_event(&tx, job.run_id, "info", "run_completed").await?;
     }
@@ -1733,6 +1840,22 @@ async fn read_exact_count(
 mod tests {
     use super::*;
     use proxy_tester_proto::v1::ArtifactChunk;
+
+    #[test]
+    fn command_deduplication_is_bounded_and_idempotent() {
+        let mut completed = HashSet::new();
+        let mut order = VecDeque::new();
+        remember_command(&mut completed, &mut order, "first");
+        remember_command(&mut completed, &mut order, "first");
+        assert!(command_seen(&completed, "first"));
+        assert_eq!(order.len(), 1);
+        for index in 0..256 {
+            remember_command(&mut completed, &mut order, &format!("command-{index}"));
+        }
+        assert_eq!(completed.len(), 256);
+        assert!(!command_seen(&completed, "first"));
+        assert!(!command_seen(&completed, ""));
+    }
 
     fn chunk(
         id: Uuid,
