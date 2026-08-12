@@ -5,7 +5,7 @@ use futures::StreamExt;
 use proxy_tester_capture::{Direction, HttpTransaction, ReplayTurn, analyze_capture};
 use proxy_tester_domain::{
     MetricsSnapshot, PayloadKind, PayloadMode, PayloadProfile, Protocol, RandomFormat, Scenario,
-    Topology,
+    TlsVersion, Topology,
 };
 use proxy_tester_proto::v1::{
     AgentEvent, AgentHello, AgentMessage, AgentRole, Heartbeat, Telemetry,
@@ -14,7 +14,10 @@ use proxy_tester_proto::v1::{
 use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme,
+    SupportedProtocolVersion, crypto::CryptoProvider, version,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -1383,6 +1386,8 @@ async fn connect_tls(
     stream: TcpStream,
     sc: &Scenario,
 ) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let builder = ClientConfig::builder_with_provider(tls_crypto_provider(sc)?)
+        .with_protocol_versions(tls_protocol_versions(sc.tls.version))?;
     let config = if sc.tls.verify_peer {
         let mut roots = RootCertStore::empty();
         let pem = sc.tls.ca_pem.as_deref().context("CA PEM required")?;
@@ -1392,11 +1397,9 @@ async fn connect_tls(
         if added == 0 {
             bail!("CA PEM contains no usable certificates")
         }
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        builder.with_root_certificates(roots).with_no_client_auth()
     } else {
-        ClientConfig::builder()
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth()
@@ -1405,6 +1408,28 @@ async fn connect_tls(
     Ok(TlsConnector::from(Arc::new(config))
         .connect(server_name, stream)
         .await?)
+}
+
+fn tls_crypto_provider(sc: &Scenario) -> anyhow::Result<Arc<CryptoProvider>> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    if let Some(cipher) = sc.tls.cipher_suite.as_deref() {
+        provider
+            .cipher_suites
+            .retain(|suite| format!("{:?}", suite.suite()) == cipher);
+        if provider.cipher_suites.is_empty() {
+            bail!("configured TLS cipher suite is unavailable: {cipher}");
+        }
+    }
+    Ok(Arc::new(provider))
+}
+
+fn tls_protocol_versions(version: TlsVersion) -> &'static [&'static SupportedProtocolVersion] {
+    static TLS12: [&SupportedProtocolVersion; 1] = [&version::TLS12];
+    static TLS13: [&SupportedProtocolVersion; 1] = [&version::TLS13];
+    match version {
+        TlsVersion::Tls12 => &TLS12,
+        TlsVersion::Tls13 => &TLS13,
+    }
 }
 
 fn build_tls_acceptor(sc: &Scenario) -> anyhow::Result<TlsAcceptor> {
@@ -1422,7 +1447,8 @@ fn build_tls_acceptor(sc: &Scenario) -> anyhow::Result<TlsAcceptor> {
         .collect::<Result<Vec<_>, _>>()?;
     let key = rustls_pemfile::private_key(&mut Cursor::new(key_pem.as_bytes()))?
         .context("server private key PEM is empty")?;
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(tls_crypto_provider(sc)?)
+        .with_protocol_versions(tls_protocol_versions(sc.tls.version))?
         .with_no_client_auth()
         .with_single_cert(certificates, key)?;
     Ok(TlsAcceptor::from(Arc::new(config)))

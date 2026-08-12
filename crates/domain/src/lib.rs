@@ -216,6 +216,8 @@ impl Default for TcpPayloadProfile {
 pub struct TlsProfile {
     pub enabled: bool,
     pub verify_peer: bool,
+    pub version: TlsVersion,
+    pub cipher_suite: Option<String>,
     pub server_name: String,
     pub ca_pem: Option<String>,
     pub server_cert_pem: Option<String>,
@@ -225,12 +227,47 @@ impl Default for TlsProfile {
     fn default() -> Self {
         Self {
             enabled: false,
-            verify_peer: true,
+            verify_peer: false,
+            version: TlsVersion::Tls13,
+            cipher_suite: None,
             server_name: "proxy-tester.local".into(),
             ca_pem: None,
             server_cert_pem: None,
             server_key_pem: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsVersion {
+    Tls12,
+    #[default]
+    Tls13,
+}
+
+impl TlsProfile {
+    pub fn cipher_is_compatible(&self) -> bool {
+        let Some(cipher) = self.cipher_suite.as_deref() else {
+            return true;
+        };
+        matches!(
+            (self.version, cipher),
+            (
+                TlsVersion::Tls13,
+                "TLS13_AES_256_GCM_SHA384"
+                    | "TLS13_AES_128_GCM_SHA256"
+                    | "TLS13_CHACHA20_POLY1305_SHA256"
+            ) | (
+                TlsVersion::Tls12,
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+                    | "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+                    | "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+                    | "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+                    | "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+                    | "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+            )
+        )
     }
 }
 
@@ -420,6 +457,12 @@ impl Scenario {
             ));
         }
         if self.tls.enabled {
+            if !self.tls.cipher_is_compatible() {
+                return Err(ValidationError::Invalid(format!(
+                    "cipher suite {:?} is not supported by {:?}",
+                    self.tls.cipher_suite, self.tls.version
+                )));
+            }
             if self.tls.server_name.trim().is_empty() {
                 return Err(ValidationError::Invalid(
                     "TLS server_name이 필요합니다".into(),
@@ -609,6 +652,21 @@ mod tests {
             ..Scenario::default()
         };
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn tls_version_and_cipher_must_be_compatible() {
+        let mut profile = TlsProfile::default();
+        assert_eq!(profile.version, TlsVersion::Tls13);
+        assert!(!profile.verify_peer);
+        profile.cipher_suite = Some("TLS13_AES_128_GCM_SHA256".into());
+        assert!(profile.cipher_is_compatible());
+        profile.version = TlsVersion::Tls12;
+        assert!(!profile.cipher_is_compatible());
+        profile.cipher_suite = Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into());
+        assert!(profile.cipher_is_compatible());
+        profile.cipher_suite = Some("TLS_RSA_WITH_3DES_EDE_CBC_SHA".into());
+        assert!(!profile.cipher_is_compatible());
     }
 
     #[test]

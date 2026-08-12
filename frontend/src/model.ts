@@ -77,7 +77,7 @@ export type Scenario={
  request:{method:string;path:string;host:string;request_body_bytes:number;response_body_bytes:number;keep_alive:boolean;transactions_per_connection:number;think_time_ms:number};
  tcp:{tx_bytes:number;rx_bytes:number};
  payload_mode:'manual'|'capture_replay';capture_artifact_id:string|null;request_payload:PayloadProfile|null;response_payload:PayloadProfile|null;
- tls:{enabled:boolean;verify_peer:boolean;server_name:string;ca_pem:string|null;server_cert_pem:string|null;server_key_pem:string|null};
+ tls:{enabled:boolean;verify_peer:boolean;version:'tls12'|'tls13';cipher_suite:string|null;server_name:string;ca_pem:string|null;server_cert_pem:string|null;server_key_pem:string|null};
  timeouts:{connect_ms:number;proxy_connect_ms:number;response_ms:number};
  observation_interfaces:string[];
 };
@@ -95,6 +95,6 @@ export const initialScenario=():Scenario=>({
   {name:'Ramp-down',mode:'ramp',duration_secs:10,target_virtual_clients:0,include_in_results:true}
  ],
  request:{method:'GET',path:'/',host:'proxy-tester.local',request_body_bytes:0,response_body_bytes:128,keep_alive:true,transactions_per_connection:1,think_time_ms:0},
- tcp:{tx_bytes:64,rx_bytes:64},payload_mode:'manual',capture_artifact_id:null,request_payload:{kind:'fixed',size_bytes:64,text:'',artifact_id:null,random_format:'binary'},response_payload:{kind:'fixed',size_bytes:64,text:'',artifact_id:null,random_format:'binary'},tls:{enabled:false,verify_peer:false,server_name:'proxy-tester.local',ca_pem:null,server_cert_pem:null,server_key_pem:null},
+ tcp:{tx_bytes:64,rx_bytes:64},payload_mode:'manual',capture_artifact_id:null,request_payload:{kind:'fixed',size_bytes:64,text:'',artifact_id:null,random_format:'binary'},response_payload:{kind:'fixed',size_bytes:64,text:'',artifact_id:null,random_format:'binary'},tls:{enabled:false,verify_peer:false,version:'tls13',cipher_suite:null,server_name:'proxy-tester.local',ca_pem:null,server_cert_pem:null,server_key_pem:null},
  timeouts:{connect_ms:3000,proxy_connect_ms:3000,response_ms:5000},observation_interfaces:[]
 });
