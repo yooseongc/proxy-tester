@@ -15,11 +15,18 @@ async def handle(client_r, client_w):
         first = head.split(b'\r\n',1)[0].decode().split()
         if first[0] == 'CONNECT':
             host, port = first[1].rsplit(':',1)
+            if host == 'reject.test':
+                client_w.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'); await client_w.drain()
+                client_w.close(); return
             upstream_r, upstream_w = await asyncio.open_connection(host, int(port))
             client_w.write(b'HTTP/1.1 200 Connection Established\r\n\r\n'); await client_w.drain()
             await asyncio.gather(relay(client_r, upstream_w), relay(upstream_r, client_w))
         else:
-            url=urlsplit(first[1]); upstream_r, upstream_w=await asyncio.open_connection(url.hostname,url.port or 80)
+            url=urlsplit(first[1])
+            if url.hostname == 'error.test':
+                client_w.write(b'HTTP/1.1 451 Unavailable For Legal Reasons\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'); await client_w.drain()
+                client_w.close(); return
+            upstream_r, upstream_w=await asyncio.open_connection(url.hostname,url.port or 80)
             path=(url.path or '/')+(('?'+url.query) if url.query else '')
             upstream_w.write(head.replace(first[1].encode(),path.encode(),1));await upstream_w.drain()
             await asyncio.gather(relay(client_r,upstream_w),relay(upstream_r,client_w))
