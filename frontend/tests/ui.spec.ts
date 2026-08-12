@@ -4,18 +4,32 @@ async function expectNoPageOverflow(page:import('@playwright/test').Page){const 
 
 test('technical console setup, local fonts and themes are available',async({page})=>{
  const profileName=`Playwright profile ${Date.now()}`;await page.setViewportSize({width:1440,height:1000});await page.goto('/#setup');
- await expect(page.getByRole('navigation',{name:'주 메뉴'})).toBeVisible();await expect(page.getByLabel('시험 프로토콜')).toBeVisible();await expect(page.getByText('Load stages')).toBeVisible();
- await expect(page.getByLabel('시험 이름')).toHaveAttribute('placeholder','비워 두면 구성 이름과 시작 일시로 자동 생성');
+ await expect(page.getByRole('navigation',{name:'주 메뉴'})).toBeVisible();await expect(page.getByLabel('시험 프로토콜')).toBeVisible();await expect(page.getByText('4. 부하')).toBeVisible();
+ await expect(page.getByLabel('개별 시험 이름')).toHaveAttribute('placeholder','비워 두면 구성 이름과 시작 일시로 자동 생성');
  await page.getByRole('button',{name:'+ Stage 추가'}).click();await expect(page.getByLabel('Stage 4 이름')).toBeVisible();
- await page.getByRole('textbox',{name:'이름',exact:true}).fill(profileName);await page.getByRole('button',{name:'현재 구성 저장'}).click();await expect(page.getByText('저장됨')).toBeVisible();
- await expect(page.getByLabel('저장된 시험 구성').locator('option',{hasText:profileName})).toHaveCount(1);await page.getByRole('button',{name:'새 구성'}).click();await expect(page.getByRole('textbox',{name:'이름',exact:true})).toHaveValue('기본 TCP 시험');
- await page.getByLabel('TLS 활성화').check();await expect(page.getByRole('button',{name:'테스트 인증서 자동 생성'})).toBeVisible();
+ await page.getByRole('textbox',{name:'구성 이름',exact:true}).fill(profileName);await page.getByRole('button',{name:'현재 구성 저장'}).click();await expect(page.getByText('저장됨')).toBeVisible();
+ await expect(page.getByLabel('저장된 시험 구성').locator('option',{hasText:profileName})).toHaveCount(1);await page.getByRole('button',{name:'새 구성'}).click();await expect(page.getByRole('textbox',{name:'구성 이름',exact:true})).toHaveValue('기본 TCP 시험');
+ await page.getByLabel('TLS 활성화').check();await expect(page.getByLabel('TLS 버전')).toBeVisible();await expect(page.getByRole('button',{name:'테스트 인증서 자동 생성'})).toBeHidden();await page.getByText('TLS 고급 설정').click();await expect(page.getByRole('button',{name:'테스트 인증서 자동 생성'})).toBeVisible();
  const font=await page.locator('body').evaluate(element=>getComputedStyle(element).fontFamily);expect(font).toContain('Pretendard');const loadedFonts=await page.evaluate(()=>performance.getEntriesByType('resource').map(entry=>entry.name));expect(loadedFonts.some(name=>name.includes('PretendardVariable'))).toBe(true);
  const before=await page.locator('html').getAttribute('data-theme'),next=before==='dark'?'light':'dark';await page.getByRole('button',{name:'테마 전환'}).click();await expect(page.locator('html')).toHaveAttribute('data-theme',next);await page.reload();await expect(page.locator('html')).toHaveAttribute('data-theme',next);await expectNoPageOverflow(page);
  await page.getByRole('button',{name:'실시간 모니터링'}).click();await expect(page.getByRole('heading',{name:'실시간 모니터링'})).toBeVisible();await page.getByRole('button',{name:'결과'}).click();await expect(page.getByRole('heading',{name:'시험 이력 및 비교'})).toBeVisible();
 });
 
 for(const viewport of [{name:'tablet',width:900,height:1000},{name:'mobile',width:390,height:844}])test(`${viewport.name} console has no page overflow`,async({page})=>{await page.setViewportSize(viewport);await page.goto('/#setup');await expect(page.getByLabel('시험 프로토콜')).toBeVisible();await expectNoPageOverflow(page)});
+
+test('traffic-first payload, summary, capture analysis and advanced fields react to selections',async({page})=>{
+ let artifacts:unknown[]=[];const capture={id:'capture-1',kind:'pcap',name:'sessions.pcap',sha256:'abc',size_bytes:100,format:'pcap',analysis:{supported_flow_count:2,http_flow_count:1,http_transaction_count:3,retransmitted_bytes:12,exclusions:{non_http_flows:1}}};
+ await page.route('**/api/artifacts**',async route=>{if(route.request().method()==='POST'){await new Promise(resolve=>setTimeout(resolve,150));artifacts=[capture];await route.fulfill({json:capture})}else await route.fulfill({json:artifacts})});
+ await page.goto('/#setup');
+ const headings=page.locator('section h3');await expect(headings).toHaveCount(4);const visualOrder=await headings.evaluateAll(elements=>elements.map(element=>({text:element.textContent,top:element.getBoundingClientRect().top})).sort((a,b)=>a.top-b.top).map(item=>item.text));expect(visualOrder).toEqual(['1. 프로토콜','2. 보안','3. Payload','4. 부하']);
+ await page.getByLabel('요청 · Client → Server 종류').selectOption('text');await page.getByLabel('요청 · Client → Server 문자열').fill('DLP-가');
+ await page.getByLabel('응답 · Server → Client 종류').selectOption('random');await page.getByLabel('응답 · Server → Client Random 형식').selectOption('printable_ascii');await page.getByLabel('응답 · Server → Client 크기 (bytes)').fill('10485760');
+ await expect(page.getByLabel('현재 트래픽 요약')).toContainText('요청: 문자열 7B');await expect(page.getByLabel('현재 트래픽 요약')).toContainText('응답: Random ASCII 10MB');
+ await page.getByText('연결 고급 설정').click();await expect(page.getByLabel('Connect timeout (ms)')).toBeVisible();await page.getByLabel('연결 경로').selectOption('explicit_proxy');await expect(page.getByLabel('HTTP Proxy 주소')).toBeVisible();await expect(page.getByLabel('현재 트래픽 요약')).toContainText('명시적 Proxy');
+ await page.getByLabel('Payload 모드').selectOption('capture_replay');await expect(page.getByRole('alert')).toContainText('선택해야');
+ const upload=page.getByLabel('PCAP / PCAPNG 업로드');await upload.setInputFiles({name:'sessions.pcap',mimeType:'application/vnd.tcpdump.pcap',buffer:Buffer.from('pcap')});await expect(page.getByRole('status')).toContainText('분석 중');await expect(page.getByLabel('Capture 분석 요약')).toContainText('2개 TCP 흐름');await expect(page.getByLabel('Capture 분석 요약')).toContainText('non_http_flows: 1');await expect(page.getByRole('alert')).toHaveCount(0);
+ await page.getByLabel('시험 프로토콜').selectOption('http1');await expect(page.getByLabel('Capture 분석 요약')).toContainText('1개 HTTP 흐름');await expect(page.getByLabel('현재 트래픽 요약')).toContainText('HTTP/1.1');await expectNoPageOverflow(page);
+});
 
 test('selected run renders seven connected ECharts and accessible legends',async({page})=>{
  const scenario={name:'Chart run',protocol:'http1',load_stages:[{name:'Warm-up',mode:'ramp',duration_secs:10,target_virtual_clients:10,include_in_results:false},{name:'Measure',mode:'hold',duration_secs:70,target_virtual_clients:10,include_in_results:true}]};
