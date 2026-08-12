@@ -10,6 +10,15 @@
 - `active_connections_min`: 구간 최소 동시 연결 수
 - `active_connections_max`: 구간 최대 동시 연결 수
 
+## 처리량과 rate
+
+- App B/W(`tx_bps`, `rx_bps`)는 agent가 실제로 읽고 쓴 TCP/HTTP application bytes의 누적 counter 차이를 표본 간격으로 나눈 값이다. HTTP body뿐 아니라 request/status line과 header도 포함한다.
+- Wire B/W/PPS는 `observation_interfaces`에 지정한 Linux NIC의 `/sys/class/net/<iface>/statistics` 차이다. 시험 프로세스 외의 트래픽, TLS·TCP/IP overhead와 NIC offload 영향이 포함될 수 있다.
+- CPS는 새로 성립한 client 연결 수, TPS는 완료한 HTTP transaction 수의 표본 간 초당 변화량이다. TCP transaction은 왕복 완료 횟수로 집계되지만 HTTP latency/TPS에는 섞지 않는다.
+- 누적 `bytes_*`, `connections_established`, `transactions`, `packets_*`는 Run 합계이고 `*_bps`, `*_pps`, CPS/TPS는 표본 구간 rate다.
+
+따라서 App와 Wire 값은 같아야 하는 불변식이 아니다. 직접 연결에서는 Client App TX와 Server App RX가 같아야 하지만 explicit proxy는 CONNECT 및 header 변환 때문에 endpoint byte 합계가 달라질 수 있다. Wire 값이 0이면 관찰 interface 이름과 권한을 확인한다.
+
 UI의 ACTIVE 카드는 `현재 / 최근 1분 최대` 순서로 표시한다. 최근 60개의 1초 표본에 포함된 `active_connections_max` 중 최댓값을 사용한다. 현재 값은 실시간 순간 상태 확인에, 1분 최대값은 짧게 유지되는 동시 연결의 규모와 최근 추세를 안정적으로 판단하는 데 사용한다. 차트는 기존 정책대로 `active_connections` 원본 순간값을 사용하며 이동평균이나 보간을 적용하지 않는다.
 
 ## 카운터 안전성

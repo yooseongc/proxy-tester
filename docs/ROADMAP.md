@@ -89,13 +89,17 @@ PCAP 모드는 업로드·분석 상태, TCP/HTTP 지원 흐름, transaction, re
 
 완료 조건: Playwright에서 조건부 필드, 독립 payload, 분석 상태, 고급 설정, mobile layout을 검증함.
 
-## M7 — 결과 메타데이터와 운영 완성도
+## M7 — 결과 메타데이터와 운영 완성도 (완료)
 
 - 결과에 방향/kind/size/artifact ID 또는 random SHA-256만 저장
 - App/Wire B/W 정책 및 CPS/TPS/pps 회귀 검증
 - SQLite migration과 PostgreSQL repository 경계 문서화
 - musl release build, Docker/systemd lifecycle, retention/cleanup
 - 설치·운영·트러블슈팅·성능 기준 문서 완성
+
+구현 완료: Run 상세에는 방향별 payload kind와 실제 byte 크기만 노출하고 file은 artifact ID, random은 형식과 Run별 SHA-256만 추가한다. text/file/random 원문과 seed는 결과 JSON에 저장하지 않는다. 시작 시 보존 기간이 지난 Run telemetry를 정리하고, 남은 Scenario/Run snapshot에서 참조하지 않는 오래된 artifact만 파일과 metadata에서 제거한다.
+
+검증: `tests/result-metadata-regression.ps1`가 file sentinel 비노출과 random digest를 확인하고, `tests/scenario-matrix.ps1`가 직접/forward proxy/CONNECT에서 App·Wire B/W, CPS/TPS/pps를 확인한다. Rust workspace test와 frontend Vitest/Playwright, Rust 1.93 musl 운영 이미지, 기존 lifecycle 및 격리된 `tests/clean-install-smoke.ps1`를 통과한다. systemd Control/Agent 템플릿과 설치·저장소·계측 문서를 함께 제공한다.
 
 완료 조건: 전체 자동시험, musl build, lifecycle regression과 clean-install smoke test 통과.
 

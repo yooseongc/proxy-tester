@@ -25,6 +25,8 @@ docker compose -f compose.production.yaml --env-file .env up -d
 
 운영 Compose에는 fixture proxy와 개발 컨테이너가 없다. SQLite DB, 업로드 artifact, Run 결과는 `proxy-data` 볼륨에 보존한다. 백업 시에는 시험을 중지한 뒤 이 볼륨의 `/data`를 백업한다.
 
+처음 설치하거나 이미지를 교체한 뒤에는 `tests/clean-install-smoke.ps1`로 별도 프로젝트와 빈 볼륨에서 Control health 및 Client/Server 등록을 확인할 수 있다. 스크립트는 검증이 끝나면 자신이 만든 컨테이너, 네트워크와 볼륨만 제거한다.
+
 ## 분산 Linux 장비
 
 Control 호스트는 TCP 8080(UI/API)과 50051(Agent gRPC)을 수신한다. 외부 Agent를 사용할 때 방화벽에서 필요한 출발지에만 50051을 허용한다. 현재 Agent gRPC는 평문이므로 신뢰할 수 있는 측정망 또는 VPN 내부에서만 사용한다.
@@ -45,6 +47,8 @@ sudo systemctl enable --now proxy-tester-agent
 journalctl -u proxy-tester-agent -f
 ```
 
+Control을 systemd로 운영할 때는 `proxy-tester-control.service`와 `control.env.example`을 사용한다. `proxy-tester` 사용자와 `/var/lib/proxy-tester/artifacts`를 먼저 만들고 쓰기 권한을 부여하며, 빌드된 frontend `dist`는 `/opt/proxy-tester/frontend/dist`에 둔다.
+
 NIC wire 계측을 사용하려면 Agent가 해당 Linux interface의 `/sys/class/net` 통계를 읽을 수 있어야 한다. 고부하 시험 전에는 파일 descriptor 한도, ephemeral port 범위, NIC offload, MTU와 라우팅을 별도로 점검한다.
 
 ## 설정 항목
@@ -56,7 +60,9 @@ NIC wire 계측을 사용하려면 Agent가 해당 Linux interface의 `/sys/clas
 | Control | `DATABASE_URL` | `sqlite://data/proxy-tester.db?mode=rwc` | SQLite 연결 문자열 |
 | Control | `PROXY_TESTER_STATIC_DIR` | `frontend/dist` | CSR 정적 자산 경로 |
 | Control | `PROXY_TESTER_ARTIFACT_DIR` | `data/artifacts` | 업로드 artifact 경로 |
+| Control | `PROXY_TESTER_RETENTION_DAYS` | `90` | 완료 Run과 참조되지 않은 artifact 보존 일수, 0 이하는 자동 정리 중지 |
 | Agent | `PROXY_TESTER_CONTROL` | `http://control:50051` | Control gRPC endpoint |
 | Agent | `PROXY_TESTER_AGENT_ID` | 역할 기반 `*-1` | UI와 시나리오에서 사용할 고유 ID |
 | Agent | `PROXY_TESTER_ROLE` | 실행 파일명에서 추론 | `client` 또는 `server` |
 
+저장소 백업, 보존 정책과 PostgreSQL 확장 경계는 [STORAGE.md](STORAGE.md)를 참고한다. 기동 실패 시에는 Control의 DB/artifact 쓰기 권한과 포트 충돌을 먼저 확인하고, Agent 누락 시에는 고유 ID, 역할, 50051 연결과 Control 로그를 확인한다. 성능 수치가 낮거나 불안정하면 [TELEMETRY.md](TELEMETRY.md)의 App/Wire 구분과 Linux 장비 점검 항목을 따른다.
