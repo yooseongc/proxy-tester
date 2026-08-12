@@ -6,6 +6,7 @@ services:
       DATABASE_URL: sqlite:///data/proxy-tester.db?mode=rwc
       PROXY_TESTER_STATIC_DIR: /frontend/dist
       PROXY_TESTER_ARTIFACT_DIR: /data/artifacts
+      PROXY_TESTER_RETENTION_DAYS: ${PROXY_TESTER_RETENTION_DAYS:-90}
       RUST_LOG: proxy_control=info
     ports:
       - "${PROXY_TESTER_PORT:-18080}:8080"

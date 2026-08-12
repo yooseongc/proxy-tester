@@ -13,7 +13,7 @@ function New-Scenario($name, $topology, $protocol, $transactions, $keepAlive = $
         tcp = @{ tx_bytes = 256; rx_bytes = 512 }
         tls = @{ enabled = $false; verify_peer = $true; server_name = 'proxy-tester.local'; ca_pem = $null }
         timeouts = @{ connect_ms = 3000; proxy_connect_ms = 3000; response_ms = 5000 }
-        observation_interfaces = @()
+        observation_interfaces = @('eth0')
     }
 }
 
@@ -37,13 +37,24 @@ function Invoke-Scenario($scenario) {
         }
     }
     $httpP99 = ($client.metrics.http_latency_p99_ms | Measure-Object -Maximum).Maximum
+    $appBps = ($client.metrics.tx_bps | Measure-Object -Maximum).Maximum
+    $wireBps = ($client.metrics.wire_tx_bps | Measure-Object -Maximum).Maximum
+    $wirePps = ($client.metrics.wire_tx_pps | Measure-Object -Maximum).Maximum
+    $cps = ($client.metrics.cps | Measure-Object -Maximum).Maximum
+    $tps = ($client.metrics.tps | Measure-Object -Maximum).Maximum
+    if ($appBps -le 0) { throw "$($scenario.name): no application bandwidth" }
+    if ($wireBps -le 0 -or $wirePps -le 0) { throw "$($scenario.name): no wire bandwidth/PPS" }
+    if ($cps -le 0) { throw "$($scenario.name): no CPS" }
     if ($scenario.protocol -eq 'http1' -and $httpP99 -le 0) { throw "$($scenario.name): no HTTP latency" }
+    if ($scenario.protocol -eq 'http1' -and $tps -le 0) { throw "$($scenario.name): no TPS" }
     if ($scenario.protocol -eq 'tcp' -and $httpP99 -gt 0) { throw "$($scenario.name): HTTP latency leaked into TCP" }
     [pscustomobject]@{
         name = $scenario.name; connections = $cm.connections_established
         transactions = $cm.transactions; http_p99_ms = $httpP99
         client_tx = $cm.bytes_tx; server_rx = $sm.bytes_rx
         client_rx = $cm.bytes_rx; server_tx = $sm.bytes_tx
+        app_mbps = [math]::Round($appBps / 1e6, 3); wire_mbps = [math]::Round($wireBps / 1e6, 3)
+        wire_pps = [math]::Round($wirePps, 1); cps = [math]::Round($cps, 1); tps = [math]::Round($tps, 1)
     }
 }
 

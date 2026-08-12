@@ -778,6 +778,7 @@ async fn run_job(
         tx.clone(),
         running.clone(),
         started,
+        random_payload_hashes(&job.scenario, &job.payloads, role),
     ));
     let result = match role {
         Role::Client => {
@@ -823,6 +824,7 @@ async fn report_metrics(
     tx: mpsc::Sender<AgentMessage>,
     running: Arc<AtomicBool>,
     started: Instant,
+    random_payload_hashes: (Option<String>, Option<String>),
 ) {
     let mut prev_est = 0;
     let mut prev_tx = 0;
@@ -890,6 +892,8 @@ async fn report_metrics(
             tls_handshake_errors: c.tls_handshake_errors.load(Ordering::Relaxed),
             proxy_connect_errors: c.proxy_connect_errors.load(Ordering::Relaxed),
             http_error_responses: c.http_error_responses.load(Ordering::Relaxed),
+            request_random_sha256: random_payload_hashes.0.clone(),
+            response_random_sha256: random_payload_hashes.1.clone(),
             bytes_tx: txb,
             bytes_rx: rxb,
             packets_tx,
@@ -941,6 +945,19 @@ async fn report_metrics(
             break;
         }
     }
+}
+
+fn random_payload_hashes(
+    scenario: &Scenario,
+    payloads: &PreparedPayloads,
+    role: Role,
+) -> (Option<String>, Option<String>) {
+    let request = (role == Role::Client && scenario.request_payload().kind == PayloadKind::Random)
+        .then(|| format!("{:x}", Sha256::digest(&payloads.request)));
+    let response = (role == Role::Server
+        && scenario.response_payload().kind == PayloadKind::Random)
+        .then(|| format!("{:x}", Sha256::digest(&payloads.response)));
+    (request, response)
 }
 
 fn percentile_ms(samples: &[u64], percentile: f64) -> f64 {

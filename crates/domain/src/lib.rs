@@ -573,6 +573,10 @@ pub struct MetricsSnapshot {
     pub proxy_connect_errors: u64,
     #[serde(default)]
     pub http_error_responses: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_random_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_random_sha256: Option<String>,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
     pub packets_tx: u64,

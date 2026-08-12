@@ -61,6 +61,8 @@ struct Args {
         default_value = "data/artifacts"
     )]
     artifact_dir: String,
+    #[arg(long, env = "PROXY_TESTER_RETENTION_DAYS", default_value_t = 90)]
+    retention_days: i64,
 }
 
 #[derive(Clone)]
@@ -107,7 +109,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("open sqlite")?;
     migrate(&db).await?;
-    apply_retention(&db, 90).await?;
+    if args.retention_days > 0 {
+        apply_retention(&db, args.retention_days).await?;
+        cleanup_orphan_artifacts(&db, args.retention_days).await?;
+    }
     tokio::fs::create_dir_all(&args.artifact_dir).await?;
     let (events, _) = broadcast::channel(1024);
     let state = AppState {
@@ -239,6 +244,46 @@ async fn apply_retention(db: &SqlitePool, days: i64) -> anyhow::Result<()> {
         .bind(&cutoff)
         .execute(db)
         .await?;
+    Ok(())
+}
+
+async fn cleanup_orphan_artifacts(db: &SqlitePool, days: i64) -> anyhow::Result<()> {
+    let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let rows = sqlx::query("SELECT id,path FROM artifacts WHERE created_at < ?")
+        .bind(cutoff)
+        .fetch_all(db)
+        .await?;
+    for row in rows {
+        let id: String = row.get("id");
+        let pattern = format!("%{id}%");
+        let scenario_refs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scenarios WHERE body LIKE ?")
+                .bind(&pattern)
+                .fetch_one(db)
+                .await?;
+        let run_refs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE scenario_json LIKE ?")
+                .bind(&pattern)
+                .fetch_one(db)
+                .await?;
+        if scenario_refs + run_refs > 0 {
+            continue;
+        }
+        let path: String = row.get("path");
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(artifact_id=%id, %error, "failed to remove orphan artifact file");
+                continue;
+            }
+        }
+        sqlx::query("DELETE FROM artifacts WHERE id=?")
+            .bind(&id)
+            .execute(db)
+            .await?;
+        info!(artifact_id=%id, "removed orphan artifact");
+    }
     Ok(())
 }
 
@@ -919,10 +964,55 @@ async fn run_detail(
         .fetch_optional(&s.db)
         .await?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let scenario_json: String = run.get("scenario_json");
     let samples=sqlx::query("SELECT agent_id,role,unix_ms,metrics_json FROM metric_samples WHERE run_id=? ORDER BY unix_ms").bind(id.to_string()).fetch_all(&s.db).await?;
+    let samples = samples.into_iter().map(|r|serde_json::json!({"agent_id":r.get::<String,_>("agent_id"),"role":r.get::<i64,_>("role"),"unix_ms":r.get::<i64,_>("unix_ms"),"metrics":serde_json::from_str::<serde_json::Value>(r.get("metrics_json")).unwrap_or_default()})).collect::<Vec<_>>();
+    let payload_metadata = result_payload_metadata(&scenario_json, &samples);
     Ok(Json(
-        serde_json::json!({"id":run.get::<String,_>("id"),"run_name":run.get::<Option<String>,_>("run_name"),"started_at":run.get::<Option<String>,_>("started_at"),"status":run.get::<String,_>("status"),"scenario":redacted_scenario(run.get("scenario_json")),"samples":samples.into_iter().map(|r|serde_json::json!({"agent_id":r.get::<String,_>("agent_id"),"role":r.get::<i64,_>("role"),"unix_ms":r.get::<i64,_>("unix_ms"),"metrics":serde_json::from_str::<serde_json::Value>(r.get("metrics_json")).unwrap_or_default()})).collect::<Vec<_>>() }),
+        serde_json::json!({"id":run.get::<String,_>("id"),"run_name":run.get::<Option<String>,_>("run_name"),"started_at":run.get::<Option<String>,_>("started_at"),"status":run.get::<String,_>("status"),"scenario":redacted_scenario(&scenario_json),"payload_metadata":payload_metadata,"samples":samples }),
     ))
+}
+
+fn result_payload_metadata(body: &str, samples: &[serde_json::Value]) -> serde_json::Value {
+    let Ok(scenario) = serde_json::from_str::<Scenario>(body).map(Scenario::migrate) else {
+        return serde_json::Value::Null;
+    };
+    if scenario.payload_mode == PayloadMode::CaptureReplay {
+        return serde_json::json!({
+            "mode": "capture_replay",
+            "capture_artifact_id": scenario.capture_artifact_id
+        });
+    }
+    let random_hash = |role: i64, field: &str| {
+        samples.iter().find_map(|sample| {
+            (sample["role"].as_i64() == Some(role))
+                .then(|| sample["metrics"][field].as_str().map(str::to_owned))
+                .flatten()
+        })
+    };
+    let metadata =
+        |direction: &str, payload: proxy_tester_domain::PayloadProfile, hash: Option<String>| {
+            let kind = serde_json::to_value(payload.kind).unwrap_or_default();
+            let mut value = serde_json::json!({
+                "direction": direction,
+                "kind": kind,
+                "size_bytes": payload.byte_len()
+            });
+            if payload.kind == PayloadKind::File {
+                value["artifact_id"] = serde_json::json!(payload.artifact_id);
+            }
+            if payload.kind == PayloadKind::Random {
+                value["random_format"] =
+                    serde_json::to_value(payload.random_format).unwrap_or_default();
+                value["sha256"] = serde_json::json!(hash);
+            }
+            value
+        };
+    serde_json::json!({
+        "mode": "manual",
+        "request": metadata("client_to_server", scenario.request_payload(), random_hash(1, "request_random_sha256")),
+        "response": metadata("server_to_client", scenario.response_payload(), random_hash(2, "response_random_sha256"))
+    })
 }
 
 async fn events_ws(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
@@ -1045,7 +1135,11 @@ impl From<serde_json::Error> for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::analyze_capture;
+    use super::{analyze_capture, cleanup_orphan_artifacts, migrate, result_payload_metadata};
+    use chrono::Utc;
+    use proxy_tester_domain::{PayloadKind, PayloadProfile, RandomFormat, Scenario};
+    use sqlx::{Row, sqlite::SqlitePoolOptions};
+    use uuid::Uuid;
 
     #[test]
     fn validates_empty_classic_pcap() {
@@ -1060,5 +1154,69 @@ mod tests {
     #[test]
     fn rejects_unknown_capture() {
         assert!(analyze_capture(b"not a capture file").is_err());
+    }
+
+    #[test]
+    fn result_payload_metadata_redacts_content_and_keeps_random_digest() {
+        let mut scenario = Scenario::default();
+        scenario.request_payload = Some(PayloadProfile {
+            kind: PayloadKind::Text,
+            text: "DLP-비밀".into(),
+            ..Default::default()
+        });
+        scenario.response_payload = Some(PayloadProfile {
+            kind: PayloadKind::Random,
+            size_bytes: 1024,
+            random_format: RandomFormat::PrintableAscii,
+            ..Default::default()
+        });
+        let samples = vec![serde_json::json!({
+            "role": 2,
+            "metrics": {"response_random_sha256": "abc123"}
+        })];
+        let metadata =
+            result_payload_metadata(&serde_json::to_string(&scenario).unwrap(), &samples);
+        assert_eq!(metadata["request"]["direction"], "client_to_server");
+        assert_eq!(metadata["request"]["size_bytes"], 10);
+        assert!(metadata["request"].get("text").is_none());
+        assert_eq!(metadata["response"]["sha256"], "abc123");
+        assert_eq!(metadata["response"]["random_format"], "printable_ascii");
+    }
+
+    #[tokio::test]
+    async fn artifact_cleanup_removes_only_old_unreferenced_files() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        migrate(&db).await.unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("proxy-tester-cleanup-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let orphan = directory.join("orphan");
+        let referenced = directory.join("referenced");
+        tokio::fs::write(&orphan, b"orphan").await.unwrap();
+        tokio::fs::write(&referenced, b"referenced").await.unwrap();
+        let old = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        for (id, path) in [("orphan-id", &orphan), ("referenced-id", &referenced)] {
+            sqlx::query("INSERT INTO artifacts(id,name,sha256,size_bytes,format,packet_count,captured_bytes,path,created_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(id).bind(format!("sha-{id}")).bind(1_i64).bind("raw").bind(0_i64).bind(1_i64).bind(path.to_string_lossy().as_ref()).bind(&old).bind("payload").execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO scenarios(id,name,body,created_at,updated_at) VALUES('scenario','test',?,'now','now')")
+            .bind(r#"{"artifact_id":"referenced-id"}"#).execute(&db).await.unwrap();
+        cleanup_orphan_artifacts(&db, 90).await.unwrap();
+        assert!(!orphan.exists());
+        assert!(referenced.exists());
+        let ids = sqlx::query("SELECT id FROM artifacts ORDER BY id")
+            .fetch_all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["referenced-id"]);
+        tokio::fs::remove_file(referenced).await.unwrap();
+        tokio::fs::remove_dir(directory).await.unwrap();
     }
 }
