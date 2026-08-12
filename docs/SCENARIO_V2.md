@@ -13,3 +13,9 @@ HTTP/1.1 `capture_replay`는 양방향 stream에서 request/status line과 `Cont
 file payload와 capture artifact는 256 KiB gRPC chunk로 양쪽 Agent에 전송하며, Agent가 offset·전체 크기·SHA-256을 검증한다. payload는 공유 buffer로, capture는 임시파일로 준비한다.
 
 빌드 환경에는 시스템 `protoc`가 없어도 되도록 vendored protoc를 사용한다.
+
+## TLS 설정과 오류 분류
+
+`tls.version`은 `tls12` 또는 `tls13`이며 기본값은 `tls13`이다. `tls.cipher_suite`는 `null`이면 해당 버전의 rustls 기본 cipher 순서를 사용한다. 값을 지정하면 선택 버전과 호환되는 TLS 1.2 ECDHE 또는 TLS 1.3 AEAD suite만 허용한다. 인증서 검증은 기본 OFF이며, ON일 때 `ca_pem`과 SNI에 사용하는 `server_name`이 필요하다. responder에는 `server_cert_pem`과 `server_key_pem`을 전달한다.
+
+평문 HTTP explicit proxy는 absolute-form request를 전달하고, TLS 및 TCP explicit proxy는 먼저 CONNECT tunnel을 만든다. 결과 metrics는 기존 `connections_failed`와 `transaction_errors` 외에 `timeout_errors`, `reset_errors`, `tls_handshake_errors`, `proxy_connect_errors`, `http_error_responses`를 제공한다. 이 분류는 장비의 차단 성공을 판정하지 않고 관측된 wire/application 실패 원인만 기록한다.

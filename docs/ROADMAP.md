@@ -59,13 +59,17 @@
 
 완료 조건: 다중 transaction/connection fixture가 메시지 단위로 재현되고 TPS·오류 계측이 일치함.
 
-## M5 — TLS와 연결 경로 완성
+## M5 — TLS와 연결 경로 완성 (완료)
 
 - TLS 1.2/1.3 선택과 rustls protocol version 제한
 - cipher suite/version 호환 validation
 - 검증 기본 OFF, SNI/CA/responder cert/key 고급 설정
 - 직접 연결, HTTP forward proxy, CONNECT 통합시험
 - reset/timeout/HTTP 오류 응답 분류
+
+구현 완료: Scenario v2에서 TLS 1.2/1.3과 선택적 cipher suite를 구성하며, 버전과 호환되지 않거나 rustls가 지원하지 않는 suite는 Run 준비 전에 거부한다. cipher 미지정 시 선택한 버전에 맞는 rustls 기본 목록을 사용한다. 기존 전체 오류 지표와 함께 timeout, reset, TLS handshake, HTTP CONNECT, HTTP 오류 응답을 결과 JSON에 별도 누적한다.
+
+검증: `tests/tls-matrix-regression.ps1`가 자동 생성 인증서로 HTTP/TCP, TLS 1.2/1.3, 직접 연결/CONNECT, 인증서 검증 OFF/ON, 기본/명시 cipher를 실제 Compose 프로세스에서 실행한다. SNI 불일치, CONNECT 403, HTTP 451의 분류와 version/cipher 불일치의 API 사전 거부도 확인한다. timeout/reset 분류기는 Agent 단위 시험으로 고정한다.
 
 완료 조건: protocol/version/path 조합 matrix와 인증서 검증 on/off 회귀시험 통과.
 
