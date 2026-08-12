@@ -77,6 +77,11 @@ struct Counters {
     active: StdMutex<ActiveWindow>,
     transactions: AtomicU64,
     transaction_errors: AtomicU64,
+    timeout_errors: AtomicU64,
+    reset_errors: AtomicU64,
+    tls_handshake_errors: AtomicU64,
+    proxy_connect_errors: AtomicU64,
+    http_error_responses: AtomicU64,
     tx: AtomicU64,
     rx: AtomicU64,
     packets_tx: AtomicU64,
@@ -131,6 +136,11 @@ impl Default for Counters {
             active: Default::default(),
             transactions: Default::default(),
             transaction_errors: Default::default(),
+            timeout_errors: Default::default(),
+            reset_errors: Default::default(),
+            tls_handshake_errors: Default::default(),
+            proxy_connect_errors: Default::default(),
+            http_error_responses: Default::default(),
             tx: Default::default(),
             rx: Default::default(),
             packets_tx: Default::default(),
@@ -153,6 +163,25 @@ impl Counters {
 
     fn transaction_completed(&self) {
         self.transactions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, error: &anyhow::Error) {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        if message.contains("deadline has elapsed") || message.contains("timed out") {
+            self.timeout_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if message.contains("connection reset") || message.contains("forcibly closed") {
+            self.reset_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if message.contains("tls handshake failed") {
+            self.tls_handshake_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if message.contains("http connect failed") {
+            self.proxy_connect_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if message.contains("http error response") {
+            self.http_error_responses.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn connection_opened(&self) -> ActiveConnection<'_> {
@@ -856,6 +885,11 @@ async fn report_metrics(
             active_connections_max,
             transactions: tr,
             transaction_errors: c.transaction_errors.load(Ordering::Relaxed),
+            timeout_errors: c.timeout_errors.load(Ordering::Relaxed),
+            reset_errors: c.reset_errors.load(Ordering::Relaxed),
+            tls_handshake_errors: c.tls_handshake_errors.load(Ordering::Relaxed),
+            proxy_connect_errors: c.proxy_connect_errors.load(Ordering::Relaxed),
+            http_error_responses: c.http_error_responses.load(Ordering::Relaxed),
             bytes_tx: txb,
             bytes_rx: rxb,
             packets_tx,
@@ -1119,9 +1153,10 @@ async fn execute_connection(
     });
     match transact(sc, payloads, flow.as_deref(), c, &gate).await {
         Ok(()) => {}
-        Err(_) => {
+        Err(error) => {
             c.failed.fetch_add(1, Ordering::Relaxed);
             c.transaction_errors.fetch_add(1, Ordering::Relaxed);
+            c.record_failure(&error);
         }
     }
 }
@@ -1143,7 +1178,8 @@ async fn transact(
         Duration::from_millis(sc.timeouts.connect_ms),
         TcpStream::connect(connect_addr),
     )
-    .await??;
+    .await?
+    .context("TCP connect failed")?;
     c.tcp_connect_latencies_us
         .lock()
         .await
@@ -1153,10 +1189,16 @@ async fn transact(
     let needs_tunnel = sc.topology == Topology::ExplicitProxy
         && (sc.tls.enabled || sc.protocol != Protocol::Http1);
     if needs_tunnel {
-        connect_tunnel(&mut tcp_stream, sc, c).await?;
+        connect_tunnel(&mut tcp_stream, sc, c)
+            .await
+            .context("HTTP CONNECT failed")?;
     }
     let mut stream: Box<dyn IoStream> = if sc.tls.enabled {
-        Box::new(connect_tls(tcp_stream, sc).await?)
+        Box::new(
+            connect_tls(tcp_stream, sc)
+                .await
+                .context("TLS handshake failed")?,
+        )
     } else {
         Box::new(tcp_stream)
     };
@@ -1191,7 +1233,10 @@ async fn connect_tunnel(stream: &mut TcpStream, sc: &Scenario, c: &Counters) -> 
     .await??;
     c.rx.fetch_add(head.len() as u64, Ordering::Relaxed);
     if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
-        bail!("CONNECT rejected")
+        bail!(
+            "CONNECT rejected with response {}",
+            String::from_utf8_lossy(&head[..head.len().min(128)])
+        )
     };
     Ok(())
 }
@@ -1367,7 +1412,11 @@ async fn http_transactions(
         .await??;
         c.rx.fetch_add((response.len() + body_len) as u64, Ordering::Relaxed);
         if !response.starts_with(b"HTTP/1.1 2") {
-            bail!("HTTP transaction failed")
+            let status = response
+                .split(|byte| *byte == b' ')
+                .nth(1)
+                .unwrap_or_default();
+            bail!("HTTP error response {}", String::from_utf8_lossy(status))
         }
         c.transaction_completed();
         c.http_latencies_us
@@ -1878,6 +1927,25 @@ mod tests {
         server.unwrap();
         assert_eq!(client_counters.rx.load(Ordering::Relaxed), 1);
         assert_eq!(server_counters.rx.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn failures_are_classified_without_losing_aggregate_errors() {
+        let counters = Counters::default();
+        counters.record_failure(&anyhow::anyhow!(
+            "HTTP CONNECT failed: CONNECT rejected with response HTTP/1.1 403"
+        ));
+        counters.record_failure(&anyhow::anyhow!(
+            "TLS handshake failed: invalid peer certificate"
+        ));
+        counters.record_failure(&anyhow::anyhow!("deadline has elapsed"));
+        counters.record_failure(&anyhow::anyhow!("connection reset by peer"));
+        counters.record_failure(&anyhow::anyhow!("HTTP error response 451"));
+        assert_eq!(counters.proxy_connect_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.tls_handshake_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.timeout_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.reset_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.http_error_responses.load(Ordering::Relaxed), 1);
     }
 }
 async fn send_event(

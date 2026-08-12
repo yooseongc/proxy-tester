@@ -563,6 +563,16 @@ pub struct MetricsSnapshot {
     pub active_connections_max: u64,
     pub transactions: u64,
     pub transaction_errors: u64,
+    #[serde(default)]
+    pub timeout_errors: u64,
+    #[serde(default)]
+    pub reset_errors: u64,
+    #[serde(default)]
+    pub tls_handshake_errors: u64,
+    #[serde(default)]
+    pub proxy_connect_errors: u64,
+    #[serde(default)]
+    pub http_error_responses: u64,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
     pub packets_tx: u64,

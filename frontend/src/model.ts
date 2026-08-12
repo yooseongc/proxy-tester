@@ -3,7 +3,7 @@ export type Agent={id:string;role:number;hostname:string;interfaces:string[];onl
 export type Metrics={
  unix_ms:number;elapsed_ms:number;bytes_tx:number;bytes_rx:number;
  load_stage_index:number;desired_virtual_clients:number;included_in_results:boolean;
- connections_established:number;active_connections:number;active_connections_avg?:number;active_connections_min?:number;active_connections_max?:number;connections_failed:number;transactions:number;transaction_errors:number;
+ connections_established:number;active_connections:number;active_connections_avg?:number;active_connections_min?:number;active_connections_max?:number;connections_failed:number;transactions:number;transaction_errors:number;timeout_errors?:number;reset_errors?:number;tls_handshake_errors?:number;proxy_connect_errors?:number;http_error_responses?:number;
  cps:number;tps:number;tx_bps:number;rx_bps:number;latency_p99_ms:number;
  tcp_connect_latency_p50_ms:number;tcp_connect_latency_p95_ms:number;tcp_connect_latency_p99_ms:number;
  http_latency_p50_ms:number;http_latency_p95_ms:number;http_latency_p99_ms:number;
