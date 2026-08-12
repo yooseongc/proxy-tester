@@ -21,6 +21,16 @@ pub struct ReassembledFlow {
     pub retransmitted_bytes: u64,
     pub turns: Vec<ReplayTurn>,
     pub http_transactions: Vec<HttpTransaction>,
+    pub http2_transactions: Vec<Http2Transaction>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http2Transaction {
+    pub method: Vec<u8>,
+    pub path: Vec<u8>,
+    pub authority: Vec<u8>,
+    pub status: Vec<u8>,
+    pub request_body: Vec<u8>,
+    pub response_body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +62,7 @@ pub struct Exclusions {
     pub non_http_flows: u64,
     pub unsupported_http_flows: u64,
     pub http_upgrade_flows: u64,
+    pub unsupported_http2_flows: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +176,19 @@ fn finish_analysis(
             analysis.exclusions.encrypted_tls_flows += 1;
             continue;
         }
-        let http_transactions =
+        let http2_transactions = if client_to_server
+            .starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        {
+            extract_http2_transactions(&client_to_server, &server_to_client).unwrap_or_else(|| {
+                analysis.exclusions.unsupported_http2_flows += 1;
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        let http_transactions = if !http2_transactions.is_empty() {
+            Vec::new()
+        } else {
             match extract_http_transactions(&client_to_server, &server_to_client) {
                 Some(transactions) => transactions,
                 None if !client_to_server.starts_with(b"HTTP/")
@@ -192,7 +215,8 @@ fn finish_analysis(
                     analysis.exclusions.unsupported_http_flows += 1;
                     Vec::new()
                 }
-            };
+            }
+        };
         analysis.flows.push(ReassembledFlow {
             key,
             client_to_server,
@@ -200,8 +224,130 @@ fn finish_analysis(
             retransmitted_bytes: parts.duplicate_bytes + client_dup + server_dup,
             turns: build_turns(parts.events),
             http_transactions,
+            http2_transactions,
         });
     }
+}
+
+#[derive(Default)]
+struct H2Parts {
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+    ended: bool,
+}
+
+fn parse_h2_direction(stream: &[u8], client: bool) -> Option<HashMap<u32, H2Parts>> {
+    let mut offset = if client { 24 } else { 0 };
+    let mut decoder = hpack::Decoder::new();
+    let mut result: HashMap<u32, H2Parts> = HashMap::new();
+    let mut pending: Option<(u32, u8, Vec<u8>)> = None;
+    while offset < stream.len() {
+        if offset + 9 > stream.len() {
+            return None;
+        }
+        let length = ((stream[offset] as usize) << 16)
+            | ((stream[offset + 1] as usize) << 8)
+            | stream[offset + 2] as usize;
+        let kind = stream[offset + 3];
+        let flags = stream[offset + 4];
+        let stream_id =
+            u32::from_be_bytes(stream[offset + 5..offset + 9].try_into().ok()?) & 0x7fff_ffff;
+        offset += 9;
+        if offset + length > stream.len() {
+            return None;
+        }
+        let payload = &stream[offset..offset + length];
+        offset += length;
+        match kind {
+            0 if stream_id > 0 => {
+                result
+                    .entry(stream_id)
+                    .or_default()
+                    .body
+                    .extend_from_slice(payload);
+                if flags & 1 != 0 {
+                    result.entry(stream_id).or_default().ended = true;
+                }
+            }
+            1 if stream_id > 0 => {
+                let block = payload.to_vec();
+                if flags & 4 == 0 {
+                    pending = Some((stream_id, flags, block));
+                    continue;
+                }
+                let headers = decoder.decode(&block).ok()?;
+                let part = result.entry(stream_id).or_default();
+                part.headers = headers;
+                if flags & 1 != 0 {
+                    part.ended = true;
+                }
+            }
+            9 => {
+                let (pending_id, pending_flags, mut block) = pending.take()?;
+                if pending_id != stream_id {
+                    return None;
+                }
+                block.extend_from_slice(payload);
+                if flags & 4 == 0 {
+                    pending = Some((stream_id, pending_flags, block));
+                    continue;
+                }
+                let headers = decoder.decode(&block).ok()?;
+                let part = result.entry(stream_id).or_default();
+                part.headers = headers;
+                if pending_flags & 1 != 0 {
+                    part.ended = true;
+                }
+            }
+            3 | 5 | 7 => return None,
+            _ => {}
+        }
+    }
+    if pending.is_some() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+pub fn extract_http2_transactions(client: &[u8], server: &[u8]) -> Option<Vec<Http2Transaction>> {
+    if !client.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
+        return None;
+    }
+    let requests = parse_h2_direction(client, true)?;
+    let responses = parse_h2_direction(server, false)?;
+    let mut ids: Vec<_> = requests.keys().copied().filter(|id| id % 2 == 1).collect();
+    ids.sort_unstable();
+    let mut output = Vec::new();
+    for id in ids {
+        let request = requests.get(&id)?;
+        let response = responses.get(&id)?;
+        if !request.ended || !response.ended {
+            return None;
+        }
+        let header = |items: &[(Vec<u8>, Vec<u8>)], name: &[u8]| {
+            items
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        let method = header(&request.headers, b":method");
+        let path = header(&request.headers, b":path");
+        let status = header(&response.headers, b":status");
+        if method.is_empty() || path.is_empty() || status.is_empty() {
+            return None;
+        }
+        output.push(Http2Transaction {
+            method,
+            path,
+            authority: header(&request.headers, b":authority"),
+            status,
+            request_body: request.body.clone(),
+            response_body: response.body.clone(),
+        });
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
@@ -793,4 +939,37 @@ mod tests {
         assert_eq!(analysis.exclusions.http_upgrade_flows, 1);
         assert!(analysis.flows[0].http_transactions.is_empty());
     }
+}
+#[cfg(test)]
+fn h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![
+        ((payload.len() >> 16) & 0xff) as u8,
+        ((payload.len() >> 8) & 0xff) as u8,
+        (payload.len() & 0xff) as u8,
+        kind,
+        flags,
+    ];
+    frame.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[cfg(test)]
+#[test]
+fn extracts_interleaved_plaintext_http2_transactions() {
+    let mut client = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    client.extend(h2_frame(4, 0, 0, &[]));
+    client.extend(h2_frame(1, 4, 1, &[0x82, 0x84]));
+    client.extend(h2_frame(1, 4, 3, &[0x83, 0x84]));
+    client.extend(h2_frame(0, 1, 1, b"alpha"));
+    client.extend(h2_frame(0, 1, 3, b"beta"));
+    let mut server = h2_frame(4, 0, 0, &[]);
+    server.extend(h2_frame(1, 4, 1, &[0x88]));
+    server.extend(h2_frame(1, 4, 3, &[0x88]));
+    server.extend(h2_frame(0, 1, 3, b"B"));
+    server.extend(h2_frame(0, 1, 1, b"A"));
+    let transactions = extract_http2_transactions(&client, &server).unwrap();
+    assert_eq!(transactions.len(), 2);
+    assert_eq!(transactions[0].request_body, b"alpha");
+    assert_eq!(transactions[1].response_body, b"B");
 }

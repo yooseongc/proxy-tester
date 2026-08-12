@@ -6,10 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 async-stream.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
+h2.workspace = true
+http.workspace = true
 proxy-tester-domain = { path = "../domain" }
 proxy-tester-capture = { path = "../capture" }
 proxy-tester-proto = { path = "../proto" }

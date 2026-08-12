@@ -861,6 +861,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hpack"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c68f61350ad23817dd207b035b5258d91ac5eaef69e96f906628aaed8854dda"
+dependencies = [
+ "log 0.3.9",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,7 +985,7 @@ dependencies = [
  "core-foundation-sys",
  "iana-time-zone-haiku",
  "js-sys",
- "log",
+ "log 0.4.33",
  "wasm-bindgen",
  "windows-core",
 ]
@@ -1218,6 +1227,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "log"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
+dependencies = [
+ "log 0.4.33",
 ]
 
 [[package]]
@@ -1569,7 +1587,7 @@ checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
  "itertools",
- "log",
+ "log 0.4.33",
  "multimap",
  "once_cell",
  "petgraph",
@@ -1673,9 +1691,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "bytes",
  "chrono",
  "clap",
  "futures",
+ "h2",
+ "http",
  "proxy-tester-capture",
  "proxy-tester-domain",
  "proxy-tester-proto",
@@ -1723,6 +1744,7 @@ dependencies = [
 name = "proxy-tester-capture"
 version = "0.1.0"
 dependencies = [
+ "hpack",
  "thiserror",
 ]
 
@@ -1941,7 +1963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
- "log",
+ "log 0.4.33",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
@@ -2207,7 +2229,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "hashlink",
  "indexmap 2.14.0",
- "log",
+ "log 0.4.33",
  "memchr",
  "once_cell",
  "percent-encoding",
@@ -2286,7 +2308,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "itoa",
- "log",
+ "log 0.4.33",
  "md-5",
  "memchr",
  "once_cell",
@@ -2327,7 +2349,7 @@ dependencies = [
  "hmac",
  "home",
  "itoa",
- "log",
+ "log 0.4.33",
  "md-5",
  "memchr",
  "once_cell",
@@ -2359,7 +2381,7 @@ dependencies = [
  "futures-intrusive",
  "futures-util",
  "libsqlite3-sys",
- "log",
+ "log 0.4.33",
  "percent-encoding",
  "serde",
  "serde_urlencoded",
@@ -2580,7 +2602,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
- "log",
+ "log 0.4.33",
  "tokio",
  "tungstenite",
 ]
@@ -2723,7 +2745,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log",
+ "log 0.4.33",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -2756,7 +2778,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log",
+ "log 0.4.33",
  "once_cell",
  "tracing-core",
 ]
@@ -2795,7 +2817,7 @@ dependencies = [
  "data-encoding",
  "http",
  "httparse",
- "log",
+ "log 0.4.33",
  "rand 0.9.5",
  "sha1",
  "thiserror",

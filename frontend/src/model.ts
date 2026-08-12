@@ -70,11 +70,12 @@ export function recentActiveMaximum(points:Point[],windowMs=60_000){
 
 export type Scenario={
  version:number;id:string;name:string;topology:'explicit_proxy'|'transparent_proxy';
- protocol:'tcp'|'http1'|'connect';client_agent_id:string;server_agent_id:string;
+ protocol:'tcp'|'http1'|'http2'|'connect';client_agent_id:string;server_agent_id:string;
  proxy_addr:string|null;target_addr:string;source_ips:string[];virtual_clients:number;
  duration_secs:number;warmup_secs:number;
  load_stages:LoadStage[];
  request:{method:string;path:string;host:string;request_body_bytes:number;response_body_bytes:number;keep_alive:boolean;transactions_per_connection:number;think_time_ms:number};
+ http2:{max_concurrent_streams:number};
  tcp:{tx_bytes:number;rx_bytes:number};
  payload_mode:'manual'|'capture_replay';capture_artifact_id:string|null;request_payload:PayloadProfile|null;response_payload:PayloadProfile|null;
  tls:{enabled:boolean;verify_peer:boolean;version:'tls12'|'tls13';cipher_suite:string|null;server_name:string;ca_pem:string|null;server_cert_pem:string|null;server_key_pem:string|null};
@@ -86,7 +87,7 @@ export type PayloadProfile={kind:'empty'|'fixed'|'text'|'file'|'random';size_byt
 export type LoadStage={name:string;mode:'ramp'|'hold';duration_secs:number;target_virtual_clients:number;include_in_results:boolean};
 
 export const initialScenario=():Scenario=>({
- version:2,id:crypto.randomUUID(),name:'기본 TCP 시험',topology:'transparent_proxy',protocol:'tcp',
+ version:3,id:crypto.randomUUID(),name:'기본 TCP 시험',topology:'transparent_proxy',protocol:'tcp',
  client_agent_id:'client-1',server_agent_id:'server-1',proxy_addr:null,target_addr:'server:8080',
  source_ips:[],virtual_clients:100,duration_secs:50,warmup_secs:0,
  load_stages:[
@@ -95,6 +96,7 @@ export const initialScenario=():Scenario=>({
   {name:'Ramp-down',mode:'ramp',duration_secs:10,target_virtual_clients:0,include_in_results:true}
  ],
  request:{method:'GET',path:'/',host:'proxy-tester.local',request_body_bytes:0,response_body_bytes:128,keep_alive:true,transactions_per_connection:1,think_time_ms:0},
+ http2:{max_concurrent_streams:100},
  tcp:{tx_bytes:64,rx_bytes:64},payload_mode:'manual',capture_artifact_id:null,request_payload:{kind:'fixed',size_bytes:64,text:'',artifact_id:null,random_format:'binary'},response_payload:{kind:'fixed',size_bytes:64,text:'',artifact_id:null,random_format:'binary'},tls:{enabled:false,verify_peer:false,version:'tls13',cipher_suite:null,server_name:'proxy-tester.local',ca_pem:null,server_cert_pem:null,server_key_pem:null},
  timeouts:{connect_ms:3000,proxy_connect_ms:3000,response_ms:5000},observation_interfaces:[]
 });

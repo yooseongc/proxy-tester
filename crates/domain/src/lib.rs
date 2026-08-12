@@ -3,7 +3,7 @@ use std::{collections::HashSet, net::IpAddr};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCENARIO_VERSION: u32 = 2;
+pub const SCENARIO_VERSION: u32 = 3;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub enum Topology {
 pub enum Protocol {
     Tcp,
     Http1,
+    Http2,
     Connect,
 }
 
@@ -39,6 +40,7 @@ pub struct Scenario {
     pub warmup_secs: u64,
     pub load_stages: Vec<LoadStage>,
     pub request: HttpRequestProfile,
+    pub http2: Http2Profile,
     pub tcp: TcpPayloadProfile,
     /// Scenario v2 payloads. `None` is retained solely for v1 JSON migration.
     pub request_payload: Option<PayloadProfile>,
@@ -68,6 +70,7 @@ impl Default for Scenario {
             warmup_secs: 0,
             load_stages: vec![],
             request: HttpRequestProfile::default(),
+            http2: Http2Profile::default(),
             tcp: TcpPayloadProfile::default(),
             request_payload: Some(PayloadProfile::fixed(64)),
             response_payload: Some(PayloadProfile::fixed(64)),
@@ -76,6 +79,19 @@ impl Default for Scenario {
             tls: TlsProfile::default(),
             timeouts: TimeoutProfile::default(),
             observation_interfaces: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Http2Profile {
+    pub max_concurrent_streams: u32,
+}
+impl Default for Http2Profile {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: 100,
         }
     }
 }
@@ -298,7 +314,7 @@ impl Scenario {
     pub fn migrate(mut self) -> Self {
         if self.version <= 1 {
             let (request, response) = match self.protocol {
-                Protocol::Http1 => (
+                Protocol::Http1 | Protocol::Http2 => (
                     self.request.request_body_bytes,
                     self.request.response_body_bytes,
                 ),
@@ -309,26 +325,32 @@ impl Scenario {
             self.payload_mode = PayloadMode::Manual;
             self.capture_artifact_id = None;
             self.version = SCENARIO_VERSION;
+        } else if self.version == 2 {
+            self.version = SCENARIO_VERSION;
         }
         self
     }
 
     pub fn request_payload(&self) -> PayloadProfile {
         self.request_payload.clone().unwrap_or_else(|| {
-            PayloadProfile::fixed(if self.protocol == Protocol::Http1 {
-                self.request.request_body_bytes
-            } else {
-                self.tcp.tx_bytes
-            })
+            PayloadProfile::fixed(
+                if matches!(self.protocol, Protocol::Http1 | Protocol::Http2) {
+                    self.request.request_body_bytes
+                } else {
+                    self.tcp.tx_bytes
+                },
+            )
         })
     }
     pub fn response_payload(&self) -> PayloadProfile {
         self.response_payload.clone().unwrap_or_else(|| {
-            PayloadProfile::fixed(if self.protocol == Protocol::Http1 {
-                self.request.response_body_bytes
-            } else {
-                self.tcp.rx_bytes
-            })
+            PayloadProfile::fixed(
+                if matches!(self.protocol, Protocol::Http1 | Protocol::Http2) {
+                    self.request.response_body_bytes
+                } else {
+                    self.tcp.rx_bytes
+                },
+            )
         })
     }
     pub fn effective_duration_secs(&self) -> u64 {
@@ -386,7 +408,7 @@ impl Scenario {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.version != 1 && self.version != SCENARIO_VERSION {
+        if self.version != 1 && self.version != 2 && self.version != SCENARIO_VERSION {
             return Err(ValidationError::Invalid(format!(
                 "지원하지 않는 scenario version: {}",
                 self.version
@@ -497,6 +519,18 @@ impl Scenario {
             return Err(ValidationError::Invalid(
                 "CONNECT는 시험 프로토콜이 아닙니다. explicit proxy와 TCP를 선택하세요".into(),
             ));
+        }
+        if self.protocol == Protocol::Http2 {
+            if !self.tls.enabled {
+                return Err(ValidationError::Invalid(
+                    "HTTP/2 requires TLS; h2c is not supported".into(),
+                ));
+            }
+            if !(1..=1000).contains(&self.http2.max_concurrent_streams) {
+                return Err(ValidationError::Invalid(
+                    "HTTP/2 max_concurrent_streams must be between 1 and 1000".into(),
+                ));
+            }
         }
         if self.protocol == Protocol::Http1
             && !self.request.keep_alive
@@ -611,6 +645,43 @@ mod tests {
     fn default_is_valid() {
         assert!(Scenario::default().validate().is_ok());
     }
+
+    #[test]
+    fn http2_requires_tls_and_bounded_stream_concurrency() {
+        let mut scenario = Scenario::default();
+        scenario.protocol = Protocol::Http2;
+        assert!(
+            scenario
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires TLS")
+        );
+        scenario.tls.enabled = true;
+        scenario.tls.server_cert_pem = Some("certificate".into());
+        scenario.tls.server_key_pem = Some("key".into());
+        scenario.http2.max_concurrent_streams = 0;
+        assert!(
+            scenario
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_streams")
+        );
+        scenario.http2.max_concurrent_streams = 100;
+        assert!(scenario.validate().is_ok());
+    }
+
+    #[test]
+    fn scenario_v2_migrates_to_v3_with_http2_defaults() {
+        let scenario = Scenario {
+            version: 2,
+            ..Scenario::default()
+        }
+        .migrate();
+        assert_eq!(scenario.version, 3);
+        assert_eq!(scenario.http2.max_concurrent_streams, 100);
+    }
     #[test]
     fn v1_payload_sizes_are_migrated_by_protocol() {
         let legacy = Scenario {
@@ -626,7 +697,7 @@ mod tests {
             ..Scenario::default()
         };
         let migrated = legacy.migrate();
-        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.version, SCENARIO_VERSION);
         assert_eq!(migrated.request_payload().byte_len(), 7);
         assert_eq!(migrated.response_payload().byte_len(), 11);
     }

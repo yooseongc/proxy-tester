@@ -59,12 +59,15 @@ npm run test:e2e
 - `GET|POST /api/scenarios`
 - `GET|POST /api/runs`, `POST /api/runs/{id}/pause|resume|stop`
 - `GET /api/runs/{id}`
+- `GET /api/runs/page`, `GET /api/runs/{id}/samples`, `GET /api/runs/{id}/export`
 - `GET|POST /api/artifacts?kind=payload|pcap` (`multipart/form-data`의 `file` 필드, 각각 최대 64 MiB/512 MiB)
 - `GET /api/events/ws`
 
 PCAP/PCAPNG 업로드는 형식, record 완결성, packet/byte 수와 SHA-256을 검증·저장합니다. 현재 자동 실행 엔진은 합성 TCP/HTTP/CONNECT workload를 사용합니다.
 
 ## TLS, wire 계측 및 결과
+
+HTTP/2는 TLS+ALPN `h2` 전용이며 직접 연결과 HTTP CONNECT를 지원한다. 연결당 동시 stream 수를 설정할 수 있고 plaintext HTTP/2 Capture의 HPACK/frame을 의미 단위 transaction으로 재현한다. 자세한 계약은 [HTTP/2 문서](docs/HTTP2.md)를 참고한다.
 
 - TLS server certificate/private key PEM을 사용해 HTTPS responder를 실행합니다.
 - 인증서 검증 ON은 CA PEM을 사용하며, OFF는 명시적으로 peer 검증을 생략합니다.

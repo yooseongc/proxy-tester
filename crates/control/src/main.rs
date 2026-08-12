@@ -171,8 +171,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/tls/certificates", post(generate_tls_certificate))
         .route("/api/artifacts", get(list_artifacts).post(upload_artifact))
         .route("/api/runs", get(list_runs).post(start_run))
+        .route("/api/runs/page", get(list_runs_page))
         .route("/api/runs/active", get(active_run))
         .route("/api/runs/{id}", get(run_detail))
+        .route("/api/runs/{id}/summary", get(run_summary_detail))
+        .route("/api/runs/{id}/samples", get(run_samples))
+        .route("/api/runs/{id}/export", get(export_run))
         .route("/api/runs/{id}/stop", post(stop_run))
         .route("/api/runs/{id}/pause", post(pause_run))
         .route("/api/runs/{id}/resume", post(resume_run))
@@ -462,6 +466,8 @@ async fn upload_artifact(
                 "supported_flow_count": analyzed.flows.len(),
                 "http_flow_count": analyzed.flows.iter().filter(|flow| !flow.http_transactions.is_empty()).count(),
                 "http_transaction_count": analyzed.flows.iter().map(|flow| flow.http_transactions.len()).sum::<usize>(),
+                "http2_flow_count": analyzed.flows.iter().filter(|flow| !flow.http2_transactions.is_empty()).count(),
+                "http2_transaction_count": analyzed.flows.iter().map(|flow| flow.http2_transactions.len()).sum::<usize>(),
                 "retransmitted_bytes": analyzed.flows.iter().map(|flow|flow.retransmitted_bytes).sum::<u64>(),
                 "exclusions": {
                     "non_tcp_packets": analyzed.exclusions.non_tcp_packets,
@@ -473,6 +479,7 @@ async fn upload_artifact(
                     "non_http_flows": analyzed.exclusions.non_http_flows,
                     "unsupported_http_flows": analyzed.exclusions.unsupported_http_flows,
                     "http_upgrade_flows": analyzed.exclusions.http_upgrade_flows,
+                    "unsupported_http2_flows": analyzed.exclusions.unsupported_http2_flows,
                 }
             });
             (
@@ -896,16 +903,16 @@ async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Resu
         .get::<Option<String>, _>("analysis_json")
         .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
         .unwrap_or_default();
-    let count_key = if scenario.protocol == Protocol::Http1 {
-        "http_flow_count"
-    } else {
-        "supported_flow_count"
+    let count_key = match scenario.protocol {
+        Protocol::Http1 => "http_flow_count",
+        Protocol::Http2 => "http2_flow_count",
+        _ => "supported_flow_count",
     };
     if analysis[count_key].as_u64().unwrap_or(0) == 0 {
-        return Err(ApiError::bad(if scenario.protocol == Protocol::Http1 {
-            "capture has no supported HTTP/1.1 request/response transactions"
-        } else {
-            "capture has no supported bidirectional plaintext TCP flows"
+        return Err(ApiError::bad(match scenario.protocol {
+            Protocol::Http1 => "capture has no supported HTTP/1.1 request/response transactions",
+            Protocol::Http2 => "capture has no supported plaintext HTTP/2 transactions",
+            _ => "capture has no supported bidirectional plaintext TCP flows",
         }));
     }
     Ok(())
@@ -1112,6 +1119,95 @@ async fn list_runs(State(s): State<AppState>) -> Result<Json<Vec<serde_json::Val
     let rows=sqlx::query("SELECT id,scenario_id,run_name,status,started_at,finished_at,error,scenario_json FROM runs ORDER BY rowid DESC LIMIT 100").fetch_all(&s.db).await?;
     Ok(Json(rows.into_iter().map(|r|serde_json::json!({"id":r.get::<String,_>("id"),"scenario_id":r.get::<String,_>("scenario_id"),"run_name":r.get::<Option<String>,_>("run_name"),"status":r.get::<String,_>("status"),"started_at":r.get::<Option<String>,_>("started_at"),"finished_at":r.get::<Option<String>,_>("finished_at"),"error":r.get::<Option<String>,_>("error"),"scenario":redacted_scenario(r.get("scenario_json"))})).collect()))
 }
+#[derive(Deserialize)]
+struct RunPageQuery {
+    limit: Option<u32>,
+    cursor: Option<i64>,
+}
+async fn list_runs_page(
+    State(s): State<AppState>,
+    Query(query): Query<RunPageQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = query.limit.unwrap_or(25).clamp(1, 100) as i64;
+    let cursor = query.cursor.unwrap_or(i64::MAX);
+    let rows=sqlx::query("SELECT rowid,id,scenario_id,run_name,status,started_at,finished_at,error,scenario_json FROM runs WHERE rowid < ? ORDER BY rowid DESC LIMIT ?")
+        .bind(cursor).bind(limit + 1).fetch_all(&s.db).await?;
+    let next_cursor =
+        (rows.len() as i64 > limit).then(|| rows[limit as usize - 1].get::<i64, _>("rowid"));
+    let items=rows.into_iter().take(limit as usize).map(|r|serde_json::json!({"id":r.get::<String,_>("id"),"scenario_id":r.get::<String,_>("scenario_id"),"run_name":r.get::<Option<String>,_>("run_name"),"status":r.get::<String,_>("status"),"started_at":r.get::<Option<String>,_>("started_at"),"finished_at":r.get::<Option<String>,_>("finished_at"),"error":r.get::<Option<String>,_>("error"),"scenario":redacted_scenario(r.get("scenario_json"))})).collect::<Vec<_>>();
+    Ok(Json(
+        serde_json::json!({"items":items,"next_cursor":next_cursor}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SampleQuery {
+    from_unix_ms: Option<i64>,
+    to_unix_ms: Option<i64>,
+    max_points: Option<u32>,
+}
+async fn run_samples(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<SampleQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let from = query.from_unix_ms.unwrap_or(i64::MIN);
+    let to = query.to_unix_ms.unwrap_or(i64::MAX);
+    let maximum = query.max_points.unwrap_or(2000).clamp(10, 10_000) as usize;
+    let rows=sqlx::query("SELECT agent_id,role,unix_ms,metrics_json FROM metric_samples WHERE run_id=? AND unix_ms>=? AND unix_ms<=? ORDER BY unix_ms")
+        .bind(id.to_string()).bind(from).bind(to).fetch_all(&s.db).await?;
+    let stride = (rows.len().saturating_add(maximum - 1) / maximum).max(1);
+    let samples=rows.into_iter().enumerate().filter(|(index,_)| index % stride == 0).map(|(_,r)|serde_json::json!({"agent_id":r.get::<String,_>("agent_id"),"role":r.get::<i64,_>("role"),"unix_ms":r.get::<i64,_>("unix_ms"),"metrics":serde_json::from_str::<serde_json::Value>(r.get("metrics_json")).unwrap_or_default()})).collect::<Vec<_>>();
+    Ok(Json(
+        serde_json::json!({"samples":samples,"downsampled":stride>1,"stride":stride}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+async fn export_run(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Response, ApiError> {
+    let detail = run_detail(State(s), Path(id)).await?.0;
+    let format = query.format.as_deref().unwrap_or("json");
+    let (content_type, body) = if format == "csv" {
+        let mut output = String::from("agent_id,role,unix_ms,metrics_json\n");
+        for sample in detail["samples"].as_array().into_iter().flatten() {
+            output.push_str(&format!(
+                "{},{},{},{}\n",
+                sample["agent_id"].as_str().unwrap_or(""),
+                sample["role"],
+                sample["unix_ms"],
+                serde_json::to_string(&sample["metrics"]).unwrap_or_default()
+            ));
+        }
+        ("text/csv", output)
+    } else {
+        (
+            "application/json",
+            serde_json::to_string_pretty(&detail).unwrap_or_default(),
+        )
+    };
+    Ok((
+        [
+            ("content-type", content_type),
+            (
+                "content-disposition",
+                if format == "csv" {
+                    "attachment; filename=run.csv"
+                } else {
+                    "attachment; filename=run.json"
+                },
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
 fn redacted_scenario(body: &str) -> serde_json::Value {
     let mut value = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
     if let Some(tls) = value
@@ -1146,6 +1242,14 @@ async fn run_detail(
     Ok(Json(
         serde_json::json!({"id":run.get::<String,_>("id"),"run_name":run.get::<Option<String>,_>("run_name"),"started_at":run.get::<Option<String>,_>("started_at"),"finished_at":run.get::<Option<String>,_>("finished_at"),"status":run.get::<String,_>("status"),"error":run.get::<Option<String>,_>("error"),"scenario":redacted_scenario(&scenario_json),"payload_metadata":payload_metadata,"samples":samples }),
     ))
+}
+async fn run_summary_detail(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut detail = run_detail(State(s), Path(id)).await?.0;
+    detail["samples"] = serde_json::json!([]);
+    Ok(Json(detail))
 }
 
 fn result_payload_metadata(body: &str, samples: &[serde_json::Value]) -> serde_json::Value {

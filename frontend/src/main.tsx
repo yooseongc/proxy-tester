@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -27,8 +27,8 @@ import {
   Wifi,
 } from "lucide-react";
 import { api } from "./api";
-import { TelemetryCharts } from "./TelemetryCharts";
-import { RunHistory } from "./RunHistory";
+const TelemetryCharts=lazy(()=>import("./TelemetryCharts").then(module=>({default:module.TelemetryCharts})));
+const RunHistory=lazy(()=>import("./RunHistory").then(module=>({default:module.RunHistory})));
 import {
   closestSample,
   formatBandwidth,
@@ -63,6 +63,8 @@ type Artifact = {
     supported_flow_count?: number;
     http_flow_count?: number;
     http_transaction_count?: number;
+    http2_flow_count?: number;
+    http2_transaction_count?: number;
     retransmitted_bytes?: number;
     exclusions?: Record<string, number>;
   };
@@ -279,6 +281,8 @@ function App() {
     setScenario({
       ...fallback,
       ...found,
+      version: 3,
+      http2: found.http2 ?? fallback.http2,
       load_stages: found.load_stages?.length
         ? found.load_stages
         : fallback.load_stages,
@@ -335,6 +339,16 @@ function App() {
       : scenario.request.transactions_per_connection === 1
         ? "single"
         : "fixed";
+  const applyPreset=(kind:"cps"|"http1"|"http2"|"bandwidth"|"dlp"|"pcap")=>{
+    const next=initialScenario();
+    if(kind==="cps")Object.assign(next,{name:"TCP CPS",virtual_clients:1000});
+    if(kind==="http1")Object.assign(next,{name:"HTTP/1.1 TPS",protocol:"http1"});
+    if(kind==="http2")Object.assign(next,{name:"HTTP/2 Multiplex TPS",protocol:"http2",tls:{...next.tls,enabled:true}});
+    if(kind==="bandwidth")Object.assign(next,{name:"양방향 B/W",request_payload:{...next.request_payload!,size_bytes:1024*1024},response_payload:{...next.response_payload!,size_bytes:1024*1024}});
+    if(kind==="dlp")Object.assign(next,{name:"DLP 양방향 문자열",request_payload:{...next.request_payload!,kind:"text",text:"DLP request sentinel"},response_payload:{...next.response_payload!,kind:"text",text:"DLP response sentinel"}});
+    if(kind==="pcap")Object.assign(next,{name:"PCAP 세션 재현",payload_mode:"capture_replay"});
+    setScenario(next);
+  };
   const selectedCapture = artifacts.find(
     (artifact) => artifact.id === scenario.capture_artifact_id,
   );
@@ -354,7 +368,7 @@ function App() {
     return `${direction}: ${kind}${payload.kind === "empty" ? "" : ` ${formatBytes(bytes)}`}`;
   };
   const trafficSummary = [
-    scenario.protocol === "http1" ? "HTTP/1.1" : "TCP",
+    scenario.protocol === "http2" ? "HTTP/2" : scenario.protocol === "http1" ? "HTTP/1.1" : "TCP",
     scenario.tls.enabled
       ? `TLS ${scenario.tls.version === "tls13" ? "1.3" : "1.2"}`
       : "평문",
@@ -363,7 +377,7 @@ function App() {
       : `${payloadLabel(scenario.request_payload, "요청")} · ${payloadLabel(scenario.response_payload, "응답")}`,
     scenario.topology === "explicit_proxy" ? "명시적 Proxy" : "직접 연결",
   ].join(" · ");
-  const captureBlocked = scenario.payload_mode === "capture_replay" && (!selectedCapture || (scenario.protocol === "http1" ? (selectedCapture.analysis?.http_flow_count ?? 0) === 0 : (selectedCapture.analysis?.supported_flow_count ?? 0) === 0));
+  const captureBlocked = scenario.payload_mode === "capture_replay" && (!selectedCapture || (scenario.protocol === "http2" ? (selectedCapture.analysis?.http2_flow_count ?? 0) === 0 : scenario.protocol === "http1" ? (selectedCapture.analysis?.http_flow_count ?? 0) === 0 : (selectedCapture.analysis?.supported_flow_count ?? 0) === 0));
   const tabs: [Tab, string, React.ElementType][] = [
     ["setup", "시험 구성", Layers3],
     ["live", "실시간 모니터링", Activity],
@@ -457,6 +471,7 @@ function App() {
             >
               {trafficSummary}
             </p>
+            <div aria-label="시험 프리셋" className="mb-4 flex flex-wrap gap-2">{([['cps','TCP CPS'],['http1','HTTP/1.1 TPS'],['http2','HTTP/2 TPS'],['bandwidth','양방향 B/W'],['dlp','DLP'],['pcap','PCAP']] as const).map(([id,label])=><Button key={id} onClick={()=>applyPreset(id)}>{label}</Button>)}</div>
             <div className="mb-5 grid gap-3 rounded-2xl border border-line bg-raised/60 p-3 md:grid-cols-[1fr_auto]">
               <Field label="저장된 시험 구성">
                 <select
@@ -514,14 +529,14 @@ function App() {
                             ? "tcp"
                             : scenario.protocol
                         }
-                        onChange={(e) =>
-                          patch({
-                            protocol: e.target.value as Scenario["protocol"],
-                          })
-                        }
+                        onChange={(e) => {
+                          const protocol=e.target.value as Scenario["protocol"];
+                          patch({protocol,tls:protocol==="http2"?{...scenario.tls,enabled:true}:scenario.tls});
+                        }}
                       >
                         <option value="tcp">TCP</option>
                         <option value="http1">HTTP/1.1</option>
+                        <option value="http2">HTTP/2</option>
                       </select>
                     </Field>
                   </div>
@@ -600,7 +615,8 @@ function App() {
                       }
                     />
                   )}{" "}
-                  {scenario.protocol === "http1" && (
+                  {scenario.protocol === "http2" && <Field label="연결당 최대 동시 Stream"><input aria-label="연결당 최대 동시 Stream" type="number" min="1" max="1000" value={scenario.http2.max_concurrent_streams} onChange={(e)=>patch({http2:{max_concurrent_streams:Math.max(1,Math.min(1000,+e.target.value))}})}/></Field>}
+                  {(scenario.protocol === "http1" || scenario.protocol === "http2") && (
                     <>
                       <Field label="Connection 사용 방식">
                         <select
@@ -662,6 +678,7 @@ function App() {
                       type="checkbox"
                       aria-label="TLS 활성화"
                       checked={scenario.tls.enabled}
+                      disabled={scenario.protocol === "http2"}
                       onChange={(e) =>
                         patch({
                           tls: { ...scenario.tls, enabled: e.target.checked },
@@ -1108,20 +1125,20 @@ function App() {
                 tone="info"
               />
             </div>
-            <TelemetryCharts
+            <Suspense fallback={<p role="status">차트 불러오는 중…</p>}><TelemetryCharts
               points={points}
               scenario={scenario}
               theme={theme}
               live
               running={!!activeRun}
-            />
+            /></Suspense>
           </Panel>
         )}
         {tab === "results" && (
-          <RunHistory
+          <Suspense fallback={<p role="status">결과 불러오는 중…</p>}><RunHistory
             refreshKey={`${activeRun ?? ""}:${status}`}
             theme={theme}
-          />
+          /></Suspense>
         )}
       </main>
     </div>
@@ -1312,7 +1329,7 @@ function CaptureEditor({
     excluded = Object.entries(current?.analysis?.exclusions ?? {}).filter(
       ([, count]) => count > 0,
     );
-  const supported = current ? protocol === "http1" ? current.analysis?.http_flow_count ?? 0 : current.analysis?.supported_flow_count ?? 0 : 0;
+  const supported = current ? protocol === "http2" ? current.analysis?.http2_flow_count ?? 0 : protocol === "http1" ? current.analysis?.http_flow_count ?? 0 : current.analysis?.supported_flow_count ?? 0 : 0;
   return (
     <div className="space-y-3 rounded-xl border border-dashed border-line bg-inset p-3">
       <Field label="PCAP / PCAPNG 업로드">
@@ -1346,7 +1363,7 @@ function CaptureEditor({
       </Field>
       {current && (
         <div className="grid gap-2 text-[10px] sm:grid-cols-2" aria-label="Capture 분석 요약">
-          <p className={`rounded-lg p-2 sm:col-span-2 ${supported > 0 ? "bg-signal/10 text-signal" : "bg-warn/10 text-warn"}`}><b className="block">현재 프로토콜 지원</b>{supported}개 {protocol === "http1" ? "HTTP 흐름" : "TCP 흐름"}</p>
+          <p className={`rounded-lg p-2 sm:col-span-2 ${supported > 0 ? "bg-signal/10 text-signal" : "bg-warn/10 text-warn"}`}><b className="block">현재 프로토콜 지원</b>{supported}개 {protocol === "http2" ? "HTTP/2 흐름" : protocol === "http1" ? "HTTP 흐름" : "TCP 흐름"}</p>
           <p className="rounded-lg bg-raised p-2">
             <b className="block text-signal">지원 TCP 흐름</b>
             {current.analysis?.supported_flow_count ?? 0}개
@@ -1356,6 +1373,7 @@ function CaptureEditor({
             {current.analysis?.http_flow_count ?? 0}개 흐름 ·{" "}
             {current.analysis?.http_transaction_count ?? 0} transactions
           </p>
+          <p className="rounded-lg bg-raised p-2"><b className="block text-signal">HTTP/2</b>{current.analysis?.http2_flow_count ?? 0}개 흐름 · {current.analysis?.http2_transaction_count ?? 0} transactions</p>
           <p className="rounded-lg bg-raised p-2">
             <b className="block text-signal">Retransmission</b>
             {(current.analysis?.retransmitted_bytes ?? 0).toLocaleString()}{" "}

@@ -103,6 +103,31 @@ PCAP 모드는 업로드·분석 상태, TCP/HTTP 지원 흐름, transaction, re
 
 완료 조건: 전체 자동시험, musl build, lifecycle regression과 clean-install smoke test 통과.
 
+## M8 — 분산 제어 안정성 (완료)
+
+- instance/session generation, command ID/ACK와 멱등 명령 처리
+- 양쪽 participant 완료 합의와 Control 재시작 orphan 정리
+- 설정 가능한 disconnect 유예, degraded 표시와 안전 실패
+
+검증: 기존 lifecycle 및 `tests/distributed-control-regression.ps1`의 Agent restart chaos 시험 통과.
+
+## M9 — TLS HTTP/2와 복호화 Capture (완료)
+
+- Scenario v3, TLS+ALPN h2 직접/CONNECT와 VU별 다중 stream
+- HTTP/2 flow-control 기반 양방향 payload 및 TPS/latency 계측
+- plaintext frame, HPACK, CONTINUATION, interleaved stream 분석과 새 h2 session 재현
+
+검증: HTTP/2 parser golden test와 `tests/http2-regression.ps1` 직접/CONNECT 통과. h2c는 validation에서 차단.
+
+## M10 — UI와 대규모 결과 조회 (완료)
+
+- TCP CPS, HTTP/1.1·2 TPS, B/W, DLP, PCAP 프리셋
+- HTTP/2 TLS 고정, stream 설정과 protocol별 Capture 요약
+- cursor Run 목록, 시간 범위 sample/downsampling과 서버 export API
+- Results/ECharts lazy loading으로 초기 JS gzip을 74KB 수준으로 축소
+
+검증: frontend typecheck, Vitest, production build와 Playwright 회귀시험 통과.
+
 ## 커밋 규칙
 
 - 한 커밋은 한 계약 변경 또는 수직 기능 단위로 제한한다.

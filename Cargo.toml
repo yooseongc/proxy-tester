@@ -19,6 +19,8 @@ anyhow = "1.0"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 bytes = "1.10"
+h2 = "0.4"
+http = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
