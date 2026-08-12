@@ -73,13 +73,19 @@
 
 완료 조건: protocol/version/path 조합 matrix와 인증서 검증 on/off 회귀시험 통과.
 
-## M6 — Traffic-first UI와 분석 UX
+## M6 — Traffic-first UI와 분석 UX (완료)
 
 - `프로토콜 → 보안 → Payload → 부하` 구성 순서
 - 현재 선택 한 줄 요약과 구성 이름/Run 이름 분리
 - payload artifact upload/선택과 PCAP 분석 진행상태
 - 지원 flow 및 제외 reason 요약, 실행 차단 사유 표시
 - 고급 설정 접기, 반응형 overflow, 접근성
+
+구현 완료: 설정 화면을 `1. 프로토콜 → 2. 보안 → 3. Payload → 4. 부하` 순서로 고정하고 현재 선택을 프로토콜, TLS 버전, 양방향 payload/PCAP, 연결 경로의 한 줄 요약으로 표시한다. 저장되는 `구성 이름`과 실행마다 지정하는 `개별 시험 이름`을 분리했다. endpoint, HTTP Proxy, timeout, Wire 인터페이스와 TLS 세부 설정은 접힌 고급 영역에 배치했다.
+
+PCAP 모드는 업로드·분석 상태, TCP/HTTP 지원 흐름, transaction, retransmission과 제외 reason을 보여준다. 선택 프로토콜에 맞는 흐름이 없거나 capture를 선택하지 않으면 차단 사유를 표시하고 시험 시작을 비활성화한다.
+
+검증: `frontend/tests/ui.spec.ts`가 요청·응답의 독립 payload 종류, UTF-8 실제 크기, random 형식/크기, 동적 상단 요약, PCAP 분석 중 상태와 결과, 프로토콜별 지원 수, 고급 설정, tablet/mobile overflow와 기존 차트 UX를 실제 브라우저에서 검증한다.
 
 완료 조건: Playwright에서 조건부 필드, 독립 payload, 분석 상태, 고급 설정, mobile layout을 검증함.
 

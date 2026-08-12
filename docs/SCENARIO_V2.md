@@ -19,3 +19,9 @@ file payload와 capture artifact는 256 KiB gRPC chunk로 양쪽 Agent에 전송
 `tls.version`은 `tls12` 또는 `tls13`이며 기본값은 `tls13`이다. `tls.cipher_suite`는 `null`이면 해당 버전의 rustls 기본 cipher 순서를 사용한다. 값을 지정하면 선택 버전과 호환되는 TLS 1.2 ECDHE 또는 TLS 1.3 AEAD suite만 허용한다. 인증서 검증은 기본 OFF이며, ON일 때 `ca_pem`과 SNI에 사용하는 `server_name`이 필요하다. responder에는 `server_cert_pem`과 `server_key_pem`을 전달한다.
 
 평문 HTTP explicit proxy는 absolute-form request를 전달하고, TLS 및 TCP explicit proxy는 먼저 CONNECT tunnel을 만든다. 결과 metrics는 기존 `connections_failed`와 `transaction_errors` 외에 `timeout_errors`, `reset_errors`, `tls_handshake_errors`, `proxy_connect_errors`, `http_error_responses`를 제공한다. 이 분류는 장비의 차단 성공을 판정하지 않고 관측된 wire/application 실패 원인만 기록한다.
+
+## Traffic-first UI
+
+설정 화면은 프로토콜, 보안, Payload, 부하 순서로 읽는다. 상단 요약은 현재 선택한 프로토콜과 TLS 버전, 요청·응답의 종류 및 실제 byte 크기 또는 capture 이름, 직접/명시적 Proxy 경로를 즉시 반영한다. `구성 이름`은 재사용할 Scenario profile의 이름이고 `개별 시험 이름`은 한 번의 Run을 이력에서 구분하기 위한 이름이다.
+
+PCAP 모드에서는 선택 프로토콜의 지원 흐름 수가 실행 가능 조건이다. TCP는 `supported_flow_count`, HTTP/1.1은 `http_flow_count`를 사용한다. 0개이면 분석 제외 reason과 함께 차단 안내를 표시한다. endpoint, HTTP Proxy, connect/proxy/response timeout, Wire 계측 인터페이스는 연결 고급 설정에 있고 cipher, SNI, 검증, CA 및 responder 인증서/키는 TLS 고급 설정에 있다.
