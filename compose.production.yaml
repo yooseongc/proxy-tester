@@ -25,7 +25,7 @@ services:
       PROXY_TESTER_ROLE: client
       RUST_LOG: proxy_agent=info
     depends_on: [control]
-    cap_add: [NET_ADMIN, NET_RAW]
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     volumes: [client-network-state:/var/lib/proxy-tester]
 
   server:
@@ -37,7 +37,7 @@ services:
       PROXY_TESTER_ROLE: server
       RUST_LOG: proxy_agent=info
     depends_on: [control]
-    cap_add: [NET_ADMIN, NET_RAW]
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     volumes: [server-network-state:/var/lib/proxy-tester]
 
 volumes:

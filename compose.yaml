@@ -11,14 +11,14 @@ services:
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
       PROXY_TESTER_NODE_ID: client-1
-    cap_add: [NET_ADMIN, NET_RAW]
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     depends_on: [control]
   server:
     build: {context: ., target: server}
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
       PROXY_TESTER_NODE_ID: server-1
-    cap_add: [NET_ADMIN, NET_RAW]
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     depends_on: [control]
   proxy:
     build: {context: tests/fixture-proxy}

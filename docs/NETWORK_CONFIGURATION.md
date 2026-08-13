@@ -18,7 +18,7 @@ The Agent journal is written atomically to `/var/lib/proxy-tester/network-state.
 
 Each selected endpoint gets a network namespace named from the immutable revision and its role. The physical test interface is moved into that namespace, assigned the configured pool and MTU, brought up, and has GRO/GSO/TSO/LRO/RX/TX offloads disabled. Traffic workers enter the namespace before creating sockets. Client connections cycle through the prepared source-IP pool, while the responder binds the prepared server address.
 
-The packaged Agent needs `CAP_NET_ADMIN` and `CAP_NET_RAW`, plus `iproute2`, `ethtool`, and `arping`. The supplied Compose definitions include those capabilities and persistent journals. A bare-metal service should use equivalent systemd capabilities and a writable `/var/lib/proxy-tester`.
+The packaged Agent needs `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_SYS_ADMIN` (for the bind mounts created by `ip netns`), plus `iproute2`, `ethtool`, and `arping`. The supplied Compose definitions include those capabilities and persistent journals. A bare-metal service should use equivalent systemd capabilities and a writable `/var/lib/proxy-tester`.
 
 ## Operator workflow
 

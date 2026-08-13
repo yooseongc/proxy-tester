@@ -19,6 +19,8 @@ pub struct InterfaceInventory {
     pub state: Option<String>,
     pub master: Option<String>,
     pub addresses: Vec<String>,
+    pub link_up: bool,
+    pub offloads: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +88,7 @@ impl NetworkManager {
             command_status("ethtool", &["--version"]).await,
         );
         capabilities.insert("tc".into(), command_status("tc", &["-V"]).await);
-        capabilities.insert("arping".into(), command_status("arping", &["-h"]).await);
+        capabilities.insert("arping".into(), command_status("arping", &["-V"]).await);
         capabilities.insert(
             "ovs".into(),
             command_status("ovs-vsctl", &["--version"]).await,
@@ -101,7 +103,18 @@ impl NetworkManager {
                     state: value["operstate"].as_str().map(str::to_owned),
                     master: value["master"].as_str().map(str::to_owned),
                     addresses: Vec::new(),
+                    link_up: value["flags"]
+                        .as_array()
+                        .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("UP"))),
+                    offloads: BTreeMap::new(),
                 });
+            }
+        }
+        if capabilities.get("ethtool").copied().unwrap_or(false) {
+            for interface in &mut interfaces {
+                if let Ok(raw) = command_output("ethtool", &["-k", &interface.name]).await {
+                    interface.offloads = parse_offloads(&raw);
+                }
             }
         }
         if let Ok(raw) = addresses {
@@ -262,20 +275,27 @@ impl NetworkManager {
                     ],
                 ));
             }
-            for feature in ["gro", "gso", "tso", "lro", "rx", "tx"] {
-                commands.push(CommandSpec::new(
-                    "ip",
-                    [
-                        "netns",
-                        "exec",
-                        namespace.as_str(),
-                        "ethtool",
-                        "-K",
-                        endpoint.interface_name.as_str(),
-                        feature,
-                        "off",
-                    ],
-                ));
+            if inventory
+                .capabilities
+                .get("ethtool")
+                .copied()
+                .unwrap_or(false)
+            {
+                for feature in ["gro", "gso", "tso", "lro", "rx", "tx"] {
+                    commands.push(CommandSpec::new(
+                        "ip",
+                        [
+                            "netns",
+                            "exec",
+                            namespace.as_str(),
+                            "ethtool",
+                            "-K",
+                            endpoint.interface_name.as_str(),
+                            feature,
+                            "off",
+                        ],
+                    ));
+                }
             }
             rollback.push(CommandSpec::new(
                 "ip",
@@ -287,6 +307,42 @@ impl NetworkManager {
                     endpoint.interface_name.as_str(),
                     "netns",
                     "1",
+                ],
+            ));
+            // Checksum restoration must precede segmentation features: several
+            // drivers reject TSO/GSO enablement while TX checksum is disabled.
+            for feature in ["tx", "rx", "tso", "gso", "gro", "lro"] {
+                if let Some(enabled) = current.offloads.get(feature) {
+                    rollback.push(CommandSpec::new(
+                        "ethtool",
+                        [
+                            "-K",
+                            endpoint.interface_name.as_str(),
+                            feature,
+                            if *enabled { "on" } else { "off" },
+                        ],
+                    ));
+                }
+            }
+            if let Some(mtu) = current.mtu {
+                rollback.push(CommandSpec::new(
+                    "ip",
+                    [
+                        "link",
+                        "set",
+                        endpoint.interface_name.as_str(),
+                        "mtu",
+                        &mtu.to_string(),
+                    ],
+                ));
+            }
+            rollback.push(CommandSpec::new(
+                "ip",
+                [
+                    "link",
+                    "set",
+                    endpoint.interface_name.as_str(),
+                    if current.link_up { "up" } else { "down" },
                 ],
             ));
             rollback.push(CommandSpec::new("ip", ["netns", "del", namespace.as_str()]));
@@ -305,7 +361,6 @@ impl NetworkManager {
         {
             warnings.push("ethtool is unavailable; offload state cannot be changed".into());
         }
-        rollback.reverse();
         Ok(NetworkPlan {
             profile_revision_id: revision_id.into(),
             node_id: node_id.into(),
@@ -383,7 +438,7 @@ impl NetworkManager {
         for command in &journal.rollback_commands {
             let mut ok = false;
             for delay in [1, 2, 4] {
-                if execute(command).await.is_ok() {
+                if execute_rollback(command).await.is_ok() {
                     ok = true;
                     break;
                 }
@@ -451,6 +506,24 @@ fn expand_pool(endpoint: &EndpointProfile) -> anyhow::Result<Vec<String>> {
         .map(|n| format!("{}/{}", std::net::Ipv4Addr::from(start + n), prefix))
         .collect())
 }
+fn parse_offloads(raw: &str) -> BTreeMap<String, bool> {
+    [
+        ("rx", "rx-checksumming:"),
+        ("tx", "tx-checksumming:"),
+        ("tso", "tcp-segmentation-offload:"),
+        ("gso", "generic-segmentation-offload:"),
+        ("gro", "generic-receive-offload:"),
+        ("lro", "large-receive-offload:"),
+    ]
+    .into_iter()
+    .filter_map(|(feature, label)| {
+        let value = raw
+            .lines()
+            .find(|line| line.trim_start().starts_with(label))?;
+        Some((feature.to_owned(), value.split_whitespace().nth(1)? == "on"))
+    })
+    .collect()
+}
 async fn execute(spec: &CommandSpec) -> anyhow::Result<()> {
     let output = tokio::process::Command::new(&spec.program)
         .args(&spec.args)
@@ -467,6 +540,30 @@ async fn execute(spec: &CommandSpec) -> anyhow::Result<()> {
         )
     }
     Ok(())
+}
+async fn execute_rollback(spec: &CommandSpec) -> anyhow::Result<()> {
+    let output = tokio::process::Command::new(&spec.program)
+        .args(&spec.args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("execute rollback {}", spec.program))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    if [
+        "Cannot open network namespace",
+        "No such file or directory",
+        "Cannot find device",
+        "does not exist",
+    ]
+    .iter()
+    .any(|expected| error.contains(expected))
+    {
+        return Ok(());
+    }
+    bail!("{} {:?} failed: {}", spec.program, spec.args, error)
 }
 async fn command_output(program: &str, args: &[&str]) -> anyhow::Result<String> {
     let out = tokio::process::Command::new(program)
@@ -515,6 +612,15 @@ mod tests {
         assert_eq!(plan.endpoints.len(), 2);
         assert!(plan.commands.iter().all(|c| c.program == "ip"));
         assert_eq!(plan.endpoints[0].addresses.len(), 16);
+        assert!(plan.rollback_commands[0].args.contains(&"link".to_owned()));
+        assert_eq!(
+            plan.rollback_commands[2].args,
+            ["netns", "del", "pt-12345678-client"]
+        );
+        assert_eq!(
+            parse_offloads("rx-checksumming: on\ngeneric-receive-offload: off\n")["rx"],
+            true
+        );
         inventory.protected_interfaces.push("eth1".into());
         assert!(
             manager

@@ -710,6 +710,11 @@ async fn teardown_network_profile(
         .bind(profile_id.to_string())
         .execute(&s.db)
         .await?;
+    sqlx::query("UPDATE network_operations SET status='completed',updated_at=? WHERE id=?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(operation.to_string())
+        .execute(&s.db)
+        .await?;
     Ok(Json(
         serde_json::json!({"operation_id":operation,"status":"unprepared"}),
     ))
