@@ -157,15 +157,6 @@ function App() {
       ws.close();
     };
   }, []);
-  useEffect(() => {
-    const client = agents.find((a) => a.role === 1),
-      server = agents.find((a) => a.role === 2);
-    setScenario((s) => ({
-      ...s,
-      client_agent_id: client?.id ?? s.client_agent_id,
-      server_agent_id: server?.id ?? s.server_agent_id,
-    }));
-  }, [agents]);
   const refreshScenarios = () =>
     api<Scenario[]>("/api/scenarios")
       .then(setSavedScenarios)
@@ -281,7 +272,7 @@ function App() {
     setScenario({
       ...fallback,
       ...found,
-      version: 3,
+      version: 4,
       http2: found.http2 ?? fallback.http2,
       load_stages: found.load_stages?.length
         ? found.load_stages
@@ -375,7 +366,7 @@ function App() {
     scenario.payload_mode === "capture_replay"
       ? `PCAP: ${selectedCapture?.name ?? "미선택"}`
       : `${payloadLabel(scenario.request_payload, "요청")} · ${payloadLabel(scenario.response_payload, "응답")}`,
-    scenario.topology === "explicit_proxy" ? "명시적 Proxy" : "직접 연결",
+    scenario.path.kind === "explicit_proxy" ? "명시적 Proxy" : "관리형 직접 연결",
   ].join(" · ");
   const captureBlocked = scenario.payload_mode === "capture_replay" && (!selectedCapture || (scenario.protocol === "http2" ? (selectedCapture.analysis?.http2_flow_count ?? 0) === 0 : scenario.protocol === "http1" ? (selectedCapture.analysis?.http_flow_count ?? 0) === 0 : (selectedCapture.analysis?.supported_flow_count ?? 0) === 0));
   const tabs: [Tab, string, React.ElementType][] = [
@@ -543,21 +534,20 @@ function App() {
                   <details className="rounded-xl border border-dashed border-line p-3">
                     <summary className="cursor-pointer text-xs font-bold text-dim">연결 고급 설정</summary>
                     <div className="mt-3 space-y-3">
-                    <Field label="연결 경로"><select value={scenario.topology} onChange={(e)=>patch({topology:e.target.value as Scenario["topology"],proxy_addr:e.target.value==="explicit_proxy"?"proxy:3128":null})}><option value="transparent_proxy">직접 연결</option><option value="explicit_proxy">명시적 HTTP Proxy</option></select></Field>
-                    {scenario.topology === "explicit_proxy" && <Field label="HTTP Proxy 주소">
+                    <Field label="연결 경로"><select value={scenario.path.kind} onChange={(e)=>patch({path:e.target.value==="explicit_proxy"?{kind:"explicit_proxy",client_node_id:agents[0]?.id??"node-1",client_bind_ip:"192.0.2.10",server_node_id:agents[1]?.id??agents[0]?.id??"node-2",server_listen_ip:"192.0.2.20",server_port:8080,proxy_addr:"proxy:3128"}:{kind:"managed_direct",profile_revision_id:"00000000-0000-0000-0000-000000000000",server_port:8080}})}><option value="managed_direct">관리형 직접 연결</option><option value="explicit_proxy">명시적 HTTP Proxy</option></select></Field>
+                    {scenario.path.kind === "explicit_proxy" && <Field label="HTTP Proxy 주소">
                       <input
-                        value={scenario.proxy_addr ?? ""}
-                        onChange={(e) => patch({ proxy_addr: e.target.value })}
+                        value={scenario.path.proxy_addr}
+                        onChange={(e) => scenario.path.kind==="explicit_proxy"&&patch({ path:{...scenario.path,proxy_addr:e.target.value} })}
                       />
                     </Field>}
-                  <Field label="Endpoint">
+                  <Field label="Server port">
                     <input
-                      value={scenario.target_addr}
-                      onChange={(e) => patch({ target_addr: e.target.value })}
+                      type="number" min="1" max="65535" value={scenario.path.server_port}
+                      onChange={(e) => patch({ path:{...scenario.path,server_port:Math.max(1,+e.target.value)} })}
                     />
                   </Field>
                     <div className="grid gap-2 sm:grid-cols-3"><Field label="Connect timeout (ms)"><input type="number" min="1" value={scenario.timeouts.connect_ms} onChange={(e)=>patch({timeouts:{...scenario.timeouts,connect_ms:Math.max(1,+e.target.value)}})}/></Field><Field label="Proxy timeout (ms)"><input type="number" min="1" value={scenario.timeouts.proxy_connect_ms} onChange={(e)=>patch({timeouts:{...scenario.timeouts,proxy_connect_ms:Math.max(1,+e.target.value)}})}/></Field><Field label="Response timeout (ms)"><input type="number" min="1" value={scenario.timeouts.response_ms} onChange={(e)=>patch({timeouts:{...scenario.timeouts,response_ms:Math.max(1,+e.target.value)}})}/></Field></div>
-                    <Field label="Wire 계측 인터페이스"><input placeholder="eth0 또는 eth0,eth1" value={scenario.observation_interfaces.join(",")} onChange={(e)=>patch({observation_interfaces:e.target.value.split(",").map((value)=>value.trim()).filter(Boolean)})}/></Field>
                     </div>
                   </details>
                 </ConfigSection>

@@ -13,7 +13,10 @@ use chrono::Utc;
 use clap::Parser;
 use futures::{Stream, StreamExt};
 use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
-use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Protocol, Scenario};
+use proxy_tester_domain::{
+    MetricsSnapshot, NetworkProfileDraft, NetworkProfileRevision, PayloadKind, PayloadMode,
+    Protocol, Scenario, ScenarioPath,
+};
 use proxy_tester_proto::v1::{
     AgentMessage, ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
@@ -165,6 +168,15 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/agents", get(agents))
+        .route(
+            "/api/network/profiles",
+            get(list_network_profiles).post(save_network_profile),
+        )
+        .route(
+            "/api/network/profiles/{id}/plan",
+            post(plan_network_profile),
+        )
+        .route("/api/network/revisions", get(list_network_revisions))
         .route("/api/scenarios", get(list_scenarios).post(save_scenario))
         .route("/api/scenarios/validate", post(validate_scenario))
         .route("/api/preflight", post(preflight))
@@ -240,8 +252,43 @@ async fn generate_tls_certificate(
 }
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
+    let schema: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_metadata'",
+    )
+    .fetch_optional(db)
+    .await?;
+    let version: Option<i64> = if schema.is_some() {
+        sqlx::query_scalar("SELECT version FROM schema_metadata LIMIT 1")
+            .fetch_optional(db)
+            .await?
+    } else {
+        None
+    };
+    if version != Some(4) {
+        for table in [
+            "metric_samples",
+            "events",
+            "run_participants",
+            "runs",
+            "scenarios",
+            "artifacts",
+            "network_operations",
+            "network_profile_revisions",
+            "network_profiles",
+            "schema_metadata",
+        ] {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+                .execute(db)
+                .await?;
+        }
+    }
     for sql in [
         "PRAGMA journal_mode=WAL",
+        "CREATE TABLE IF NOT EXISTS schema_metadata(version INTEGER NOT NULL)",
+        "INSERT INTO schema_metadata(version) SELECT 4 WHERE NOT EXISTS(SELECT 1 FROM schema_metadata)",
+        "CREATE TABLE IF NOT EXISTS network_profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,draft_json TEXT NOT NULL,status TEXT NOT NULL,archived INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS network_profile_revisions(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,revision INTEGER NOT NULL,sha256 TEXT NOT NULL UNIQUE,body_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(profile_id,revision))",
+        "CREATE TABLE IF NOT EXISTS network_operations(id TEXT PRIMARY KEY,profile_revision_id TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,plan_token_hash TEXT,expires_at TEXT,detail_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS scenarios(id TEXT PRIMARY KEY,name TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,scenario_id TEXT NOT NULL,status TEXT NOT NULL,started_at TEXT,finished_at TEXT,error TEXT,scenario_json TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS metric_samples(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,agent_id TEXT NOT NULL,role INTEGER NOT NULL,unix_ms INTEGER NOT NULL,metrics_json TEXT NOT NULL)",
@@ -264,6 +311,93 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         .execute(db)
         .await;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct ProfileListQuery {
+    profile_id: Option<Uuid>,
+}
+async fn list_network_profiles(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let rows=sqlx::query("SELECT id,name,draft_json,status,archived,created_at,updated_at FROM network_profiles ORDER BY updated_at DESC").fetch_all(&s.db).await?;
+    Ok(Json(rows.into_iter().map(|r|serde_json::json!({"id":r.get::<String,_>("id"),"name":r.get::<String,_>("name"),"draft":serde_json::from_str::<serde_json::Value>(r.get("draft_json")).unwrap_or_default(),"status":r.get::<String,_>("status"),"archived":r.get::<i64,_>("archived")!=0,"created_at":r.get::<String,_>("created_at"),"updated_at":r.get::<String,_>("updated_at")})).collect()))
+}
+async fn save_network_profile(
+    State(s): State<AppState>,
+    Json(draft): Json<NetworkProfileDraft>,
+) -> Result<Json<NetworkProfileDraft>, ApiError> {
+    draft.validate().map_err(|e| ApiError::bad(e.to_string()))?;
+    let now = Utc::now().to_rfc3339();
+    let body = serde_json::to_string(&draft)?;
+    sqlx::query("INSERT INTO network_profiles(id,name,draft_json,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,draft_json=excluded.draft_json,status=CASE WHEN network_profiles.status='prepared' THEN 'prepared' ELSE 'draft' END,updated_at=excluded.updated_at").bind(draft.id.to_string()).bind(&draft.name).bind(body).bind(&now).bind(&now).execute(&s.db).await?;
+    Ok(Json(draft))
+}
+async fn list_network_revisions(
+    State(s): State<AppState>,
+    Query(q): Query<ProfileListQuery>,
+) -> Result<Json<Vec<NetworkProfileRevision>>, ApiError> {
+    let rows = if let Some(id) = q.profile_id {
+        sqlx::query("SELECT id,profile_id,revision,sha256,body_json FROM network_profile_revisions WHERE profile_id=? ORDER BY revision DESC").bind(id.to_string()).fetch_all(&s.db).await?
+    } else {
+        sqlx::query("SELECT id,profile_id,revision,sha256,body_json FROM network_profile_revisions ORDER BY created_at DESC").fetch_all(&s.db).await?
+    };
+    Ok(Json(
+        rows.into_iter()
+            .filter_map(|r| {
+                let body = serde_json::from_str::<NetworkProfileDraft>(r.get("body_json")).ok()?;
+                Some(NetworkProfileRevision {
+                    id: Uuid::parse_str(r.get::<String, _>("id").as_str()).ok()?,
+                    profile_id: Uuid::parse_str(r.get::<String, _>("profile_id").as_str()).ok()?,
+                    revision: r.get::<i64, _>("revision") as u32,
+                    sha256: r.get("sha256"),
+                    body,
+                })
+            })
+            .collect(),
+    ))
+}
+async fn plan_network_profile(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = sqlx::query("SELECT draft_json FROM network_profiles WHERE id=? AND archived=0")
+        .bind(id.to_string())
+        .fetch_optional(&s.db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("network profile not found"))?;
+    let draft: NetworkProfileDraft =
+        serde_json::from_str(row.get::<String, _>("draft_json").as_str())
+            .map_err(|e| ApiError::bad(e.to_string()))?;
+    draft.validate().map_err(|e| ApiError::bad(e.to_string()))?;
+    let body = serde_json::to_string(&draft)?;
+    let sha = format!("{:x}", Sha256::digest(body.as_bytes()));
+    let existing = sqlx::query("SELECT id,revision FROM network_profile_revisions WHERE sha256=?")
+        .bind(&sha)
+        .fetch_optional(&s.db)
+        .await?;
+    let (revision_id, revision) = if let Some(r) = existing {
+        (r.get::<String, _>("id"), r.get::<i64, _>("revision"))
+    } else {
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(revision),0)+1 FROM network_profile_revisions WHERE profile_id=?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&s.db)
+        .await?;
+        let revision_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO network_profile_revisions(id,profile_id,revision,sha256,body_json,status,created_at) VALUES(?,?,?,?,?,'unprepared',?)").bind(&revision_id).bind(id.to_string()).bind(revision).bind(&sha).bind(&body).bind(Utc::now().to_rfc3339()).execute(&s.db).await?;
+        (revision_id, revision)
+    };
+    let token = Uuid::new_v4().to_string();
+    let operation_id = Uuid::new_v4();
+    let now = Utc::now();
+    let expires = now + chrono::Duration::minutes(5);
+    let detail = serde_json::json!({"nodes":[draft.client_endpoint.node_id,draft.server_endpoint.node_id],"changes":["create endpoint namespaces","move data interfaces","assign IPv4 pools","set MTU","disable offloads","start endpoint workers"],"rollback":["stop workers","return interfaces","restore link settings"]});
+    sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,plan_token_hash,expires_at,detail_json,created_at,updated_at) VALUES(?,?,'plan','planned',?,?,?,?,?)").bind(operation_id.to_string()).bind(&revision_id).bind(format!("{:x}",Sha256::digest(token.as_bytes()))).bind(expires.to_rfc3339()).bind(detail.to_string()).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&s.db).await?;
+    Ok(Json(
+        serde_json::json!({"operation_id":operation_id,"profile_revision_id":revision_id,"revision":revision,"sha256":sha,"plan_token":token,"expires_at":expires,"detail":detail}),
+    ))
 }
 
 async fn apply_retention(db: &SqlitePool, days: i64) -> anyhow::Result<()> {
@@ -361,23 +495,51 @@ async fn preflight(
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     validate_payload_artifacts(&s.db, &sc).await?;
     validate_capture_artifact(&s.db, &sc).await?;
+    let (client_id, server_id, profile_ready) = scenario_nodes(&s.db, &sc).await?;
     let agents = s.agents.read().await;
-    let client = agents.get(&sc.client_agent_id);
-    let server = agents.get(&sc.server_agent_id);
-    let mut checks = vec![
-        serde_json::json!({"name":"client_agent","ok":client.is_some(),"detail":sc.client_agent_id}),
-        serde_json::json!({"name":"server_agent","ok":server.is_some(),"detail":sc.server_agent_id}),
+    let client = agents.get(&client_id);
+    let server = agents.get(&server_id);
+    let checks = vec![
+        serde_json::json!({"name":"client_node","ok":client.is_some(),"detail":client_id}),
+        serde_json::json!({"name":"server_node","ok":server.is_some(),"detail":server_id}),
+        serde_json::json!({"name":"network_profile","ok":profile_ready,"detail":if profile_ready {"prepared"} else {"not prepared"}}),
     ];
-    for iface in &sc.observation_interfaces {
-        let client_present = client.is_some_and(|a| a.interfaces.contains(iface));
-        let server_present = server.is_some_and(|a| a.interfaces.contains(iface));
-        checks.push(serde_json::json!({"name":"client_observation_interface","ok":client_present,"detail":iface}));
-        checks.push(serde_json::json!({"name":"server_observation_interface","ok":server_present,"detail":iface}));
-    }
     let ok = checks.iter().all(|v| v["ok"].as_bool() == Some(true));
     Ok(Json(
         serde_json::json!({"ok":ok,"checks":checks,"warnings":["route, MTU, offload와 물리 경로는 Linux 실장비에서 별도 확인해야 합니다"]}),
     ))
+}
+
+async fn scenario_nodes(
+    db: &SqlitePool,
+    sc: &Scenario,
+) -> Result<(String, String, bool), ApiError> {
+    match &sc.path {
+        ScenarioPath::ExplicitProxy {
+            client_node_id,
+            server_node_id,
+            ..
+        } => Ok((client_node_id.clone(), server_node_id.clone(), true)),
+        ScenarioPath::ManagedDirect {
+            profile_revision_id,
+            ..
+        } => {
+            let row =
+                sqlx::query("SELECT body_json,status FROM network_profile_revisions WHERE id=?")
+                    .bind(profile_revision_id.to_string())
+                    .fetch_optional(db)
+                    .await?
+                    .ok_or_else(|| ApiError::bad("network profile revision not found"))?;
+            let body: NetworkProfileDraft =
+                serde_json::from_str(row.get::<String, _>("body_json").as_str())
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok((
+                body.client_endpoint.node_id,
+                body.server_endpoint.node_id,
+                row.get::<String, _>("status") == "prepared",
+            ))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -652,15 +814,21 @@ async fn start_run(
     if active.is_some() {
         return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
     }
+    let (client_id, server_id, profile_ready) = scenario_nodes(&s.db, &sc).await?;
+    if !profile_ready {
+        return Err(ApiError::conflict(
+            "referenced network profile revision is not prepared",
+        ));
+    }
     let sessions = s.agents.read().await;
     let online_cutoff = Utc::now().timestamp_millis() - 15_000;
     let client = sessions
-        .get(&sc.client_agent_id)
+        .get(&client_id)
         .filter(|agent| agent.last_seen_ms >= online_cutoff)
         .ok_or_else(|| ApiError::bad("client agent가 연결되지 않았습니다"))?
         .clone();
     let server = sessions
-        .get(&sc.server_agent_id)
+        .get(&server_id)
         .filter(|agent| agent.last_seen_ms >= online_cutoff)
         .ok_or_else(|| ApiError::bad("server agent가 연결되지 않았습니다"))?
         .clone();
@@ -696,16 +864,8 @@ async fn start_run(
     let preparation = async {
         send_artifacts(&s.db, &client, &artifact_ids).await?;
         send_artifacts(&s.db, &server, &artifact_ids).await?;
-        command_agent(
-            &s,
-            &sc.client_agent_id,
-            &client,
-            run_id,
-            "prepare",
-            prepare.clone(),
-        )
-        .await?;
-        command_agent(&s, &sc.server_agent_id, &server, run_id, "prepare", prepare).await?;
+        command_agent(&s, &client_id, &client, run_id, "prepare", prepare.clone()).await?;
+        command_agent(&s, &server_id, &server, run_id, "prepare", prepare).await?;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -727,16 +887,8 @@ async fn start_run(
         })),
     };
     let starting = async {
-        command_agent(
-            &s,
-            &sc.client_agent_id,
-            &client,
-            run_id,
-            "start",
-            start.clone(),
-        )
-        .await?;
-        command_agent(&s, &sc.server_agent_id, &server, run_id, "start", start).await?;
+        command_agent(&s, &client_id, &client, run_id, "start", start.clone()).await?;
+        command_agent(&s, &server_id, &server, run_id, "start", start).await?;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -766,10 +918,10 @@ async fn start_run(
         .execute(&s.db)
         .await?;
     *active = Some(run_id);
-    s.run_agents.lock().await.insert(
-        run_id,
-        HashSet::from([sc.client_agent_id.clone(), sc.server_agent_id.clone()]),
-    );
+    s.run_agents
+        .lock()
+        .await
+        .insert(run_id, HashSet::from([client_id, server_id]));
     let _ = s
         .events
         .send(serde_json::json!({"type":"run_started","run_id":run_id}).to_string());
@@ -1602,5 +1754,40 @@ mod tests {
         assert_eq!(ids, ["referenced-id"]);
         tokio::fs::remove_file(referenced).await.unwrap();
         tokio::fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_v4_resets_legacy_application_tables_once() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE scenarios(id TEXT PRIMARY KEY,name TEXT,body TEXT,created_at TEXT,updated_at TEXT)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO scenarios VALUES('old','old','{}','now','now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        migrate(&db).await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_metadata")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scenarios")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(version, 4);
+        assert_eq!(old, 0);
+        sqlx::query("INSERT INTO scenarios VALUES('new','new','{}','now','now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        migrate(&db).await.unwrap();
+        let current: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scenarios")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(current, 1);
     }
 }

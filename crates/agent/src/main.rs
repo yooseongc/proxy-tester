@@ -6,7 +6,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use proxy_tester_capture::{Direction, HttpTransaction, ReplayTurn, analyze_capture};
 use proxy_tester_domain::{
     MetricsSnapshot, PayloadKind, PayloadMode, PayloadProfile, Protocol, RandomFormat, Scenario,
-    TlsVersion, Topology,
+    TlsVersion,
 };
 use proxy_tester_proto::v1::{
     AgentEvent, AgentHello, AgentMessage, AgentRole, AgentStatus, CommandAck, Heartbeat, Telemetry,
@@ -349,13 +349,11 @@ fn rewrite_http_request(request: &[u8], scenario: &Scenario, role: Role) -> Vec<
     } else {
         target
     };
-    let absolute = role == Role::Client
-        && scenario.topology == Topology::ExplicitProxy
-        && !scenario.tls.enabled;
+    let absolute = role == Role::Client && scenario.is_explicit_proxy() && !scenario.tls.enabled;
     let target = if absolute {
         format!(
             "http://{}{}",
-            scenario.target_addr,
+            scenario.target_addr(),
             String::from_utf8_lossy(path)
         )
         .into_bytes()
@@ -889,15 +887,7 @@ async fn run_job(
 ) -> anyhow::Result<()> {
     let counters = Arc::new(Counters::default());
     let started = Instant::now();
-    let interface_task = if !job.scenario.observation_interfaces.is_empty() {
-        Some(tokio::spawn(monitor_interfaces(
-            job.scenario.observation_interfaces.clone(),
-            counters.clone(),
-            running.clone(),
-        )))
-    } else {
-        None
-    };
+    let interface_task: Option<tokio::task::JoinHandle<()>> = None;
     let metric_task = tokio::spawn(report_metrics(
         job.run_id,
         counters.clone(),
@@ -1311,11 +1301,8 @@ async fn transact(
     c: &Counters,
     gate: &WorkerGate<'_>,
 ) -> anyhow::Result<()> {
-    let connect_addr = if sc.topology == Topology::ExplicitProxy {
-        sc.proxy_addr.as_ref().unwrap()
-    } else {
-        &sc.target_addr
-    };
+    let target_addr = sc.target_addr();
+    let connect_addr = sc.proxy_addr().unwrap_or(&target_addr);
     let connect_started = Instant::now();
     let mut tcp_stream = tokio::time::timeout(
         Duration::from_millis(sc.timeouts.connect_ms),
@@ -1329,8 +1316,7 @@ async fn transact(
         .push(connect_started.elapsed().as_micros() as u64);
     c.connection_established();
     let _active_connection = c.connection_opened();
-    let needs_tunnel = sc.topology == Topology::ExplicitProxy
-        && (sc.tls.enabled || sc.protocol != Protocol::Http1);
+    let needs_tunnel = sc.is_explicit_proxy() && (sc.tls.enabled || sc.protocol != Protocol::Http1);
     if needs_tunnel {
         connect_tunnel(&mut tcp_stream, sc, c)
             .await
@@ -1352,7 +1338,7 @@ async fn transact(
     } else {
         match sc.protocol {
             Protocol::Http1 => {
-                let absolute = sc.topology == Topology::ExplicitProxy && !sc.tls.enabled;
+                let absolute = sc.is_explicit_proxy() && !sc.tls.enabled;
                 http_transactions(&mut *stream, sc, payloads, absolute, c, gate).await
             }
             _ => tcp_transaction(&mut *stream, sc, payloads, c).await,
@@ -1367,7 +1353,8 @@ async fn transact(
 async fn connect_tunnel(stream: &mut TcpStream, sc: &Scenario, c: &Counters) -> anyhow::Result<()> {
     let req = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\n\r\n",
-        sc.target_addr, sc.target_addr
+        sc.target_addr(),
+        sc.target_addr()
     );
     stream.write_all(req.as_bytes()).await?;
     c.tx.fetch_add(req.len() as u64, Ordering::Relaxed);
@@ -1524,7 +1511,7 @@ async fn http_transactions(
         }
         let transaction_started = Instant::now();
         let target = if absolute {
-            format!("http://{}{}", sc.target_addr, sc.request.path)
+            format!("http://{}{}", sc.target_addr(), sc.request.path)
         } else {
             sc.request.path.clone()
         };
@@ -1780,12 +1767,7 @@ async fn run_server(
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let port = sc
-        .target_addr
-        .rsplit_once(':')
-        .context("target port")?
-        .1
-        .parse::<u16>()?;
+    let port = sc.server_port();
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let tls_acceptor = sc.tls.enabled.then(|| build_tls_acceptor(sc)).transpose()?;
     info!(port, "responder listening");
@@ -2211,8 +2193,14 @@ mod tests {
         let capture = include_bytes!("../../../tests/pcap/fixtures/plaintext_flows.pcap");
         let mut scenario = Scenario::default();
         scenario.protocol = Protocol::Http1;
-        scenario.topology = Topology::ExplicitProxy;
-        scenario.target_addr = "origin.test:8080".into();
+        scenario.path = proxy_tester_domain::ScenarioPath::ExplicitProxy {
+            client_node_id: "client".into(),
+            client_bind_ip: "192.0.2.10".parse().unwrap(),
+            server_node_id: "server".into(),
+            server_listen_ip: "192.0.2.20".parse().unwrap(),
+            server_port: 8080,
+            proxy_addr: "proxy.test:3128".into(),
+        };
         scenario.request.host = "origin.test".into();
         let plan = ReplayPlan::from_capture(capture, &scenario, Role::Client).unwrap();
         assert_eq!(plan.flows.len(), 1);
@@ -2220,7 +2208,7 @@ mod tests {
         assert!(
             plan.flows[0][0]
                 .payload
-                .starts_with(b"POST http://origin.test:8080/scan HTTP/1.1\r\n")
+                .starts_with(b"POST http://192.0.2.20:8080/scan HTTP/1.1\r\n")
         );
         assert!(
             plan.flows[0][0]

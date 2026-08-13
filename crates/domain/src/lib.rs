@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::IpAddr};
+use std::net::IpAddr;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCENARIO_VERSION: u32 = 3;
+pub const SCENARIO_VERSION: u32 = 4;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -11,6 +11,83 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub enum Topology {
     ExplicitProxy,
     TransparentProxy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScenarioPath {
+    ManagedDirect {
+        profile_revision_id: Uuid,
+        server_port: u16,
+    },
+    ExplicitProxy {
+        client_node_id: String,
+        client_bind_ip: IpAddr,
+        server_node_id: String,
+        server_listen_ip: IpAddr,
+        server_port: u16,
+        proxy_addr: String,
+    },
+}
+impl Default for ScenarioPath {
+    fn default() -> Self {
+        Self::ManagedDirect {
+            profile_revision_id: Uuid::new_v4(),
+            server_port: 8080,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EndpointProfile {
+    pub node_id: String,
+    pub interface_name: String,
+    /// First address and prefix, for example `10.20.0.10/24`.
+    pub start_cidr: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkProfileDraft {
+    pub id: Uuid,
+    pub name: String,
+    pub client_endpoint: EndpointProfile,
+    pub server_endpoint: EndpointProfile,
+    pub mtu: u32,
+    pub diagnostic_port: u16,
+    pub path_probe_enabled: bool,
+}
+impl Default for NetworkProfileDraft {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: "Managed direct network".into(),
+            client_endpoint: EndpointProfile {
+                node_id: "node-1".into(),
+                interface_name: "eth1".into(),
+                start_cidr: "10.20.0.10/24".into(),
+                count: 16,
+            },
+            server_endpoint: EndpointProfile {
+                node_id: "node-1".into(),
+                interface_name: "eth2".into(),
+                start_cidr: "10.20.0.100/24".into(),
+                count: 16,
+            },
+            mtu: 1370,
+            diagnostic_port: 39000,
+            path_probe_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkProfileRevision {
+    pub id: Uuid,
+    pub profile_id: Uuid,
+    pub revision: u32,
+    pub sha256: String,
+    pub body: NetworkProfileDraft,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,13 +105,8 @@ pub struct Scenario {
     pub version: u32,
     pub id: Uuid,
     pub name: String,
-    pub topology: Topology,
+    pub path: ScenarioPath,
     pub protocol: Protocol,
-    pub client_agent_id: String,
-    pub server_agent_id: String,
-    pub proxy_addr: Option<String>,
-    pub target_addr: String,
-    pub source_ips: Vec<IpAddr>,
     pub virtual_clients: u32,
     pub duration_secs: u64,
     pub warmup_secs: u64,
@@ -49,7 +121,6 @@ pub struct Scenario {
     pub capture_artifact_id: Option<Uuid>,
     pub tls: TlsProfile,
     pub timeouts: TimeoutProfile,
-    pub observation_interfaces: Vec<String>,
 }
 
 impl Default for Scenario {
@@ -58,13 +129,8 @@ impl Default for Scenario {
             version: SCENARIO_VERSION,
             id: Uuid::new_v4(),
             name: "기본 시험".into(),
-            topology: Topology::TransparentProxy,
+            path: ScenarioPath::default(),
             protocol: Protocol::Tcp,
-            client_agent_id: "client-1".into(),
-            server_agent_id: "server-1".into(),
-            proxy_addr: None,
-            target_addr: "server:8080".into(),
-            source_ips: vec![],
             virtual_clients: 1,
             duration_secs: 10,
             warmup_secs: 0,
@@ -78,7 +144,6 @@ impl Default for Scenario {
             capture_artifact_id: None,
             tls: TlsProfile::default(),
             timeouts: TimeoutProfile::default(),
-            observation_interfaces: vec![],
         }
     }
 }
@@ -311,24 +376,46 @@ pub enum ValidationError {
 }
 
 impl Scenario {
-    pub fn migrate(mut self) -> Self {
-        if self.version <= 1 {
-            let (request, response) = match self.protocol {
-                Protocol::Http1 | Protocol::Http2 => (
-                    self.request.request_body_bytes,
-                    self.request.response_body_bytes,
-                ),
-                _ => (self.tcp.tx_bytes, self.tcp.rx_bytes),
-            };
-            self.request_payload = Some(PayloadProfile::fixed(request));
-            self.response_payload = Some(PayloadProfile::fixed(response));
-            self.payload_mode = PayloadMode::Manual;
-            self.capture_artifact_id = None;
-            self.version = SCENARIO_VERSION;
-        } else if self.version == 2 {
-            self.version = SCENARIO_VERSION;
-        }
+    pub fn migrate(self) -> Self {
         self
+    }
+
+    pub fn is_explicit_proxy(&self) -> bool {
+        matches!(self.path, ScenarioPath::ExplicitProxy { .. })
+    }
+    pub fn client_node_id(&self) -> Option<&str> {
+        match &self.path {
+            ScenarioPath::ManagedDirect { .. } => None,
+            ScenarioPath::ExplicitProxy { client_node_id, .. } => Some(client_node_id),
+        }
+    }
+    pub fn server_node_id(&self) -> Option<&str> {
+        match &self.path {
+            ScenarioPath::ManagedDirect { .. } => None,
+            ScenarioPath::ExplicitProxy { server_node_id, .. } => Some(server_node_id),
+        }
+    }
+    pub fn proxy_addr(&self) -> Option<&str> {
+        match &self.path {
+            ScenarioPath::ExplicitProxy { proxy_addr, .. } => Some(proxy_addr),
+            _ => None,
+        }
+    }
+    pub fn server_port(&self) -> u16 {
+        match self.path {
+            ScenarioPath::ManagedDirect { server_port, .. }
+            | ScenarioPath::ExplicitProxy { server_port, .. } => server_port,
+        }
+    }
+    pub fn target_addr(&self) -> String {
+        match &self.path {
+            ScenarioPath::ExplicitProxy {
+                server_listen_ip,
+                server_port,
+                ..
+            } => format!("{server_listen_ip}:{server_port}"),
+            ScenarioPath::ManagedDirect { server_port, .. } => format!("127.0.0.1:{server_port}"),
+        }
     }
 
     pub fn request_payload(&self) -> PayloadProfile {
@@ -408,7 +495,7 @@ impl Scenario {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.version != 1 && self.version != 2 && self.version != SCENARIO_VERSION {
+        if self.version != SCENARIO_VERSION {
             return Err(ValidationError::Invalid(format!(
                 "지원하지 않는 scenario version: {}",
                 self.version
@@ -442,11 +529,6 @@ impl Scenario {
         if self.name.trim().is_empty() {
             return Err(ValidationError::Invalid(
                 "name은 비어 있을 수 없습니다".into(),
-            ));
-        }
-        if self.client_agent_id == self.server_agent_id {
-            return Err(ValidationError::Invalid(
-                "client와 server agent는 달라야 합니다".into(),
             ));
         }
         if self.load_stages.is_empty() && self.duration_secs == 0 {
@@ -510,11 +592,6 @@ impl Scenario {
                 "warmup 구간은 아직 구현되지 않았습니다".into(),
             ));
         }
-        if !self.source_ips.is_empty() {
-            return Err(ValidationError::Invalid(
-                "source IP binding은 아직 구현되지 않았습니다".into(),
-            ));
-        }
         if self.protocol == Protocol::Connect {
             return Err(ValidationError::Invalid(
                 "CONNECT는 시험 프로토콜이 아닙니다. explicit proxy와 TCP를 선택하세요".into(),
@@ -540,32 +617,130 @@ impl Scenario {
                 "여러 HTTP transaction을 한 연결에서 실행하려면 keep-alive가 필요합니다".into(),
             ));
         }
-        if self.target_addr.parse::<std::net::SocketAddr>().is_err()
-            && !valid_host_port(&self.target_addr)
-        {
+        match &self.path {
+            ScenarioPath::ManagedDirect {
+                profile_revision_id,
+                server_port,
+            } => {
+                if profile_revision_id.is_nil() {
+                    return Err(ValidationError::Invalid(
+                        "managed_direct requires profile_revision_id".into(),
+                    ));
+                }
+                if *server_port == 0 {
+                    return Err(ValidationError::Invalid(
+                        "server_port must be non-zero".into(),
+                    ));
+                }
+            }
+            ScenarioPath::ExplicitProxy {
+                client_node_id,
+                client_bind_ip,
+                server_node_id,
+                server_listen_ip,
+                server_port,
+                proxy_addr,
+            } => {
+                if client_node_id.trim().is_empty() || server_node_id.trim().is_empty() {
+                    return Err(ValidationError::Invalid(
+                        "explicit_proxy requires client and server node IDs".into(),
+                    ));
+                }
+                if !client_bind_ip.is_ipv4() || !server_listen_ip.is_ipv4() {
+                    return Err(ValidationError::Invalid(
+                        "explicit_proxy endpoint addresses must be IPv4".into(),
+                    ));
+                }
+                if *server_port == 0 || !valid_host_port(proxy_addr) {
+                    return Err(ValidationError::Invalid(
+                        "explicit_proxy requires server port and proxy host:port".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl NetworkProfileDraft {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.name.trim().is_empty() {
             return Err(ValidationError::Invalid(
-                "target_addr는 host:port 형식이어야 합니다".into(),
+                "network profile name is required".into(),
             ));
         }
-        if self.topology == Topology::ExplicitProxy
-            && self
-                .proxy_addr
-                .as_deref()
-                .filter(|a| valid_host_port(a))
-                .is_none()
-        {
+        if !(576..=9216).contains(&self.mtu) {
             return Err(ValidationError::Invalid(
-                "explicit_proxy에는 proxy_addr가 필요합니다".into(),
+                "MTU must be between 576 and 9216".into(),
             ));
         }
-        let unique: HashSet<_> = self.observation_interfaces.iter().collect();
-        if unique.len() != self.observation_interfaces.len() {
+        if self.diagnostic_port == 0 {
             return Err(ValidationError::Invalid(
-                "observation interface가 중복되었습니다".into(),
+                "diagnostic_port must be non-zero".into(),
+            ));
+        }
+        let client = ipv4_range(&self.client_endpoint)?;
+        let server = ipv4_range(&self.server_endpoint)?;
+        if client.2 != server.2 || client.3 != server.3 {
+            return Err(ValidationError::Invalid(
+                "client and server pools must use the same IPv4 subnet".into(),
+            ));
+        }
+        if client.0 <= server.1 && server.0 <= client.1 {
+            return Err(ValidationError::Invalid(
+                "client and server pools must not overlap".into(),
+            ));
+        }
+        if self.client_endpoint.node_id == self.server_endpoint.node_id
+            && self.client_endpoint.interface_name == self.server_endpoint.interface_name
+        {
+            return Err(ValidationError::Invalid(
+                "client and server endpoints require different interfaces on the same node".into(),
             ));
         }
         Ok(())
     }
+}
+
+fn ipv4_range(endpoint: &EndpointProfile) -> Result<(u32, u32, u32, u8), ValidationError> {
+    if endpoint.node_id.trim().is_empty() || endpoint.interface_name.trim().is_empty() {
+        return Err(ValidationError::Invalid(
+            "endpoint node and interface are required".into(),
+        ));
+    }
+    if !(1..=4096).contains(&endpoint.count) {
+        return Err(ValidationError::Invalid(
+            "endpoint pool count must be between 1 and 4096".into(),
+        ));
+    }
+    let (address, prefix) = endpoint
+        .start_cidr
+        .split_once('/')
+        .ok_or_else(|| ValidationError::Invalid("start_cidr must be IPv4/prefix".into()))?;
+    let address: std::net::Ipv4Addr = address
+        .parse()
+        .map_err(|_| ValidationError::Invalid("start_cidr must be IPv4/prefix".into()))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| ValidationError::Invalid("invalid IPv4 prefix".into()))?;
+    if !(1..=30).contains(&prefix) {
+        return Err(ValidationError::Invalid(
+            "IPv4 prefix must be between 1 and 30".into(),
+        ));
+    }
+    let start = u32::from(address);
+    let mask = u32::MAX << (32 - prefix);
+    let network = start & mask;
+    let broadcast = network | !mask;
+    let end = start
+        .checked_add(endpoint.count - 1)
+        .ok_or_else(|| ValidationError::Invalid("IP pool overflows".into()))?;
+    if start <= network || end >= broadcast {
+        return Err(ValidationError::Invalid(
+            "IP pool includes network/broadcast or leaves subnet".into(),
+        ));
+    }
+    Ok((start, end, network, prefix))
 }
 
 fn valid_host_port(value: &str) -> bool {
@@ -673,33 +848,19 @@ mod tests {
     }
 
     #[test]
-    fn scenario_v2_migrates_to_v3_with_http2_defaults() {
-        let scenario = Scenario {
-            version: 2,
-            ..Scenario::default()
-        }
-        .migrate();
-        assert_eq!(scenario.version, 3);
-        assert_eq!(scenario.http2.max_concurrent_streams, 100);
-    }
-    #[test]
-    fn v1_payload_sizes_are_migrated_by_protocol() {
-        let legacy = Scenario {
-            version: 1,
-            protocol: Protocol::Http1,
-            request_payload: None,
-            response_payload: None,
-            request: HttpRequestProfile {
-                request_body_bytes: 7,
-                response_body_bytes: 11,
-                ..Default::default()
-            },
-            ..Scenario::default()
+    fn scenario_v4_rejects_unsealed_managed_profile() {
+        let mut scenario = Scenario::default();
+        scenario.path = ScenarioPath::ManagedDirect {
+            profile_revision_id: Uuid::nil(),
+            server_port: 8080,
         };
-        let migrated = legacy.migrate();
-        assert_eq!(migrated.version, SCENARIO_VERSION);
-        assert_eq!(migrated.request_payload().byte_len(), 7);
-        assert_eq!(migrated.response_payload().byte_len(), 11);
+        assert!(
+            scenario
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("profile_revision_id")
+        );
     }
 
     #[test]
@@ -731,7 +892,14 @@ mod tests {
     #[test]
     fn explicit_requires_proxy() {
         let s = Scenario {
-            topology: Topology::ExplicitProxy,
+            path: ScenarioPath::ExplicitProxy {
+                client_node_id: "client-node".into(),
+                client_bind_ip: "192.0.2.10".parse().unwrap(),
+                server_node_id: "server-node".into(),
+                server_listen_ip: "192.0.2.20".parse().unwrap(),
+                server_port: 8080,
+                proxy_addr: String::new(),
+            },
             ..Scenario::default()
         };
         assert!(s.validate().is_err());
@@ -769,15 +937,29 @@ mod tests {
                 .to_string()
                 .contains("warmup")
         );
+    }
 
-        let mut scenario = Scenario::default();
-        scenario.source_ips.push("127.0.0.2".parse().unwrap());
+    #[test]
+    fn network_profile_validates_subnet_pool_and_interfaces() {
+        let profile = NetworkProfileDraft::default();
+        assert!(profile.validate().is_ok());
+        let mut overlap = profile.clone();
+        overlap.server_endpoint.start_cidr = "10.20.0.20/24".into();
         assert!(
-            scenario
+            overlap
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("source IP")
+                .contains("overlap")
+        );
+        let mut too_large = profile;
+        too_large.client_endpoint.count = 4097;
+        assert!(
+            too_large
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("4096")
         );
     }
 
