@@ -29,7 +29,7 @@
 6. 산출물 SHA-256 생성, 컨테이너 취약점 검사, 서명
 7. 버전 태그와 immutable digest로 registry/GitHub Release에 게시
 
-현재 Dockerfile은 control/client/server target을 만들지만 Client와 Server의 바이너리는 동일하다. 정식 registry 게시 단계에서는 중복 Agent 이미지를 하나로 합치고 `PROXY_TESTER_ROLE`을 필수로 지정하는 형태가 기준이다. 기존 target은 로컬 Compose 호환성을 위해 유지할 수 있다.
+현재 Dockerfile의 client/server target은 동일한 Agent 바이너리를 사용한다. Node는 `PROXY_TESTER_NODE_ID`로만 등록하며 Client/Server 역할은 Run 명령의 endpoint role로 결정된다.
 
 ## 업그레이드와 롤백
 

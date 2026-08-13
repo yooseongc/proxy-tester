@@ -52,8 +52,6 @@ struct Args {
     control: String,
     #[arg(long, env = "PROXY_TESTER_NODE_ID")]
     node_id: Option<String>,
-    #[arg(long, env = "PROXY_TESTER_ROLE")]
-    role: Option<String>,
     #[arg(
         long,
         env = "PROXY_TESTER_NETWORK_JOURNAL",
@@ -627,17 +625,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let exe = std::env::current_exe()?
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let role = match args.role.as_deref() {
-        Some("client") => Role::Client,
-        Some("server") => Role::Server,
-        _ if exe.contains("client") => Role::Client,
-        _ => Role::Server,
-    };
     let id = args
         .node_id
         .clone()
@@ -648,7 +635,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let instance_id = Uuid::new_v4().to_string();
     loop {
-        match run_connection(&args.control, &id, &instance_id, role, network.clone()).await {
+        match run_connection(&args.control, &id, &instance_id, network.clone()).await {
             Ok(()) => warn!("control stream ended"),
             Err(e) => error!(%e,"control connection failed"),
         };
@@ -660,7 +647,6 @@ async fn run_connection(
     control: &str,
     id: &str,
     instance_id: &str,
-    role: Role,
     network: NetworkManager,
 ) -> anyhow::Result<()> {
     let mut client = AgentControlClient::connect(control.to_owned()).await?;
@@ -668,13 +654,11 @@ async fn run_connection(
     let inventory = network.inventory().await.unwrap_or_default();
     tx.send(AgentMessage {
         body: Some(agent_message::Body::Hello(AgentHello {
-            agent_id: id.into(),
-            role: role.proto(),
+            node_id: id.into(),
             hostname: hostname(),
             version: env!("CARGO_PKG_VERSION").into(),
-            interfaces: list_interfaces(),
             instance_id: instance_id.into(),
-            inventory_json: serde_json::to_string(&inventory)?,
+            inventory: Some(inventory.into()),
         })),
     })
     .await?;
@@ -889,26 +873,28 @@ async fn run_connection(
                 send_ack(&tx, &command.command_id, &command.run_id, "pause", true, "").await?;
             }
             Some(control_message::Body::Network(command)) => {
-                let mut detail = serde_json::Value::Null;
-                let outcome = match command.action.as_str() {
-                    "plan" => {
-                        let value: serde_json::Value = serde_json::from_str(&command.payload_json)?;
-                        let draft: proxy_tester_domain::NetworkProfileDraft =
-                            serde_json::from_value(value["draft"].clone())?;
-                        let revision = value["profile_revision_id"]
-                            .as_str()
-                            .context("profile_revision_id")?;
+                use proxy_tester_proto::v1::network_command::Action;
+                let mut result_plan = None;
+                let (stage, outcome) = match command.action {
+                    Some(Action::Plan(request)) => {
+                        let draft = wire_draft(request.draft.context("network draft")?)?;
                         let inventory = network.inventory().await?;
-                        match network.plan(id, revision, &draft, &inventory) {
+                        let outcome = match network.plan(
+                            id,
+                            &request.profile_revision_id,
+                            &draft,
+                            &inventory,
+                        ) {
                             Ok(plan) => {
-                                detail = serde_json::to_value(plan)?;
+                                result_plan = Some(plan.into());
                                 Ok(())
                             }
                             Err(error) => Err(error),
-                        }
+                        };
+                        ("plan", outcome)
                     }
-                    "stage" => {
-                        let plan: NetworkPlan = serde_json::from_str(&command.payload_json)?;
+                    Some(Action::Stage(request)) => {
+                        let plan: NetworkPlan = request.plan.context("network plan")?.into();
                         let result = network
                             .apply(&command.operation_id, &plan, command.lease_expires_unix_ms)
                             .await;
@@ -920,12 +906,16 @@ async fn run_connection(
                                 manager.enforce_lease(operation, expires).await;
                             });
                         }
-                        result
+                        ("stage", result)
                     }
-                    "commit" => network.commit().await,
-                    "rollback" | "teardown" => network.recover().await,
-                    "reconcile" => network.recover().await,
-                    action => Err(anyhow::anyhow!("unknown network action {action}")),
+                    Some(Action::Commit(_)) => ("commit", network.commit().await),
+                    Some(Action::Rollback(_)) => ("rollback", network.recover().await),
+                    Some(Action::Teardown(_)) => ("teardown", network.recover().await),
+                    Some(Action::Reconcile(_)) => ("reconcile", network.recover().await),
+                    None => (
+                        "unknown",
+                        Err(anyhow::anyhow!("network action is required")),
+                    ),
                 };
                 let (ok, error) = match outcome {
                     Ok(()) => (true, String::new()),
@@ -936,22 +926,15 @@ async fn run_connection(
                         proxy_tester_proto::v1::NetworkProgress {
                             command_id: command.command_id.clone(),
                             operation_id: command.operation_id.clone(),
-                            stage: command.action.clone(),
-                            status: if ok {
-                                "completed".into()
-                            } else {
-                                "failed".into()
-                            },
-                            detail_json: if ok {
-                                detail.to_string()
-                            } else {
-                                serde_json::json!({"error":error}).to_string()
-                            },
+                            stage: stage.into(),
+                            ok,
+                            plan: result_plan,
+                            error: error.clone(),
                         },
                     )),
                 })
                 .await?;
-                send_ack(&tx, &command.command_id, "", &command.action, ok, &error).await?;
+                send_ack(&tx, &command.command_id, "", stage, ok, &error).await?;
             }
             None => {}
         }
@@ -961,6 +944,24 @@ async fn run_connection(
 
 fn command_seen(completed: &HashSet<String>, command_id: &str) -> bool {
     !command_id.is_empty() && completed.contains(command_id)
+}
+
+fn wire_draft(
+    value: proxy_tester_proto::v1::NetworkProfileDraft,
+) -> anyhow::Result<proxy_tester_domain::NetworkProfileDraft> {
+    let endpoint = |value: Option<proxy_tester_proto::v1::EndpointProfile>| -> anyhow::Result<proxy_tester_domain::EndpointProfile> {
+        let value = value.context("network endpoint")?;
+        Ok(proxy_tester_domain::EndpointProfile { node_id:value.node_id, interface_name:value.interface_name, start_cidr:value.start_cidr, count:value.count })
+    };
+    Ok(proxy_tester_domain::NetworkProfileDraft {
+        id: Uuid::parse_str(&value.id)?,
+        name: value.name,
+        client_endpoint: endpoint(value.client_endpoint)?,
+        server_endpoint: endpoint(value.server_endpoint)?,
+        mtu: value.mtu,
+        diagnostic_port: u16::try_from(value.diagnostic_port).context("diagnostic port")?,
+        path_probe_enabled: value.path_probe_enabled,
+    })
 }
 
 fn remember_command(
@@ -2508,14 +2509,6 @@ async fn send_event(
 }
 fn hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into())
-}
-fn list_interfaces() -> Vec<String> {
-    std::fs::read_dir("/sys/class/net")
-        .map(|it| {
-            it.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 fn tokio_stream<T: Send + 'static>(mut rx: mpsc::Receiver<T>) -> impl futures::Stream<Item = T> {
     async_stream::stream! {while let Some(v)=rx.recv().await{yield v;}}

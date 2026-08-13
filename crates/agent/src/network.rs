@@ -1,5 +1,6 @@
 use anyhow::{Context, bail};
 use proxy_tester_domain::{EndpointProfile, NetworkProfileDraft};
+use proxy_tester_proto::v1 as wire;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio};
 
@@ -23,7 +24,7 @@ pub struct InterfaceInventory {
     pub offloads: BTreeMap<String, bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkPlan {
     pub profile_revision_id: String,
     pub node_id: String,
@@ -35,7 +36,7 @@ pub struct NetworkPlan {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EndpointPlan {
     pub role: String,
     pub namespace: String,
@@ -70,6 +71,104 @@ pub struct NetworkJournal {
 #[derive(Clone)]
 pub struct NetworkManager {
     journal_path: PathBuf,
+}
+
+impl From<NodeInventory> for wire::NodeInventory {
+    fn from(value: NodeInventory) -> Self {
+        Self {
+            interfaces: value
+                .interfaces
+                .into_iter()
+                .map(|v| wire::InterfaceInventory {
+                    name: v.name,
+                    mac: v.mac,
+                    mtu: v.mtu,
+                    state: v.state,
+                    master: v.master,
+                    addresses: v.addresses,
+                    link_up: v.link_up,
+                    offloads: v.offloads.into_iter().collect(),
+                })
+                .collect(),
+            capabilities: value.capabilities.into_iter().collect(),
+            protected_interfaces: value.protected_interfaces,
+            fingerprint: value.fingerprint,
+        }
+    }
+}
+impl From<NetworkPlan> for wire::NetworkPlan {
+    fn from(value: NetworkPlan) -> Self {
+        Self {
+            profile_revision_id: value.profile_revision_id,
+            node_id: value.node_id,
+            inventory_fingerprint: value.inventory_fingerprint,
+            endpoints: value
+                .endpoints
+                .into_iter()
+                .map(|v| wire::EndpointPlan {
+                    role: v.role,
+                    namespace: v.namespace,
+                    interface: v.interface,
+                    addresses: v.addresses,
+                })
+                .collect(),
+            semantic_changes: value.semantic_changes,
+            commands: value
+                .commands
+                .into_iter()
+                .map(|v| wire::CommandSpec {
+                    program: v.program,
+                    args: v.args,
+                })
+                .collect(),
+            rollback_commands: value
+                .rollback_commands
+                .into_iter()
+                .map(|v| wire::CommandSpec {
+                    program: v.program,
+                    args: v.args,
+                })
+                .collect(),
+            warnings: value.warnings,
+        }
+    }
+}
+impl From<wire::NetworkPlan> for NetworkPlan {
+    fn from(value: wire::NetworkPlan) -> Self {
+        Self {
+            profile_revision_id: value.profile_revision_id,
+            node_id: value.node_id,
+            inventory_fingerprint: value.inventory_fingerprint,
+            endpoints: value
+                .endpoints
+                .into_iter()
+                .map(|v| EndpointPlan {
+                    role: v.role,
+                    namespace: v.namespace,
+                    interface: v.interface,
+                    addresses: v.addresses,
+                })
+                .collect(),
+            semantic_changes: value.semantic_changes,
+            commands: value
+                .commands
+                .into_iter()
+                .map(|v| CommandSpec {
+                    program: v.program,
+                    args: v.args,
+                })
+                .collect(),
+            rollback_commands: value
+                .rollback_commands
+                .into_iter()
+                .map(|v| CommandSpec {
+                    program: v.program,
+                    args: v.args,
+                })
+                .collect(),
+            warnings: value.warnings,
+        }
+    }
 }
 impl NetworkManager {
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -609,6 +708,8 @@ mod tests {
         let plan = manager
             .plan("node-1", "12345678-revision", &draft, &inventory)
             .unwrap();
+        let wire: wire::NetworkPlan = plan.clone().into();
+        assert_eq!(NetworkPlan::from(wire), plan);
         assert_eq!(plan.endpoints.len(), 2);
         assert!(plan.commands.iter().all(|c| c.program == "ip"));
         assert_eq!(plan.endpoints[0].addresses.len(), 16);

@@ -22,7 +22,6 @@ services:
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
       PROXY_TESTER_NODE_ID: client-1
-      PROXY_TESTER_ROLE: client
       RUST_LOG: proxy_agent=info
     depends_on: [control]
     cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
@@ -34,7 +33,6 @@ services:
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
       PROXY_TESTER_NODE_ID: server-1
-      PROXY_TESTER_ROLE: server
       RUST_LOG: proxy_agent=info
     depends_on: [control]
     cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
