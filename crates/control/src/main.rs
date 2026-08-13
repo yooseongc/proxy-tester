@@ -88,6 +88,8 @@ struct AgentSession {
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
+    database_url: Arc<String>,
+    database_fallback: bool,
     agents: Arc<RwLock<HashMap<String, AgentSession>>>,
     events: broadcast::Sender<String>,
     active_run: Arc<Mutex<Option<Uuid>>>,
@@ -128,11 +130,7 @@ async fn main() -> anyhow::Result<()> {
     {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    let db = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect(&args.database_url)
-        .await
-        .context("open sqlite")?;
+    let (db, database_url, database_fallback) = open_database(&args.database_url).await?;
     migrate(&db).await?;
     sqlx::query("UPDATE runs SET status='failed',finished_at=?,error='control_restarted' WHERE status IN ('preparing','running','paused','degraded')")
         .bind(Utc::now().to_rfc3339()).execute(&db).await?;
@@ -144,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
     let (events, _) = broadcast::channel(1024);
     let state = AppState {
         db,
+        database_url: Arc::new(database_url),
+        database_fallback,
         agents: Default::default(),
         events,
         active_run: Default::default(),
@@ -285,24 +285,8 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     } else {
         None
     };
-    if version != Some(4) {
-        for table in [
-            "metric_samples",
-            "events",
-            "run_participants",
-            "runs",
-            "scenarios",
-            "artifacts",
-            "network_operations",
-            "network_operation_events",
-            "network_profile_revisions",
-            "network_profiles",
-            "schema_metadata",
-        ] {
-            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-                .execute(db)
-                .await?;
-        }
+    if version.is_some_and(|version| version != 4) {
+        anyhow::bail!("unsupported database schema version {version:?}");
     }
     for sql in [
         "PRAGMA journal_mode=WAL",
@@ -335,6 +319,69 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         .execute(db)
         .await;
     Ok(())
+}
+
+async fn open_database(configured_url: &str) -> anyhow::Result<(SqlitePool, String, bool)> {
+    let configured = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect(configured_url)
+        .await
+        .context("open configured sqlite database")?;
+    let schema_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_metadata')",
+    )
+    .fetch_one(&configured)
+    .await?;
+    let has_application_tables: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('runs','scenarios','artifacts','network_profiles'))",
+    )
+    .fetch_one(&configured)
+    .await?;
+    let version = if schema_exists {
+        sqlx::query_scalar::<_, i64>("SELECT version FROM schema_metadata LIMIT 1")
+            .fetch_optional(&configured)
+            .await?
+    } else {
+        None
+    };
+    if version == Some(4) || (!schema_exists && !has_application_tables) {
+        return Ok((configured, configured_url.to_owned(), false));
+    }
+    configured.close().await;
+    let fallback_url = schema_fallback_url(configured_url)?;
+    warn!(configured_url, %fallback_url, ?version, "unsupported database preserved; using schema-specific database");
+    let fallback = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect(&fallback_url)
+        .await
+        .context("open schema-specific sqlite database")?;
+    Ok((fallback, fallback_url, true))
+}
+
+fn schema_fallback_url(url: &str) -> anyhow::Result<String> {
+    let (prefix, suffix) = url.split_once('?').map_or((url, ""), |(a, b)| (a, b));
+    let path = prefix
+        .strip_prefix("sqlite://")
+        .context("DATABASE_URL must use sqlite://")?;
+    if path == ":memory:" || path.is_empty() {
+        anyhow::bail!("cannot create a schema-specific path for an in-memory database");
+    }
+    let path = std::path::Path::new(path);
+    let stem = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .context("invalid database filename")?;
+    let extension = path.extension().and_then(|v| v.to_str()).unwrap_or("db");
+    let fallback = path.with_file_name(format!("{stem}.schema-4.{extension}"));
+    Ok(format!(
+        "sqlite://{}{}",
+        fallback.to_string_lossy().replace('\\', "/"),
+        if suffix.is_empty() {
+            String::new()
+        } else {
+            format!("?{suffix}")
+        }
+    ))
 }
 
 #[derive(Deserialize)]
@@ -850,8 +897,10 @@ struct AgentView {
     online: bool,
     inventory: serde_json::Value,
 }
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
+async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(
+        serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION"),"schema_version":4,"database_url":s.database_url.as_str(),"database_fallback":s.database_fallback}),
+    )
 }
 async fn agents(State(s): State<AppState>) -> Json<Vec<AgentView>> {
     let now = Utc::now().timestamp_millis();
@@ -2230,7 +2279,10 @@ impl From<serde_json::Error> for ApiError {
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
-    use super::{analyze_capture, cleanup_orphan_artifacts, migrate, result_payload_metadata};
+    use super::{
+        analyze_capture, cleanup_orphan_artifacts, migrate, result_payload_metadata,
+        schema_fallback_url,
+    };
     use chrono::Utc;
     use proxy_tester_domain::{PayloadKind, PayloadProfile, RandomFormat, Scenario};
     use sqlx::{Row, sqlite::SqlitePoolOptions};
@@ -2316,18 +2368,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_v4_resets_legacy_application_tables_once() {
+    async fn schema_v4_rejects_legacy_database_without_deleting_it() {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE scenarios(id TEXT PRIMARY KEY,name TEXT,body TEXT,created_at TEXT,updated_at TEXT)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO scenarios VALUES('old','old','{}','now','now')")
+        sqlx::query("CREATE TABLE schema_metadata(version INTEGER NOT NULL)")
             .execute(&db)
             .await
             .unwrap();
-        migrate(&db).await.unwrap();
+        sqlx::query("INSERT INTO schema_metadata VALUES(3)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE scenarios(id TEXT PRIMARY KEY)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scenarios VALUES('old')")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(migrate(&db).await.is_err());
         let version: i64 = sqlx::query_scalar("SELECT version FROM schema_metadata")
             .fetch_one(&db)
             .await
@@ -2336,17 +2399,11 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(version, 4);
-        assert_eq!(old, 0);
-        sqlx::query("INSERT INTO scenarios VALUES('new','new','{}','now','now')")
-            .execute(&db)
-            .await
-            .unwrap();
-        migrate(&db).await.unwrap();
-        let current: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scenarios")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(current, 1);
+        assert_eq!(version, 3);
+        assert_eq!(old, 1);
+        assert_eq!(
+            schema_fallback_url("sqlite://data/proxy.db?mode=rwc").unwrap(),
+            "sqlite://data/proxy.schema-4.db?mode=rwc"
+        );
     }
 }
