@@ -1,37 +1,35 @@
-# 설치와 설정
+# 설치와 운영 설정
 
 ## 구성 원칙
 
-Control은 UI, REST/WebSocket, Agent gRPC, SQLite를 함께 제공한다. Client와 Server는 같은 `proxy-agent` 실행 파일이며 `PROXY_TESTER_ROLE=client|server`로 역할을 정한다. Agent ID는 전체 Control 범위에서 고유해야 한다. 운영 환경에서는 실행 파일 이름에 따른 역할 추론에 의존하지 않는다.
+Control은 UI, REST/WebSocket, agent gRPC와 SQLite를 제공합니다. 모든 노드는 동일한 `proxy-agent` 실행 파일을 사용하며 agent 자체에 client/server 역할을 고정하지 않습니다. 실행할 Scenario와 준비된 network profile revision이 각 endpoint 역할을 결정합니다.
 
-`proxy` 서비스는 제품 구성요소가 아니라 로컬 explicit proxy 시험을 위한 fixture다. 실제 배포에서는 측정 대상 proxy를 별도로 준비하고 시나리오의 `proxy_addr` 또는 네트워크의 transparent 경로로 연결한다.
+Agent ID는 Control 범위에서 고유해야 합니다. 같은 ID로 새 agent가 연결되면 기존 세션을 대체하므로 장비 교체를 제외하고 ID를 재사용하지 마세요.
 
-## 빠른 로컬 평가
+## Docker 개발 환경
 
 ```powershell
 docker compose build
 docker compose up -d
+Invoke-RestMethod http://localhost:18080/api/health
+Invoke-RestMethod http://localhost:18080/api/agents
 ```
 
-이 구성은 control, client, server와 테스트용 proxy를 함께 기동한다. 개발용 `dev` 서비스는 `compose.dev.yaml`을 명시했을 때만 사용한다. UI는 기본적으로 `http://localhost:18080`이다.
+기본 compose의 `proxy`는 explicit proxy 기능 시험용 fixture이며 운영 구성 요소가 아닙니다. Docker Desktop은 기능 검증에만 사용하고 실제 처리량은 Linux 장비에서 측정하세요.
 
 ## 단일 호스트 운영
 
-`.env.example`을 `.env`로 복사하고 이미지 이름과 포트를 지정한 뒤 실행한다.
+`.env.example`을 `.env`로 복사해 image와 포트를 지정한 뒤 실행합니다.
 
 ```powershell
 docker compose -f compose.production.yaml --env-file .env up -d
 ```
 
-운영 Compose에는 fixture proxy와 개발 컨테이너가 없다. SQLite DB, 업로드 artifact, Run 결과는 `proxy-data` 볼륨에 보존한다. 백업 시에는 시험을 중지한 뒤 이 볼륨의 `/data`를 백업한다.
+SQLite, artifact와 결과는 `proxy-data` volume에 보존됩니다. 백업할 때는 활성 Run을 중지한 뒤 volume의 `/data` 전체를 함께 백업하세요.
 
-처음 설치하거나 이미지를 교체한 뒤에는 `tests/clean-install-smoke.ps1`로 별도 프로젝트와 빈 볼륨에서 Control health 및 Client/Server 등록을 확인할 수 있다. 스크립트는 검증이 끝나면 자신이 만든 컨테이너, 네트워크와 볼륨만 제거한다.
+## 분산 Linux agent
 
-## 분산 Linux 장비
-
-Control 호스트는 TCP 8080(UI/API)과 50051(Agent gRPC)을 수신한다. 외부 Agent를 사용할 때 방화벽에서 필요한 출발지에만 50051을 허용한다. 현재 Agent gRPC는 평문이므로 신뢰할 수 있는 측정망 또는 VPN 내부에서만 사용한다.
-
-각 부하 장비에 musl `proxy-agent`를 `/usr/local/bin/proxy-agent`로 설치하고 `packaging/systemd` 템플릿을 배치한다.
+Rust 1.93 musl release binary를 각 부하 발생 장비의 `/usr/local/bin/proxy-agent`에 설치합니다. systemd template은 `packaging/systemd`에 있습니다.
 
 ```text
 /etc/systemd/system/proxy-tester-agent.service
@@ -39,7 +37,7 @@ Control 호스트는 TCP 8080(UI/API)과 50051(Agent gRPC)을 수신한다. 외�
 /usr/local/bin/proxy-agent
 ```
 
-Client 예시는 `PROXY_TESTER_ROLE=client`, Server 예시는 `server`로 설정한다. `PROXY_TESTER_CONTROL`에는 Control 장비에서 접근 가능한 주소를 사용한다. 여러 Agent를 설치할 때 `PROXY_TESTER_AGENT_ID`를 중복시키면 마지막 연결이 기존 세션을 대체하므로 반드시 고유하게 정한다.
+Agent는 network namespace와 주소를 준비하므로 `CAP_NET_ADMIN`이 필요합니다. wire counter와 namespace 준비에 사용할 시험 전용 NIC를 마련하고 관리 NIC는 보호 목록에 유지하세요.
 
 ```bash
 sudo systemctl daemon-reload
@@ -47,24 +45,32 @@ sudo systemctl enable --now proxy-tester-agent
 journalctl -u proxy-tester-agent -f
 ```
 
-Control을 systemd로 운영할 때는 `proxy-tester-control.service`와 `control.env.example`을 사용한다. `proxy-tester` 사용자와 `/var/lib/proxy-tester/artifacts`를 먼저 만들고 쓰기 권한을 부여하며, 빌드된 frontend `dist`는 `/opt/proxy-tester/frontend/dist`에 둔다.
+Control의 TCP 50051을 필요한 agent 주소에서만 허용하세요. 현재 gRPC transport 자체 인증은 제공하지 않으므로 신뢰된 측정망 또는 VPN 안에서 운영해야 합니다.
 
-NIC wire 계측을 사용하려면 Agent가 해당 Linux interface의 `/sys/class/net` 통계를 읽을 수 있어야 한다. 고부하 시험 전에는 파일 descriptor 한도, ephemeral port 범위, NIC offload, MTU와 라우팅을 별도로 점검한다.
+## 환경 변수
 
-## 설정 항목
-
-| 구성요소 | 환경변수 | 기본값 | 설명 |
+| 구성 요소 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|---|
 | Control | `PROXY_TESTER_HTTP_ADDR` | `0.0.0.0:8080` | UI/API listen 주소 |
-| Control | `PROXY_TESTER_GRPC_ADDR` | `0.0.0.0:50051` | Agent gRPC listen 주소 |
+| Control | `PROXY_TESTER_GRPC_ADDR` | `0.0.0.0:50051` | agent gRPC listen 주소 |
 | Control | `DATABASE_URL` | `sqlite://data/proxy-tester.db?mode=rwc` | SQLite 연결 문자열 |
 | Control | `PROXY_TESTER_STATIC_DIR` | `frontend/dist` | CSR 정적 자산 경로 |
 | Control | `PROXY_TESTER_ARTIFACT_DIR` | `data/artifacts` | 업로드 artifact 경로 |
-| Control | `PROXY_TESTER_RETENTION_DAYS` | `90` | 완료 Run과 참조되지 않은 artifact 보존 일수, 0 이하는 자동 정리 중지 |
-| Control | `PROXY_TESTER_AGENT_GRACE_SECS` | `10` | Agent 연결 단절 후 Run 안전 실패까지의 유예 시간 |
-| Control | `PROXY_TESTER_COMMAND_TIMEOUT_SECS` | `10` | Agent 상태 명령 ACK 제한 시간 |
+| Control | `PROXY_TESTER_RETENTION_DAYS` | `90` | 완료 Run 보존 일수, 0 이하는 자동 정리 중지 |
+| Control | `PROXY_TESTER_AGENT_GRACE_SECS` | `10` | agent 단절 후 Run 실패까지 유예 시간 |
+| Control | `PROXY_TESTER_COMMAND_TIMEOUT_SECS` | `10` | agent 명령 ACK 제한 시간 |
 | Agent | `PROXY_TESTER_CONTROL` | `http://control:50051` | Control gRPC endpoint |
-| Agent | `PROXY_TESTER_AGENT_ID` | 역할 기반 `*-1` | UI와 시나리오에서 사용할 고유 ID |
-| Agent | `PROXY_TESTER_ROLE` | 실행 파일명에서 추론 | `client` 또는 `server` |
+| Agent | `PROXY_TESTER_NODE_ID` | hostname 기반 | Control 전체에서 고유한 node ID |
+| Agent | `PROXY_TESTER_PROTECTED_INTERFACES` | route 기반 감지 | 변경을 금지할 관리 interface 목록 |
 
-저장소 백업, 보존 정책과 PostgreSQL 확장 경계는 [STORAGE.md](STORAGE.md)를 참고한다. 기동 실패 시에는 Control의 DB/artifact 쓰기 권한과 포트 충돌을 먼저 확인하고, Agent 누락 시에는 고유 ID, 역할, 50051 연결과 Control 로그를 확인한다. 성능 수치가 낮거나 불안정하면 [TELEMETRY.md](TELEMETRY.md)의 App/Wire 구분과 Linux 장비 점검 항목을 따른다.
+역할을 정하는 `PROXY_TESTER_ROLE`은 사용하지 않습니다. 서비스 파일과 compose에서도 node ID만 지정합니다.
+
+## 설치 확인과 문제 해결
+
+1. `/api/health`에서 `schema_version=4`와 실제 `database_url`을 확인합니다.
+2. `/api/agents`에서 모든 node가 online이고 inventory에 시험 NIC가 있는지 확인합니다.
+3. UI에서 network profile을 Plan한 뒤 예상 namespace, 주소와 rollback 명령을 검토합니다.
+4. Apply 후 Diagnose를 실행하고 실패하면 network audit와 agent journal을 함께 확인합니다.
+5. 준비 중 중단된 노드는 Reconcile 또는 Teardown으로 복구한 뒤 다시 Plan합니다.
+
+NIC가 보이지 않으면 권한, `/sys/class/net`, protected interface 설정을 확인하세요. 처리량이 불안정하면 file descriptor, ephemeral port 범위, MTU와 NIC offload를 점검하세요. 네트워크 변경·rollback 상세는 [NETWORK_CONFIGURATION.md](NETWORK_CONFIGURATION.md), 저장소 복구는 [STORAGE.md](STORAGE.md), 계측 해석은 [TELEMETRY.md](TELEMETRY.md)를 참고하세요.
