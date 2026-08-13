@@ -35,7 +35,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
+    sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
 use tower_http::{
@@ -43,7 +43,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 mod error;
 use error::ApiError;
@@ -160,17 +160,16 @@ async fn main() -> anyhow::Result<()> {
         artifact_dir: Arc::new(args.artifact_dir.into()),
     };
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let grpc_state = state.clone();
     let grpc_addr = args.grpc_addr.parse()?;
-    tokio::spawn(async move {
+    let grpc_shutdown = shutdown_rx.clone();
+    let mut grpc_task = tokio::spawn(async move {
         info!(%grpc_addr,"agent gRPC listening");
-        if let Err(e) = tonic::transport::Server::builder()
+        tonic::transport::Server::builder()
             .add_service(AgentControlServer::new(ControlSvc(grpc_state)))
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, wait_for_shutdown(grpc_shutdown))
             .await
-        {
-            error!(%e,"gRPC stopped");
-        }
     });
 
     let static_dir = args.static_dir.clone();
@@ -227,8 +226,64 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
     info!(addr=%args.http_addr,"control HTTP listening");
-    axum::serve(listener, app).await?;
+    let http_shutdown = shutdown_rx;
+    let mut http_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(http_shutdown))
+            .await
+    });
+
+    let mut grpc_finished = false;
+    let mut http_finished = false;
+    let first_error = tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to listen for shutdown signal")?;
+            info!("shutdown signal received");
+            None
+        }
+        result = &mut grpc_task => {
+            grpc_finished = true;
+            Some(join_server_result("gRPC", result))
+        }
+        result = &mut http_task => {
+            http_finished = true;
+            Some(join_server_result("HTTP", result))
+        }
+    };
+
+    let _ = shutdown_tx.send(true);
+    if !grpc_finished {
+        join_server_result("gRPC", grpc_task.await)?;
+    }
+    if !http_finished {
+        join_server_result("HTTP", http_task.await)?;
+    }
+    if let Some(result) = first_error {
+        result?;
+        anyhow::bail!("server stopped unexpectedly");
+    }
+    info!("control shutdown complete");
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn join_server_result<E>(
+    name: &str,
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> anyhow::Result<()>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    result
+        .with_context(|| format!("{name} server task failed"))?
+        .with_context(|| format!("{name} server stopped with an error"))
 }
 
 #[derive(Deserialize)]
