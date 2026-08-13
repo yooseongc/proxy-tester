@@ -1,5 +1,7 @@
 # Proxy Tester
 
+Managed Linux interface/namespace setup, rollback, diagnostics, and recovery: [Network configuration](docs/NETWORK_CONFIGURATION.md).
+
 분산 TCP client/server agent로 transparent 또는 explicit proxy의 CPS, bandwidth, PPS 및 HTTP TPS를 측정하는 Rust 기반 도구입니다. Control plane은 React UI와 SQLite 결과 저장소를 제공합니다.
 
 ## Docker로 실행

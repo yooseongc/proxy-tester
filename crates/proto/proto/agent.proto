@@ -5,18 +5,20 @@ service AgentControl { rpc AgentStream(stream AgentMessage) returns (stream Cont
 
 enum AgentRole { AGENT_ROLE_UNSPECIFIED = 0; AGENT_ROLE_CLIENT = 1; AGENT_ROLE_SERVER = 2; }
 
-message AgentHello { string agent_id = 1; AgentRole role = 2; string hostname = 3; string version = 4; repeated string interfaces = 5; string instance_id = 6; }
+message AgentHello { string agent_id = 1; AgentRole role = 2; string hostname = 3; string version = 4; repeated string interfaces = 5; string instance_id = 6; string inventory_json = 7; }
 message Heartbeat { int64 unix_ms = 1; }
-message Telemetry { string run_id = 1; string metrics_json = 2; }
-message AgentEvent { string run_id = 1; string level = 2; string message = 3; }
+message Telemetry { string run_id = 1; string metrics_json = 2; AgentRole endpoint_role = 3; }
+message AgentEvent { string run_id = 1; string level = 2; string message = 3; AgentRole endpoint_role = 4; }
 message CommandAck { string command_id = 1; string run_id = 2; string phase = 3; bool ok = 4; string error = 5; }
 message AgentStatus { string active_run_id = 1; string phase = 2; }
-message AgentMessage { oneof body { AgentHello hello = 1; Heartbeat heartbeat = 2; Telemetry telemetry = 3; AgentEvent event = 4; CommandAck command_ack = 5; AgentStatus status = 6; } }
+message AgentMessage { oneof body { AgentHello hello = 1; Heartbeat heartbeat = 2; Telemetry telemetry = 3; AgentEvent event = 4; CommandAck command_ack = 5; AgentStatus status = 6; NetworkProgress network_progress = 7; } }
 
-message PrepareRun { string run_id = 1; string scenario_json = 2; string command_id = 3; }
-message StartRun { string run_id = 1; int64 start_unix_ms = 2; string command_id = 3; }
-message StopRun { string run_id = 1; string command_id = 2; }
-message SetPaused { string run_id = 1; bool paused = 2; string command_id = 3; }
+message PrepareRun { string run_id = 1; string scenario_json = 2; string command_id = 3; AgentRole endpoint_role = 4; string target_addr = 5; string interface_name = 6; string namespace = 7; repeated string source_ips = 8; }
+message StartRun { string run_id = 1; int64 start_unix_ms = 2; string command_id = 3; AgentRole endpoint_role = 4; }
+message StopRun { string run_id = 1; string command_id = 2; AgentRole endpoint_role = 3; }
+message SetPaused { string run_id = 1; bool paused = 2; string command_id = 3; AgentRole endpoint_role = 4; }
+message NetworkCommand { string command_id = 1; string operation_id = 2; string action = 3; string payload_json = 4; int64 lease_expires_unix_ms = 5; }
+message NetworkProgress { string command_id = 1; string operation_id = 2; string stage = 3; string status = 4; string detail_json = 5; }
 message ArtifactChunk {
   string artifact_id = 1;
   uint64 offset = 2;
@@ -26,4 +28,4 @@ message ArtifactChunk {
   bool eof = 6;
   string artifact_kind = 7;
 }
-message ControlMessage { oneof body { PrepareRun prepare = 1; StartRun start = 2; StopRun stop = 3; SetPaused set_paused = 4; ArtifactChunk artifact_chunk = 5; } }
+message ControlMessage { oneof body { PrepareRun prepare = 1; StartRun start = 2; StopRun stop = 3; SetPaused set_paused = 4; ArtifactChunk artifact_chunk = 5; NetworkCommand network = 6; } }

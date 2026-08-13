@@ -10,13 +10,15 @@ services:
     build: {context: ., target: client}
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
-      PROXY_TESTER_AGENT_ID: client-1
+      PROXY_TESTER_NODE_ID: client-1
+    cap_add: [NET_ADMIN, NET_RAW]
     depends_on: [control]
   server:
     build: {context: ., target: server}
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
-      PROXY_TESTER_AGENT_ID: server-1
+      PROXY_TESTER_NODE_ID: server-1
+    cap_add: [NET_ADMIN, NET_RAW]
     depends_on: [control]
   proxy:
     build: {context: tests/fixture-proxy}

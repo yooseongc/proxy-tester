@@ -121,6 +121,14 @@ pub struct Scenario {
     pub capture_artifact_id: Option<Uuid>,
     pub tls: TlsProfile,
     pub timeouts: TimeoutProfile,
+    #[serde(skip)]
+    pub runtime_target_addr: Option<String>,
+    #[serde(skip)]
+    pub runtime_interface: Option<String>,
+    #[serde(skip)]
+    pub runtime_namespace: Option<String>,
+    #[serde(skip)]
+    pub runtime_source_ips: Vec<IpAddr>,
 }
 
 impl Default for Scenario {
@@ -144,6 +152,10 @@ impl Default for Scenario {
             capture_artifact_id: None,
             tls: TlsProfile::default(),
             timeouts: TimeoutProfile::default(),
+            runtime_target_addr: None,
+            runtime_interface: None,
+            runtime_namespace: None,
+            runtime_source_ips: Vec::new(),
         }
     }
 }
@@ -408,6 +420,9 @@ impl Scenario {
         }
     }
     pub fn target_addr(&self) -> String {
+        if let Some(value) = &self.runtime_target_addr {
+            return value.clone();
+        }
         match &self.path {
             ScenarioPath::ExplicitProxy {
                 server_listen_ip,

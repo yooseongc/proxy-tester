@@ -18,7 +18,8 @@ COPY --from=frontend /src/frontend/dist /frontend/dist
 WORKDIR /
 ENTRYPOINT ["/proxy-control"]
 
-FROM scratch AS agent
+FROM alpine:3.23 AS agent
+RUN apk add --no-cache iproute2 ethtool iputils
 COPY --from=backend /src/target/x86_64-unknown-linux-musl/release/proxy-agent /proxy-agent
 ENTRYPOINT ["/proxy-agent"]
 

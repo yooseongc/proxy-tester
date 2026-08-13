@@ -50,6 +50,7 @@ import {
   type Theme,
 } from "./ui";
 import "./styles.css";
+import { NetworkSetup } from "./NetworkSetup";
 
 type Tab = "setup" | "live" | "results";
 type Artifact = {
@@ -445,7 +446,8 @@ function App() {
             </button>
           ))}
         </nav>
-        {tab === "setup" && (
+        {tab === "setup" && (<>
+          <NetworkSetup agents={agents} onPrepared={(profile_revision_id)=>patch({path:{kind:"managed_direct",profile_revision_id,server_port:scenario.path.server_port}})} />
           <Panel className="p-4 sm:p-6">
             <SectionTitle
               eyebrow="TRAFFIC PROFILE"
@@ -1001,7 +1003,7 @@ function App() {
               <Play size={15} />
               시험 시작
             </Button>
-          </Panel>
+          </Panel></>
         )}
         {tab === "live" && (
           <Panel className="p-4 sm:p-6">

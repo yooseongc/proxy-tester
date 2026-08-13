@@ -18,7 +18,8 @@ use proxy_tester_domain::{
     Protocol, Scenario, ScenarioPath,
 };
 use proxy_tester_proto::v1::{
-    AgentMessage, ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun,
+    AgentMessage, ArtifactChunk, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun,
+    SetPaused, StartRun, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -79,6 +80,7 @@ struct AgentSession {
     role: i32,
     hostname: String,
     interfaces: Vec<String>,
+    inventory_json: String,
     last_seen_ms: i64,
     tx: mpsc::Sender<Result<ControlMessage, Status>>,
 }
@@ -91,7 +93,9 @@ struct AppState {
     active_run: Arc<Mutex<Option<Uuid>>>,
     run_agents: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
     completed_agents: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
+    expected_endpoints: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
     pending_acks: Arc<Mutex<HashMap<String, oneshot::Sender<CommandAckResult>>>>,
+    pending_network: Arc<Mutex<HashMap<String, oneshot::Sender<NetworkProgress>>>>,
     agent_grace_secs: u64,
     command_timeout_secs: u64,
     artifact_dir: Arc<std::path::PathBuf>,
@@ -145,7 +149,9 @@ async fn main() -> anyhow::Result<()> {
         active_run: Default::default(),
         run_agents: Default::default(),
         completed_agents: Default::default(),
+        expected_endpoints: Default::default(),
         pending_acks: Default::default(),
+        pending_network: Default::default(),
         agent_grace_secs: args.agent_grace_secs,
         command_timeout_secs: args.command_timeout_secs,
         artifact_dir: Arc::new(args.artifact_dir.into()),
@@ -176,6 +182,21 @@ async fn main() -> anyhow::Result<()> {
             "/api/network/profiles/{id}/plan",
             post(plan_network_profile),
         )
+        .route(
+            "/api/network/profiles/{id}/archive",
+            post(archive_network_profile),
+        )
+        .route(
+            "/api/network/operations/{id}/apply",
+            post(apply_network_profile),
+        )
+        .route(
+            "/api/network/revisions/{id}/teardown",
+            post(teardown_network_profile),
+        )
+        .route("/api/network/audit", get(network_audit))
+        .route("/api/network/diagnose", post(diagnose_network))
+        .route("/api/network/nodes/{id}/reconcile", post(reconcile_node))
         .route("/api/network/revisions", get(list_network_revisions))
         .route("/api/scenarios", get(list_scenarios).post(save_scenario))
         .route("/api/scenarios/validate", post(validate_scenario))
@@ -273,6 +294,7 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             "scenarios",
             "artifacts",
             "network_operations",
+            "network_operation_events",
             "network_profile_revisions",
             "network_profiles",
             "schema_metadata",
@@ -289,6 +311,8 @@ async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS network_profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,draft_json TEXT NOT NULL,status TEXT NOT NULL,archived INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS network_profile_revisions(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL,revision INTEGER NOT NULL,sha256 TEXT NOT NULL UNIQUE,body_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(profile_id,revision))",
         "CREATE TABLE IF NOT EXISTS network_operations(id TEXT PRIMARY KEY,profile_revision_id TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,plan_token_hash TEXT,expires_at TEXT,detail_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS network_operation_events(id INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL,node_id TEXT NOT NULL,stage TEXT NOT NULL,status TEXT NOT NULL,detail_json TEXT NOT NULL,created_at TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_network_events_operation ON network_operation_events(operation_id,id)",
         "CREATE TABLE IF NOT EXISTS scenarios(id TEXT PRIMARY KEY,name TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,scenario_id TEXT NOT NULL,status TEXT NOT NULL,started_at TEXT,finished_at TEXT,error TEXT,scenario_json TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS metric_samples(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,agent_id TEXT NOT NULL,role INTEGER NOT NULL,unix_ms INTEGER NOT NULL,metrics_json TEXT NOT NULL)",
@@ -332,6 +356,39 @@ async fn save_network_profile(
     let body = serde_json::to_string(&draft)?;
     sqlx::query("INSERT INTO network_profiles(id,name,draft_json,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,draft_json=excluded.draft_json,status=CASE WHEN network_profiles.status='prepared' THEN 'prepared' ELSE 'draft' END,updated_at=excluded.updated_at").bind(draft.id.to_string()).bind(&draft.name).bind(body).bind(&now).bind(&now).execute(&s.db).await?;
     Ok(Json(draft))
+}
+
+async fn archive_network_profile(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if s.active_run.lock().await.is_some() {
+        return Err(ApiError::conflict(
+            "profiles cannot be archived during a run",
+        ));
+    }
+    let prepared: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM network_profile_revisions WHERE profile_id=? AND status='prepared'",
+    )
+    .bind(id.to_string())
+    .fetch_one(&s.db)
+    .await?;
+    if prepared > 0 {
+        return Err(ApiError::conflict(
+            "teardown the prepared revision before archiving the profile",
+        ));
+    }
+    let result = sqlx::query(
+        "UPDATE network_profiles SET archived=1,status='archived',updated_at=? WHERE id=?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(id.to_string())
+    .execute(&s.db)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("network profile not found"));
+    }
+    Ok(Json(serde_json::json!({"id":id,"status":"archived"})))
 }
 async fn list_network_revisions(
     State(s): State<AppState>,
@@ -393,10 +450,337 @@ async fn plan_network_profile(
     let operation_id = Uuid::new_v4();
     let now = Utc::now();
     let expires = now + chrono::Duration::minutes(5);
-    let detail = serde_json::json!({"nodes":[draft.client_endpoint.node_id,draft.server_endpoint.node_id],"changes":["create endpoint namespaces","move data interfaces","assign IPv4 pools","set MTU","disable offloads","start endpoint workers"],"rollback":["stop workers","return interfaces","restore link settings"]});
+    let mut nodes = vec![
+        draft.client_endpoint.node_id.clone(),
+        draft.server_endpoint.node_id.clone(),
+    ];
+    nodes.sort();
+    nodes.dedup();
+    let mut detail = serde_json::json!({"nodes":nodes,"plans":{}});
     sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,plan_token_hash,expires_at,detail_json,created_at,updated_at) VALUES(?,?,'plan','planned',?,?,?,?,?)").bind(operation_id.to_string()).bind(&revision_id).bind(format!("{:x}",Sha256::digest(token.as_bytes()))).bind(expires.to_rfc3339()).bind(detail.to_string()).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&s.db).await?;
+    let mut plans = serde_json::Map::new();
+    for node in &nodes {
+        let progress = network_command(
+            &s,
+            node,
+            operation_id,
+            "plan",
+            serde_json::json!({"profile_revision_id":revision_id,"draft":draft}),
+            expires.timestamp_millis(),
+        )
+        .await?;
+        plans.insert(
+            node.clone(),
+            serde_json::from_str(&progress.detail_json)
+                .map_err(|e| ApiError::internal(e.to_string()))?,
+        );
+    }
+    detail["plans"] = serde_json::Value::Object(plans);
+    sqlx::query(
+        "UPDATE network_operations SET status='planned',detail_json=?,updated_at=? WHERE id=?",
+    )
+    .bind(detail.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(operation_id.to_string())
+    .execute(&s.db)
+    .await?;
     Ok(Json(
         serde_json::json!({"operation_id":operation_id,"profile_revision_id":revision_id,"revision":revision,"sha256":sha,"plan_token":token,"expires_at":expires,"detail":detail}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ApplyNetworkRequest {
+    plan_token: String,
+}
+async fn network_command(
+    s: &AppState,
+    node_id: &str,
+    operation_id: Uuid,
+    action: &str,
+    payload: serde_json::Value,
+    lease_ms: i64,
+) -> Result<NetworkProgress, ApiError> {
+    let agent = s
+        .agents
+        .read()
+        .await
+        .get(node_id)
+        .cloned()
+        .ok_or_else(|| ApiError::bad(format!("node {node_id} is offline")))?;
+    let command_id = Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel();
+    s.pending_network
+        .lock()
+        .await
+        .insert(command_id.clone(), tx);
+    agent
+        .tx
+        .send(Ok(ControlMessage {
+            body: Some(control_message::Body::Network(NetworkCommand {
+                command_id: command_id.clone(),
+                operation_id: operation_id.to_string(),
+                action: action.into(),
+                payload_json: payload.to_string(),
+                lease_expires_unix_ms: lease_ms,
+            })),
+        }))
+        .await
+        .map_err(|_| ApiError::internal("node command channel closed"))?;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(s.command_timeout_secs.max(180)),
+        rx,
+    )
+    .await
+    {
+        Ok(Ok(progress)) if progress.status == "completed" => Ok(progress),
+        Ok(Ok(progress)) => Err(ApiError::internal(format!(
+            "node {node_id} {action} failed: {}",
+            progress.detail_json
+        ))),
+        _ => {
+            s.pending_network.lock().await.remove(&command_id);
+            Err(ApiError::internal(format!(
+                "node {node_id} {action} timed out"
+            )))
+        }
+    }
+}
+
+async fn revision_nodes(
+    db: &SqlitePool,
+    revision_id: Uuid,
+) -> Result<(NetworkProfileDraft, Vec<String>, Uuid), ApiError> {
+    let row = sqlx::query("SELECT profile_id,body_json FROM network_profile_revisions WHERE id=?")
+        .bind(revision_id.to_string())
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("network profile revision not found"))?;
+    let draft: NetworkProfileDraft =
+        serde_json::from_str(row.get::<String, _>("body_json").as_str())?;
+    let mut nodes = vec![
+        draft.client_endpoint.node_id.clone(),
+        draft.server_endpoint.node_id.clone(),
+    ];
+    nodes.sort();
+    nodes.dedup();
+    Ok((
+        draft,
+        nodes,
+        Uuid::parse_str(row.get::<String, _>("profile_id").as_str())
+            .map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
+}
+
+async fn apply_network_profile(
+    State(s): State<AppState>,
+    Path(operation_id): Path<Uuid>,
+    Json(request): Json<ApplyNetworkRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if s.active_run.lock().await.is_some() {
+        return Err(ApiError::conflict(
+            "network profile cannot be applied during a run",
+        ));
+    }
+    let row=sqlx::query("SELECT profile_revision_id,status,plan_token_hash,expires_at,detail_json FROM network_operations WHERE id=? AND kind='plan'").bind(operation_id.to_string()).fetch_optional(&s.db).await?.ok_or_else(||ApiError::not_found("network plan not found"))?;
+    if row.get::<String, _>("status") != "planned" {
+        return Err(ApiError::conflict("network plan token is single-use"));
+    }
+    let expected: String = row.get("plan_token_hash");
+    if expected != format!("{:x}", Sha256::digest(request.plan_token.as_bytes())) {
+        return Err(ApiError::bad("invalid plan token"));
+    }
+    let expires: chrono::DateTime<Utc> = row
+        .get::<String, _>("expires_at")
+        .parse()
+        .map_err(|_| ApiError::bad("invalid plan expiry"))?;
+    if expires < Utc::now() {
+        return Err(ApiError::conflict("network plan expired"));
+    }
+    let revision_id = Uuid::parse_str(row.get::<String, _>("profile_revision_id").as_str())
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (_draft, nodes, profile_id) = revision_nodes(&s.db, revision_id).await?;
+    let lease = Utc::now().timestamp_millis() + 180_000;
+    sqlx::query("UPDATE network_operations SET status='applying',updated_at=? WHERE id=?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(operation_id.to_string())
+        .execute(&s.db)
+        .await?;
+    let mut staged: Vec<String> = Vec::new();
+    let saved: serde_json::Value =
+        serde_json::from_str(row.get::<String, _>("detail_json").as_str())?;
+    let plans = saved["plans"]
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("network plan has no node plans"))?;
+    for node in &nodes {
+        let plan = plans
+            .get(node)
+            .cloned()
+            .ok_or_else(|| ApiError::internal(format!("network plan missing node {node}")))?;
+        if let Err(error) = network_command(&s, node, operation_id, "stage", plan, lease).await {
+            for applied in &staged {
+                let _ = network_command(
+                    &s,
+                    applied,
+                    operation_id,
+                    "rollback",
+                    serde_json::Value::Null,
+                    lease,
+                )
+                .await;
+            }
+            sqlx::query("UPDATE network_operations SET status='failed',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"error":error.1,"plans":plans}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation_id.to_string()).execute(&s.db).await?;
+            return Err(error);
+        }
+        staged.push(node.clone());
+    }
+    for node in &nodes {
+        if let Err(error) = network_command(
+            &s,
+            node,
+            operation_id,
+            "commit",
+            serde_json::Value::Null,
+            lease,
+        )
+        .await
+        {
+            for applied in &staged {
+                let _ = network_command(
+                    &s,
+                    applied,
+                    operation_id,
+                    "rollback",
+                    serde_json::Value::Null,
+                    lease,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    }
+    sqlx::query("UPDATE network_operations SET status='completed',detail_json=?,plan_token_hash=NULL,updated_at=? WHERE id=?").bind(serde_json::json!({"plans":plans}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation_id.to_string()).execute(&s.db).await?;
+    sqlx::query("UPDATE network_profile_revisions SET status='prepared' WHERE id=?")
+        .bind(revision_id.to_string())
+        .execute(&s.db)
+        .await?;
+    sqlx::query("UPDATE network_profiles SET status='prepared',updated_at=? WHERE id=?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(profile_id.to_string())
+        .execute(&s.db)
+        .await?;
+    Ok(Json(
+        serde_json::json!({"operation_id":operation_id,"profile_revision_id":revision_id,"status":"prepared"}),
+    ))
+}
+
+async fn teardown_network_profile(
+    State(s): State<AppState>,
+    Path(revision_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if s.active_run.lock().await.is_some() {
+        return Err(ApiError::conflict("active run must finish before teardown"));
+    }
+    let (_draft, nodes, profile_id) = revision_nodes(&s.db, revision_id).await?;
+    let operation = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,detail_json,created_at,updated_at) VALUES(?,?,'teardown','tearing_down','{}',?,?)").bind(operation.to_string()).bind(revision_id.to_string()).bind(&now).bind(&now).execute(&s.db).await?;
+    for node in &nodes {
+        if let Err(error) = network_command(
+            &s,
+            node,
+            operation,
+            "teardown",
+            serde_json::Value::Null,
+            Utc::now().timestamp_millis() + 180_000,
+        )
+        .await
+        {
+            sqlx::query("UPDATE network_operations SET status='quarantined',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"node":node,"error":error.1}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation.to_string()).execute(&s.db).await?;
+            return Err(error);
+        }
+    }
+    sqlx::query("UPDATE network_profile_revisions SET status='unprepared' WHERE id=?")
+        .bind(revision_id.to_string())
+        .execute(&s.db)
+        .await?;
+    sqlx::query("UPDATE network_profiles SET status='unprepared',updated_at=? WHERE id=?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(profile_id.to_string())
+        .execute(&s.db)
+        .await?;
+    Ok(Json(
+        serde_json::json!({"operation_id":operation,"status":"unprepared"}),
+    ))
+}
+
+async fn network_audit(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let rows=sqlx::query("SELECT id,profile_revision_id,kind,status,detail_json,created_at,updated_at FROM network_operations ORDER BY created_at DESC LIMIT 500").fetch_all(&s.db).await?;
+    let mut result = Vec::with_capacity(rows.len());
+    for r in rows {
+        let operation_id: String = r.get("id");
+        let event_rows = sqlx::query("SELECT node_id,stage,status,detail_json,created_at FROM network_operation_events WHERE operation_id=? ORDER BY id")
+            .bind(&operation_id).fetch_all(&s.db).await?;
+        let events: Vec<_> = event_rows.into_iter().map(|event| serde_json::json!({
+            "node_id":event.get::<String,_>("node_id"),"stage":event.get::<String,_>("stage"),
+            "status":event.get::<String,_>("status"),"detail":serde_json::from_str::<serde_json::Value>(event.get("detail_json")).unwrap_or_default(),
+            "created_at":event.get::<String,_>("created_at")
+        })).collect();
+        result.push(serde_json::json!({"id":operation_id,"profile_revision_id":r.get::<String,_>("profile_revision_id"),"kind":r.get::<String,_>("kind"),"status":r.get::<String,_>("status"),"detail":serde_json::from_str::<serde_json::Value>(r.get("detail_json")).unwrap_or_default(),"events":events,"created_at":r.get::<String,_>("created_at"),"updated_at":r.get::<String,_>("updated_at")}));
+    }
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct DiagnoseNetworkRequest {
+    profile_revision_id: Uuid,
+}
+
+async fn diagnose_network(
+    State(s): State<AppState>,
+    Json(request): Json<DiagnoseNetworkRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (draft, nodes, _) = revision_nodes(&s.db, request.profile_revision_id).await?;
+    let agents = s.agents.read().await;
+    let mut checks = Vec::new();
+    for node in &nodes {
+        match agents.get(node) {
+            Some(agent) => {
+                let inventory = serde_json::from_str::<serde_json::Value>(&agent.inventory_json)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                checks.push(serde_json::json!({"name":"node_online","node_id":node,"ok":true,"detail":agent.hostname}));
+                checks.push(serde_json::json!({"name":"inventory_available","node_id":node,"ok":inventory.get("interfaces").and_then(|v|v.as_array()).is_some_and(|v|!v.is_empty()),"detail":inventory}));
+            }
+            None => checks.push(serde_json::json!({"name":"node_online","node_id":node,"ok":false,"detail":"agent is offline"})),
+        }
+    }
+    checks.push(serde_json::json!({"name":"profile_valid","ok":draft.validate().is_ok()}));
+    let ok = checks
+        .iter()
+        .all(|check| check["ok"].as_bool().unwrap_or(false));
+    Ok(Json(
+        serde_json::json!({"profile_revision_id":request.profile_revision_id,"ok":ok,"checks":checks,"note":"link reachability is verified again by run preflight from the selected namespace"}),
+    ))
+}
+async fn reconcile_node(
+    State(s): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let operation = Uuid::new_v4();
+    network_command(
+        &s,
+        &node_id,
+        operation,
+        "reconcile",
+        serde_json::Value::Null,
+        Utc::now().timestamp_millis() + 180_000,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({"node_id":node_id,"status":"unprepared"}),
     ))
 }
 
@@ -459,6 +843,7 @@ struct AgentView {
     interfaces: Vec<String>,
     last_seen_ms: i64,
     online: bool,
+    inventory: serde_json::Value,
 }
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
@@ -477,6 +862,7 @@ async fn agents(State(s): State<AppState>) -> Json<Vec<AgentView>> {
                 interfaces: a.interfaces.clone(),
                 last_seen_ms: a.last_seen_ms,
                 online: now - a.last_seen_ms < 15_000,
+                inventory: serde_json::from_str(&a.inventory_json).unwrap_or_default(),
             })
             .collect(),
     )
@@ -537,6 +923,83 @@ async fn scenario_nodes(
                 body.client_endpoint.node_id,
                 body.server_endpoint.node_id,
                 row.get::<String, _>("status") == "prepared",
+            ))
+        }
+    }
+}
+
+async fn scenario_runtime(
+    db: &SqlitePool,
+    sc: &Scenario,
+) -> Result<
+    (
+        (String, String, String, Vec<String>),
+        (String, String, String, Vec<String>),
+    ),
+    ApiError,
+> {
+    match &sc.path {
+        ScenarioPath::ExplicitProxy {
+            client_bind_ip,
+            server_listen_ip,
+            server_port,
+            ..
+        } => {
+            let target = format!("{server_listen_ip}:{server_port}");
+            Ok((
+                (
+                    target.clone(),
+                    String::new(),
+                    String::new(),
+                    vec![client_bind_ip.to_string()],
+                ),
+                (target, String::new(), String::new(), Vec::new()),
+            ))
+        }
+        ScenarioPath::ManagedDirect {
+            profile_revision_id,
+            server_port,
+        } => {
+            let row = sqlx::query("SELECT body_json FROM network_profile_revisions WHERE id=?")
+                .bind(profile_revision_id.to_string())
+                .fetch_one(db)
+                .await?;
+            let draft: NetworkProfileDraft =
+                serde_json::from_str(row.get::<String, _>("body_json").as_str())?;
+            let address = draft
+                .server_endpoint
+                .start_cidr
+                .split_once('/')
+                .map(|v| v.0)
+                .ok_or_else(|| ApiError::bad("invalid server pool"))?;
+            let revision = profile_revision_id.to_string();
+            let short = &revision[..8];
+            let (start, prefix) = draft
+                .client_endpoint
+                .start_cidr
+                .split_once('/')
+                .ok_or_else(|| ApiError::bad("invalid client pool"))?;
+            let start: u32 = start
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| ApiError::bad("invalid client pool"))?
+                .into();
+            let sources = (0..draft.client_endpoint.count)
+                .map(|offset| std::net::Ipv4Addr::from(start + offset).to_string())
+                .collect();
+            let _ = prefix;
+            Ok((
+                (
+                    format!("{address}:{server_port}"),
+                    draft.client_endpoint.interface_name,
+                    format!("pt-{short}-client"),
+                    sources,
+                ),
+                (
+                    format!("{address}:{server_port}"),
+                    draft.server_endpoint.interface_name,
+                    format!("pt-{short}-server"),
+                    Vec::new(),
+                ),
             ))
         }
     }
@@ -835,6 +1298,7 @@ async fn start_run(
     drop(sessions);
     let run_id = Uuid::new_v4();
     let json = serde_json::to_string(&sc)?;
+    let (client_runtime, server_runtime) = scenario_runtime(&s.db, &sc).await?;
     let started_at = Utc::now();
     let run_name = requested_name
         .map(|name| name.trim().to_owned())
@@ -859,13 +1323,28 @@ async fn start_run(
             run_id: run_id.to_string(),
             scenario_json: json,
             command_id: String::new(),
+            endpoint_role: 1,
+            target_addr: client_runtime.0,
+            interface_name: client_runtime.1,
+            namespace: client_runtime.2,
+            source_ips: client_runtime.3,
         })),
     };
     let preparation = async {
         send_artifacts(&s.db, &client, &artifact_ids).await?;
-        send_artifacts(&s.db, &server, &artifact_ids).await?;
+        if client_id != server_id {
+            send_artifacts(&s.db, &server, &artifact_ids).await?;
+        }
         command_agent(&s, &client_id, &client, run_id, "prepare", prepare.clone()).await?;
-        command_agent(&s, &server_id, &server, run_id, "prepare", prepare).await?;
+        let mut server_prepare = prepare;
+        if let Some(control_message::Body::Prepare(value)) = server_prepare.body.as_mut() {
+            value.endpoint_role = 2;
+            value.target_addr = server_runtime.0;
+            value.interface_name = server_runtime.1;
+            value.namespace = server_runtime.2;
+            value.source_ips = server_runtime.3;
+        }
+        command_agent(&s, &server_id, &server, run_id, "prepare", server_prepare).await?;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -884,11 +1363,16 @@ async fn start_run(
             run_id: run_id.to_string(),
             start_unix_ms: start_at,
             command_id: String::new(),
+            endpoint_role: 1,
         })),
     };
     let starting = async {
         command_agent(&s, &client_id, &client, run_id, "start", start.clone()).await?;
-        command_agent(&s, &server_id, &server, run_id, "start", start).await?;
+        let mut server_start = start;
+        if let Some(control_message::Body::Start(value)) = server_start.body.as_mut() {
+            value.endpoint_role = 2;
+        }
+        command_agent(&s, &server_id, &server, run_id, "start", server_start).await?;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -900,6 +1384,7 @@ async fn start_run(
                     body: Some(control_message::Body::Stop(StopRun {
                         run_id: run_id.to_string(),
                         command_id: Uuid::new_v4().to_string(),
+                        endpoint_role: 0,
                     })),
                 }))
                 .await;
@@ -918,10 +1403,14 @@ async fn start_run(
         .execute(&s.db)
         .await?;
     *active = Some(run_id);
-    s.run_agents
-        .lock()
-        .await
-        .insert(run_id, HashSet::from([client_id, server_id]));
+    s.run_agents.lock().await.insert(
+        run_id,
+        HashSet::from([client_id.clone(), server_id.clone()]),
+    );
+    s.expected_endpoints.lock().await.insert(
+        run_id,
+        HashSet::from([format!("{client_id}:1"), format!("{server_id}:2")]),
+    );
     let _ = s
         .events
         .send(serde_json::json!({"type":"run_started","run_id":run_id}).to_string());
@@ -1170,6 +1659,7 @@ async fn stop_run(
                     body: Some(control_message::Body::Stop(StopRun {
                         run_id: id.to_string(),
                         command_id: String::new(),
+                        endpoint_role: 0,
                     })),
                 },
             )
@@ -1204,6 +1694,7 @@ async fn set_run_paused(
             run_id: id.to_string(),
             paused,
             command_id: String::new(),
+            endpoint_role: 0,
         })),
     };
     let agents = s.agents.read().await.clone();
@@ -1259,6 +1750,7 @@ async fn finish_run(
     drop(active);
     s.run_agents.lock().await.remove(&id);
     s.completed_agents.lock().await.remove(&id);
+    s.expected_endpoints.lock().await.remove(&id);
     let _ = s
         .events
         .send(serde_json::json!({"type":"run_finished","run_id":id,"status":status}).to_string());
@@ -1486,6 +1978,7 @@ impl AgentControl for ControlSvc {
                 role,
                 hostname: hello.hostname,
                 interfaces: hello.interfaces,
+                inventory_json: hello.inventory_json,
                 last_seen_ms: Utc::now().timestamp_millis(),
                 tx,
             },
@@ -1512,6 +2005,20 @@ impl AgentControl for ControlSvc {
                             });
                         }
                     }
+                    Some(agent_message::Body::NetworkProgress(progress)) => {
+                        let _=sqlx::query("INSERT INTO network_operation_events(operation_id,node_id,stage,status,detail_json,created_at) VALUES(?,?,?,?,?,?)")
+                            .bind(&progress.operation_id).bind(&id).bind(&progress.stage).bind(&progress.status)
+                            .bind(&progress.detail_json).bind(Utc::now().to_rfc3339()).execute(&state.db).await;
+                        if let Some(waiter) = state
+                            .pending_network
+                            .lock()
+                            .await
+                            .remove(&progress.command_id)
+                        {
+                            let _ = waiter.send(progress.clone());
+                        }
+                        let _=state.events.send(serde_json::json!({"type":"network_progress","node_id":id,"operation_id":progress.operation_id,"stage":progress.stage,"status":progress.status,"detail":serde_json::from_str::<serde_json::Value>(&progress.detail_json).unwrap_or_default()}).to_string());
+                    }
                     Some(agent_message::Body::Status(status)) => {
                         if !status.active_run_id.is_empty() {
                             warn!(agent=%id, run=%status.active_run_id, "agent reconnected with orphan run; it will not be resumed");
@@ -1519,8 +2026,13 @@ impl AgentControl for ControlSvc {
                     }
                     Some(agent_message::Body::Telemetry(t)) => {
                         if let Ok(m) = serde_json::from_str::<MetricsSnapshot>(&t.metrics_json) {
-                            let _=sqlx::query("INSERT INTO metric_samples(run_id,agent_id,role,unix_ms,metrics_json) VALUES(?,?,?,?,?)").bind(&t.run_id).bind(&id).bind(role).bind(m.unix_ms).bind(&t.metrics_json).execute(&state.db).await;
-                            let _=state.events.send(serde_json::json!({"type":"metrics","agent_id":id,"role":role,"data":m}).to_string());
+                            let endpoint_role = if t.endpoint_role == 0 {
+                                role
+                            } else {
+                                t.endpoint_role
+                            };
+                            let _=sqlx::query("INSERT INTO metric_samples(run_id,agent_id,role,unix_ms,metrics_json) VALUES(?,?,?,?,?)").bind(&t.run_id).bind(&id).bind(endpoint_role).bind(m.unix_ms).bind(&t.metrics_json).execute(&state.db).await;
+                            let _=state.events.send(serde_json::json!({"type":"metrics","agent_id":id,"role":endpoint_role,"data":m}).to_string());
                         }
                     }
                     Some(agent_message::Body::Event(e)) => {
@@ -1538,14 +2050,17 @@ impl AgentControl for ControlSvc {
                             && *state.active_run.lock().await == Some(run_id)
                         {
                             let expected = state
-                                .run_agents
+                                .expected_endpoints
                                 .lock()
                                 .await
                                 .get(&run_id)
                                 .cloned()
                                 .unwrap_or_default();
                             let mut completed = state.completed_agents.lock().await;
-                            completed.entry(run_id).or_default().insert(id.clone());
+                            completed
+                                .entry(run_id)
+                                .or_default()
+                                .insert(format!("{}:{}", id, e.endpoint_role));
                             let all_completed = !expected.is_empty()
                                 && completed
                                     .get(&run_id)
@@ -1622,6 +2137,7 @@ async fn schedule_disconnect_failure(state: AppState, agent_id: String) {
                     body: Some(control_message::Body::Stop(StopRun {
                         run_id: run_id.to_string(),
                         command_id: Uuid::new_v4().to_string(),
+                        endpoint_role: 0,
                     })),
                 }))
                 .await;

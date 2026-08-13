@@ -39,6 +39,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tonic::Request;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+mod network;
+use network::{NetworkManager, NetworkPlan};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -48,10 +50,16 @@ struct Args {
         default_value = "http://control:50051"
     )]
     control: String,
-    #[arg(long, env = "PROXY_TESTER_AGENT_ID")]
-    agent_id: Option<String>,
+    #[arg(long, env = "PROXY_TESTER_NODE_ID")]
+    node_id: Option<String>,
     #[arg(long, env = "PROXY_TESTER_ROLE")]
     role: Option<String>,
+    #[arg(
+        long,
+        env = "PROXY_TESTER_NETWORK_JOURNAL",
+        default_value = "/var/lib/proxy-tester/network-state.json"
+    )]
+    network_journal: std::path::PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +72,13 @@ impl Role {
         match self {
             Self::Client => AgentRole::Client as i32,
             Self::Server => AgentRole::Server as i32,
+        }
+    }
+    fn from_proto(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Client),
+            2 => Some(Self::Server),
+            _ => None,
         }
     }
 }
@@ -621,19 +636,17 @@ async fn main() -> anyhow::Result<()> {
         _ if exe.contains("client") => Role::Client,
         _ => Role::Server,
     };
-    let id = args.agent_id.unwrap_or_else(|| {
-        format!(
-            "{}-1",
-            if role == Role::Client {
-                "client"
-            } else {
-                "server"
-            }
-        )
-    });
+    let id = args
+        .node_id
+        .clone()
+        .context("PROXY_TESTER_NODE_ID is required")?;
+    let network = NetworkManager::new(args.network_journal.clone());
+    if let Err(error) = network.recover().await {
+        error!(%error,"startup network recovery failed");
+    }
     let instance_id = Uuid::new_v4().to_string();
     loop {
-        match run_connection(&args.control, &id, &instance_id, role).await {
+        match run_connection(&args.control, &id, &instance_id, role, network.clone()).await {
             Ok(()) => warn!("control stream ended"),
             Err(e) => error!(%e,"control connection failed"),
         };
@@ -646,9 +659,11 @@ async fn run_connection(
     id: &str,
     instance_id: &str,
     role: Role,
+    network: NetworkManager,
 ) -> anyhow::Result<()> {
     let mut client = AgentControlClient::connect(control.to_owned()).await?;
     let (tx, rx) = mpsc::channel(128);
+    let inventory = network.inventory().await.unwrap_or_default();
     tx.send(AgentMessage {
         body: Some(agent_message::Body::Hello(AgentHello {
             agent_id: id.into(),
@@ -657,6 +672,7 @@ async fn run_connection(
             version: env!("CARGO_PKG_VERSION").into(),
             interfaces: list_interfaces(),
             instance_id: instance_id.into(),
+            inventory_json: serde_json::to_string(&inventory)?,
         })),
     })
     .await?;
@@ -681,11 +697,11 @@ async fn run_connection(
             }
         }
     });
-    let prepared: Arc<Mutex<Option<Prepared>>> = Default::default();
+    let prepared: Arc<Mutex<HashMap<i32, Prepared>>> = Default::default();
     let mut incoming_artifacts = HashMap::new();
     let mut completed_artifacts = HashMap::new();
     type ActiveRun = (Uuid, Arc<AtomicBool>, Arc<AtomicBool>);
-    let active_run: Arc<Mutex<Option<ActiveRun>>> = Default::default();
+    let active_run: Arc<Mutex<HashMap<i32, ActiveRun>>> = Default::default();
     tx.send(AgentMessage {
         body: Some(agent_message::Body::Status(AgentStatus {
             active_run_id: String::new(),
@@ -698,6 +714,8 @@ async fn run_connection(
     while let Some(cmd) = commands.next().await {
         match cmd?.body {
             Some(control_message::Body::Prepare(p)) => {
+                let endpoint_role =
+                    Role::from_proto(p.endpoint_role).context("invalid endpoint role")?;
                 if command_seen(&completed_commands, &p.command_id) {
                     send_ack(&tx, &p.command_id, &p.run_id, "prepare", true, "").await?;
                     continue;
@@ -705,8 +723,19 @@ async fn run_connection(
                 if !incoming_artifacts.is_empty() {
                     bail!("PrepareRun arrived before artifact transfer completed");
                 }
-                let scenario: Scenario =
+                let mut scenario: Scenario =
                     serde_json::from_str::<Scenario>(&p.scenario_json)?.migrate();
+                scenario.runtime_target_addr =
+                    (!p.target_addr.is_empty()).then_some(p.target_addr.clone());
+                scenario.runtime_interface =
+                    (!p.interface_name.is_empty()).then_some(p.interface_name.clone());
+                scenario.runtime_namespace =
+                    (!p.namespace.is_empty()).then_some(p.namespace.clone());
+                scenario.runtime_source_ips = p
+                    .source_ips
+                    .iter()
+                    .map(|value| value.parse())
+                    .collect::<Result<Vec<_>, _>>()?;
                 scenario.validate()?;
                 let payloads = Arc::new(PreparedPayloads::new(&scenario, &completed_artifacts)?);
                 let replay = if scenario.payload_mode == PayloadMode::CaptureReplay {
@@ -721,19 +750,20 @@ async fn run_connection(
                         })
                         .with_context(|| format!("capture artifact {id} was not transferred"))?;
                     let bytes = tokio::fs::read(path).await?;
-                    let replay = ReplayPlan::from_capture(&bytes, &scenario, role)?;
-                    tokio::fs::remove_file(path).await?;
+                    let replay = ReplayPlan::from_capture(&bytes, &scenario, endpoint_role)?;
                     Some(Arc::new(replay))
                 } else {
                     None
                 };
-                completed_artifacts.clear();
-                *prepared.lock().await = Some(Prepared {
-                    run_id: Uuid::parse_str(&p.run_id)?,
-                    scenario,
-                    payloads,
-                    replay,
-                });
+                prepared.lock().await.insert(
+                    p.endpoint_role,
+                    Prepared {
+                        run_id: Uuid::parse_str(&p.run_id)?,
+                        scenario,
+                        payloads,
+                        replay,
+                    },
+                );
                 info!(run=%p.run_id,"prepared");
                 remember_command(&mut completed_commands, &mut command_order, &p.command_id);
                 send_ack(&tx, &p.command_id, &p.run_id, "prepare", true, "").await?;
@@ -743,11 +773,13 @@ async fn run_connection(
                     .await?;
             }
             Some(control_message::Body::Start(s)) => {
+                let endpoint_role =
+                    Role::from_proto(s.endpoint_role).context("invalid endpoint role")?;
                 if command_seen(&completed_commands, &s.command_id) {
                     send_ack(&tx, &s.command_id, &s.run_id, "start", true, "").await?;
                     continue;
                 }
-                let Some(job) = prepared.lock().await.clone() else {
+                let Some(job) = prepared.lock().await.get(&s.endpoint_role).cloned() else {
                     send_ack(
                         &tx,
                         &s.command_id,
@@ -761,8 +793,9 @@ async fn run_connection(
                 };
                 let mut active = active_run.lock().await;
                 if active
-                    .as_ref()
-                    .is_some_and(|(_, running, _)| running.load(Ordering::SeqCst))
+                    .values()
+                    .any(|(_, running, _)| running.load(Ordering::SeqCst))
+                    && active.contains_key(&s.endpoint_role)
                 {
                     send_ack(
                         &tx,
@@ -777,7 +810,10 @@ async fn run_connection(
                 }
                 let running = Arc::new(AtomicBool::new(true));
                 let paused = Arc::new(AtomicBool::new(false));
-                *active = Some((job.run_id, running.clone(), paused.clone()));
+                active.insert(
+                    s.endpoint_role,
+                    (job.run_id, running.clone(), paused.clone()),
+                );
                 drop(active);
                 remember_command(&mut completed_commands, &mut command_order, &s.command_id);
                 send_ack(&tx, &s.command_id, &s.run_id, "start", true, "").await?;
@@ -785,10 +821,18 @@ async fn run_connection(
                 tokio::spawn(async move {
                     let delay = (s.start_unix_ms - Utc::now().timestamp_millis()).max(0) as u64;
                     tokio::time::sleep(Duration::from_millis(delay)).await;
-                    let result =
-                        run_job(job.clone(), role, tx2.clone(), running.clone(), paused).await;
+                    let result = run_job_isolated(
+                        job.clone(),
+                        endpoint_role,
+                        tx2.clone(),
+                        running.clone(),
+                        paused,
+                    )
+                    .await;
                     if let Err(e) = result {
-                        let _ = send_event(&tx2, job.run_id, "error", &e.to_string()).await;
+                        let _ =
+                            send_event(&tx2, job.run_id, endpoint_role, "error", &e.to_string())
+                                .await;
                     }
                     running.store(false, Ordering::SeqCst);
                 });
@@ -798,12 +842,18 @@ async fn run_connection(
                     send_ack(&tx, &command.command_id, &command.run_id, "stop", true, "").await?;
                     continue;
                 }
-                if let Ok(run_id) = Uuid::parse_str(&command.run_id)
-                    && let Some((active_id, running, paused)) = active_run.lock().await.as_ref()
-                    && *active_id == run_id
-                {
-                    running.store(false, Ordering::SeqCst);
-                    paused.store(false, Ordering::SeqCst);
+                if let Ok(run_id) = Uuid::parse_str(&command.run_id) {
+                    for (endpoint_role, (active_id, running, paused)) in
+                        active_run.lock().await.iter()
+                    {
+                        if *active_id == run_id
+                            && (command.endpoint_role == 0
+                                || command.endpoint_role == *endpoint_role)
+                        {
+                            running.store(false, Ordering::SeqCst);
+                            paused.store(false, Ordering::SeqCst);
+                        }
+                    }
                 }
                 remember_command(
                     &mut completed_commands,
@@ -817,12 +867,18 @@ async fn run_connection(
                     send_ack(&tx, &command.command_id, &command.run_id, "pause", true, "").await?;
                     continue;
                 }
-                if let Ok(run_id) = Uuid::parse_str(&command.run_id)
-                    && let Some((active_id, running, paused)) = active_run.lock().await.as_ref()
-                    && *active_id == run_id
-                    && running.load(Ordering::SeqCst)
-                {
-                    paused.store(command.paused, Ordering::SeqCst);
+                if let Ok(run_id) = Uuid::parse_str(&command.run_id) {
+                    for (endpoint_role, (active_id, running, paused)) in
+                        active_run.lock().await.iter()
+                    {
+                        if *active_id == run_id
+                            && (command.endpoint_role == 0
+                                || command.endpoint_role == *endpoint_role)
+                            && running.load(Ordering::SeqCst)
+                        {
+                            paused.store(command.paused, Ordering::SeqCst);
+                        }
+                    }
                 }
                 remember_command(
                     &mut completed_commands,
@@ -830,6 +886,71 @@ async fn run_connection(
                     &command.command_id,
                 );
                 send_ack(&tx, &command.command_id, &command.run_id, "pause", true, "").await?;
+            }
+            Some(control_message::Body::Network(command)) => {
+                let mut detail = serde_json::Value::Null;
+                let outcome = match command.action.as_str() {
+                    "plan" => {
+                        let value: serde_json::Value = serde_json::from_str(&command.payload_json)?;
+                        let draft: proxy_tester_domain::NetworkProfileDraft =
+                            serde_json::from_value(value["draft"].clone())?;
+                        let revision = value["profile_revision_id"]
+                            .as_str()
+                            .context("profile_revision_id")?;
+                        let inventory = network.inventory().await?;
+                        match network.plan(id, revision, &draft, &inventory) {
+                            Ok(plan) => {
+                                detail = serde_json::to_value(plan)?;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    "stage" => {
+                        let plan: NetworkPlan = serde_json::from_str(&command.payload_json)?;
+                        let result = network
+                            .apply(&command.operation_id, &plan, command.lease_expires_unix_ms)
+                            .await;
+                        if result.is_ok() {
+                            let manager = network.clone();
+                            let operation = command.operation_id.clone();
+                            let expires = command.lease_expires_unix_ms;
+                            tokio::spawn(async move {
+                                manager.enforce_lease(operation, expires).await;
+                            });
+                        }
+                        result
+                    }
+                    "commit" => network.commit().await,
+                    "rollback" | "teardown" => network.recover().await,
+                    "reconcile" => network.recover().await,
+                    action => Err(anyhow::anyhow!("unknown network action {action}")),
+                };
+                let (ok, error) = match outcome {
+                    Ok(()) => (true, String::new()),
+                    Err(error) => (false, error.to_string()),
+                };
+                tx.send(AgentMessage {
+                    body: Some(agent_message::Body::NetworkProgress(
+                        proxy_tester_proto::v1::NetworkProgress {
+                            command_id: command.command_id.clone(),
+                            operation_id: command.operation_id.clone(),
+                            stage: command.action.clone(),
+                            status: if ok {
+                                "completed".into()
+                            } else {
+                                "failed".into()
+                            },
+                            detail_json: if ok {
+                                detail.to_string()
+                            } else {
+                                serde_json::json!({"error":error}).to_string()
+                            },
+                        },
+                    )),
+                })
+                .await?;
+                send_ack(&tx, &command.command_id, "", &command.action, ok, &error).await?;
             }
             None => {}
         }
@@ -887,13 +1008,20 @@ async fn run_job(
 ) -> anyhow::Result<()> {
     let counters = Arc::new(Counters::default());
     let started = Instant::now();
-    let interface_task: Option<tokio::task::JoinHandle<()>> = None;
+    let interface_task = job.scenario.runtime_interface.clone().map(|interface| {
+        tokio::spawn(monitor_interfaces(
+            vec![interface],
+            counters.clone(),
+            running.clone(),
+        ))
+    });
     let metric_task = tokio::spawn(report_metrics(
         job.run_id,
         counters.clone(),
         tx.clone(),
         running.clone(),
         started,
+        role,
         random_payload_hashes(&job.scenario, &job.payloads, role),
     ));
     let result = match role {
@@ -929,9 +1057,52 @@ async fn run_job(
         // Give both endpoints one telemetry interval to flush final counters before
         // control marks the run complete after receiving both completion reports.
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        send_event(&tx, job.run_id, "info", "run_completed").await?;
+        send_event(&tx, job.run_id, role, "info", "run_completed").await?;
     }
     result
+}
+
+async fn run_job_isolated(
+    job: Prepared,
+    role: Role,
+    tx: mpsc::Sender<AgentMessage>,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let Some(namespace) = job
+        .scenario
+        .runtime_namespace
+        .clone()
+        .filter(|v| !v.is_empty())
+    else {
+        return run_job(job, role, tx, running, paused).await;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name(format!("endpoint-{namespace}"))
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<()> {
+                    use std::os::fd::AsRawFd;
+                    let namespace = std::fs::File::open(format!("/var/run/netns/{namespace}"))?;
+                    if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(run_job(job, role, tx, running, paused))
+                })();
+                let _ = result_tx.send(result);
+            })?;
+        return result_rx.await.context("endpoint worker exited")?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = namespace;
+        run_job(job, role, tx, running, paused).await
+    }
 }
 
 async fn report_metrics(
@@ -940,6 +1111,7 @@ async fn report_metrics(
     tx: mpsc::Sender<AgentMessage>,
     running: Arc<AtomicBool>,
     started: Instant,
+    role: Role,
     random_payload_hashes: (Option<String>, Option<String>),
 ) {
     let mut prev_est = 0;
@@ -1053,6 +1225,7 @@ async fn report_metrics(
                 body: Some(agent_message::Body::Telemetry(Telemetry {
                     run_id: run_id.to_string(),
                     metrics_json: serde_json::to_string(&m).unwrap(),
+                    endpoint_role: role.proto(),
                 })),
             })
             .await
@@ -1272,7 +1445,7 @@ async fn execute_connection(
     desired_clients: &AtomicU32,
     worker_index: u32,
 ) {
-    c.attempted.fetch_add(1, Ordering::Relaxed);
+    let connection_index = c.attempted.fetch_add(1, Ordering::Relaxed);
     let gate = WorkerGate {
         running,
         paused,
@@ -1284,7 +1457,7 @@ async fn execute_connection(
         let index = next_flow.fetch_add(1, Ordering::Relaxed) as usize % plan.flows.len();
         plan.flows[index].clone()
     });
-    match transact(sc, payloads, flow.as_deref(), c, &gate).await {
+    match transact(sc, payloads, flow.as_deref(), c, &gate, connection_index).await {
         Ok(()) => {}
         Err(error) => {
             c.failed.fetch_add(1, Ordering::Relaxed);
@@ -1300,13 +1473,37 @@ async fn transact(
     replay_turns: Option<&[ReplayTurn]>,
     c: &Counters,
     gate: &WorkerGate<'_>,
+    connection_index: u64,
 ) -> anyhow::Result<()> {
     let target_addr = sc.target_addr();
     let connect_addr = sc.proxy_addr().unwrap_or(&target_addr);
     let connect_started = Instant::now();
+    let connect_future = async {
+        let remote = tokio::net::lookup_host(connect_addr)
+            .await?
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "target address did not resolve",
+                )
+            })?;
+        let socket = if remote.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        if let Some(ip) = sc
+            .runtime_source_ips
+            .get(connection_index as usize % sc.runtime_source_ips.len().max(1))
+        {
+            socket.bind(SocketAddr::new(*ip, 0))?;
+        }
+        socket.connect(remote).await
+    };
     let mut tcp_stream = tokio::time::timeout(
         Duration::from_millis(sc.timeouts.connect_ms),
-        TcpStream::connect(connect_addr),
+        connect_future,
     )
     .await?
     .context("TCP connect failed")?;
@@ -2292,6 +2489,7 @@ mod tests {
 async fn send_event(
     tx: &mpsc::Sender<AgentMessage>,
     run_id: Uuid,
+    role: Role,
     level: &str,
     message: &str,
 ) -> anyhow::Result<()> {
@@ -2300,6 +2498,7 @@ async fn send_event(
             run_id: run_id.to_string(),
             level: level.into(),
             message: message.into(),
+            endpoint_role: role.proto(),
         })),
     })
     .await?;

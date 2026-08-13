@@ -21,20 +21,26 @@ services:
     restart: unless-stopped
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
-      PROXY_TESTER_AGENT_ID: client-1
+      PROXY_TESTER_NODE_ID: client-1
       PROXY_TESTER_ROLE: client
       RUST_LOG: proxy_agent=info
     depends_on: [control]
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes: [client-network-state:/var/lib/proxy-tester]
 
   server:
     image: ${PROXY_TESTER_AGENT_IMAGE:-proxy-tester-agent:local}
     restart: unless-stopped
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
-      PROXY_TESTER_AGENT_ID: server-1
+      PROXY_TESTER_NODE_ID: server-1
       PROXY_TESTER_ROLE: server
       RUST_LOG: proxy_agent=info
     depends_on: [control]
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes: [server-network-state:/var/lib/proxy-tester]
 
 volumes:
   proxy-data: {}
+  client-network-state: {}
+  server-network-state: {}

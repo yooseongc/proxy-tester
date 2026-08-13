@@ -1,4 +1,4 @@
-export type Agent={id:string;role:number;hostname:string;interfaces:string[];online:boolean};
+export type Agent={id:string;role:number;hostname:string;interfaces:string[];online:boolean;inventory?:{interfaces?:{name:string;mac?:string;mtu?:number;state?:string;addresses?:string[]}[];protected_interfaces?:string[];fingerprint?:string}};
 
 export type Metrics={
  unix_ms:number;elapsed_ms:number;bytes_tx:number;bytes_rx:number;
