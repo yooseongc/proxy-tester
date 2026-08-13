@@ -507,9 +507,9 @@ function App() {
                   title="1. 프로토콜"
                   description="구성 이름과 생성할 애플리케이션 프로토콜을 선택합니다."
                 >
-                  <Field label="구성 이름">
+                  <Field label="트래픽 구성 이름">
                     <input
-                      aria-label="구성 이름"
+                      aria-label="트래픽 구성 이름"
                       value={scenario.name}
                       onChange={(e) => patch({ name: e.target.value })}
                     />
