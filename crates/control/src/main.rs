@@ -2045,6 +2045,27 @@ impl AgentControl for ControlSvc {
                         .bind(&e.message)
                         .execute(&state.db)
                         .await;
+                        if e.level == "error"
+                            && let Ok(run_id) = Uuid::parse_str(&e.run_id)
+                            && *state.active_run.lock().await == Some(run_id)
+                        {
+                            let peers: Vec<_> =
+                                state.agents.read().await.values().cloned().collect();
+                            for peer in peers {
+                                let _ = peer
+                                    .tx
+                                    .send(Ok(ControlMessage {
+                                        body: Some(control_message::Body::Stop(StopRun {
+                                            run_id: run_id.to_string(),
+                                            command_id: Uuid::new_v4().to_string(),
+                                            endpoint_role: 0,
+                                        })),
+                                    }))
+                                    .await;
+                            }
+                            let reason = format!("endpoint_worker_failed: {}", e.message);
+                            let _ = finish_run(&state, run_id, "failed", Some(&reason)).await;
+                        }
                         if e.message == "run_completed"
                             && let Ok(run_id) = Uuid::parse_str(&e.run_id)
                             && *state.active_run.lock().await == Some(run_id)
