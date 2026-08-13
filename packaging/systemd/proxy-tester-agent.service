@@ -10,6 +10,9 @@ ExecStart=/usr/local/bin/proxy-agent
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+ReadWritePaths=/var/lib/proxy-tester /run/netns
 LimitNOFILE=1048576
 
 [Install]

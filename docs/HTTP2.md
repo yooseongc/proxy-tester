@@ -1,6 +1,6 @@
 # HTTP/2 시험과 Capture 재현
 
-HTTP/2는 Scenario v3의 `protocol=http2`로 선택한다. h2c와 HTTP Upgrade는 지원하지 않으며 TLS가 필수다. 직접 연결은 대상에 TLS+ALPN `h2`로 연결하고, 명시적 proxy에서는 HTTP/1.1 CONNECT tunnel을 만든 뒤 같은 방식으로 협상한다.
+HTTP/2는 Scenario v4의 `protocol=http2`로 선택한다. h2c와 HTTP Upgrade는 지원하지 않으며 TLS가 필수다. 직접 연결은 대상에 TLS+ALPN `h2`로 연결하고, 명시적 proxy에서는 HTTP/1.1 CONNECT tunnel을 만든 뒤 같은 방식으로 협상한다.
 
 `http2.max_concurrent_streams`는 VU별 연결 하나에서 동시에 실행할 stream 상한이며 기본값은 100, 범위는 1–1000이다. 실제 동시성은 peer SETTINGS 제한을 함께 따른다. request/response payload는 DATA frame으로 flow-control capacity에 맞춰 보내며 완료된 response stream을 TPS와 HTTP latency로 집계한다.
 

@@ -140,6 +140,7 @@ impl ActiveWindow {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Counters {
     fn default() -> Self {
         Self {
@@ -416,8 +417,8 @@ struct PreparedPayloads {
 impl PreparedPayloads {
     fn new(sc: &Scenario, artifacts: &HashMap<Uuid, CompletedArtifact>) -> anyhow::Result<Self> {
         Ok(Self {
-            request: materialize(&sc.request_payload(), artifacts)?,
-            response: materialize(&sc.response_payload(), artifacts)?,
+            request: materialize(&sc.request_payload, artifacts)?,
+            response: materialize(&sc.response_payload, artifacts)?,
         })
     }
 }
@@ -469,6 +470,7 @@ enum CompletedArtifact {
     Capture(std::path::PathBuf),
 }
 
+#[allow(clippy::map_entry)]
 async fn accept_artifact_chunk(
     incoming: &mut HashMap<Uuid, IncomingArtifact>,
     completed: &mut HashMap<Uuid, CompletedArtifact>,
@@ -723,8 +725,7 @@ async fn run_connection(
                 if !incoming_artifacts.is_empty() {
                     bail!("PrepareRun arrived before artifact transfer completed");
                 }
-                let mut scenario: Scenario =
-                    serde_json::from_str::<Scenario>(&p.scenario_json)?.migrate();
+                let mut scenario: Scenario = serde_json::from_str(&p.scenario_json)?;
                 scenario.runtime_target_addr =
                     (!p.target_addr.is_empty()).then_some(p.target_addr.clone());
                 scenario.runtime_interface =
@@ -1241,10 +1242,9 @@ fn random_payload_hashes(
     payloads: &PreparedPayloads,
     role: Role,
 ) -> (Option<String>, Option<String>) {
-    let request = (role == Role::Client && scenario.request_payload().kind == PayloadKind::Random)
+    let request = (role == Role::Client && scenario.request_payload.kind == PayloadKind::Random)
         .then(|| format!("{:x}", Sha256::digest(&payloads.request)));
-    let response = (role == Role::Server
-        && scenario.response_payload().kind == PayloadKind::Random)
+    let response = (role == Role::Server && scenario.response_payload.kind == PayloadKind::Random)
         .then(|| format!("{:x}", Sha256::digest(&payloads.response)));
     (request, response)
 }
@@ -1433,6 +1433,7 @@ async fn run_client_concurrency(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_connection(
     sc: &Scenario,
     payloads: &PreparedPayloads,
@@ -1832,7 +1833,7 @@ async fn http2_transactions(
     let mut builder = h2::client::Builder::new();
     builder.initial_max_send_streams(sc.http2.max_concurrent_streams as usize);
     let (sender, connection) = builder.handshake(stream).await?;
-    let driver = tokio::spawn(async move { connection.await });
+    let driver = tokio::spawn(connection);
     let maximum = sc.request.transactions_per_connection as u64;
     let concurrency = sc.http2.max_concurrent_streams as usize;
     let mut launched = 0_u64;
@@ -2229,6 +2230,7 @@ async fn read_exact_count(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default, clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use proxy_tester_proto::v1::ArtifactChunk;

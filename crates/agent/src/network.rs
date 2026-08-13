@@ -617,10 +617,7 @@ mod tests {
             plan.rollback_commands[2].args,
             ["netns", "del", "pt-12345678-client"]
         );
-        assert_eq!(
-            parse_offloads("rx-checksumming: on\ngeneric-receive-offload: off\n")["rx"],
-            true
-        );
+        assert!(parse_offloads("rx-checksumming: on\ngeneric-receive-offload: off\n")["rx"]);
         inventory.protected_interfaces.push("eth1".into());
         assert!(
             manager

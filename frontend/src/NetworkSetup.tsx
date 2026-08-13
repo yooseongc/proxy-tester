@@ -25,7 +25,7 @@ export function NetworkSetup({agents,onPrepared}:{agents:Agent[];onPrepared:(rev
   <SectionTitle eyebrow="NETWORK PROFILE" title="시험 네트워크 구성" aside={<StatusBadge tone={revision?"live":"neutral"}>{message}</StatusBadge>} />
   <p className="mb-4 text-xs text-dim">관리 인터페이스는 보호됩니다. 적용 전 실제 명령과 롤백 계획을 검토하고, 준비된 revision만 시험에 고정됩니다.</p>
   <div className="grid gap-3 md:grid-cols-2">
-   <Field label="구성 이름"><input value={draft.name} disabled={!!revision} onChange={e=>setDraft(d=>({...d,name:e.target.value}))}/></Field>
+   <Field label="네트워크 구성 이름"><input value={draft.name} disabled={!!revision} onChange={e=>setDraft(d=>({...d,name:e.target.value}))}/></Field>
    <Field label="MTU"><input type="number" min={576} max={9216} value={draft.mtu} disabled={!!revision} onChange={e=>setDraft(d=>({...d,mtu:Number(e.target.value)}))}/></Field>
    {(["client_endpoint","server_endpoint"] as const).map((side)=><div key={side} className="rounded-xl border border-line p-3">
     <strong className="mb-3 block text-xs">{side==="client_endpoint"?"Client endpoint":"Server endpoint"}</strong>

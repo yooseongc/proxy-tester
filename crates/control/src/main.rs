@@ -630,7 +630,7 @@ async fn apply_network_profile(
                 )
                 .await;
             }
-            sqlx::query("UPDATE network_operations SET status='failed',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"error":error.1,"plans":plans}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation_id.to_string()).execute(&s.db).await?;
+            sqlx::query("UPDATE network_operations SET status='failed',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"error":error.message,"plans":plans}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation_id.to_string()).execute(&s.db).await?;
             return Err(error);
         }
         staged.push(node.clone());
@@ -697,7 +697,7 @@ async fn teardown_network_profile(
         )
         .await
         {
-            sqlx::query("UPDATE network_operations SET status='quarantined',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"node":node,"error":error.1}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation.to_string()).execute(&s.db).await?;
+            sqlx::query("UPDATE network_operations SET status='quarantined',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"node":node,"error":error.message}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation.to_string()).execute(&s.db).await?;
             return Err(error);
         }
     }
@@ -874,7 +874,6 @@ async fn agents(State(s): State<AppState>) -> Json<Vec<AgentView>> {
 }
 
 async fn validate_scenario(Json(sc): Json<Scenario>) -> Result<Json<serde_json::Value>, ApiError> {
-    let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     Ok(Json(serde_json::json!({"valid":true})))
 }
@@ -882,7 +881,6 @@ async fn preflight(
     State(s): State<AppState>,
     Json(sc): Json<Scenario>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     validate_payload_artifacts(&s.db, &sc).await?;
     validate_capture_artifact(&s.db, &sc).await?;
@@ -1221,7 +1219,6 @@ async fn save_scenario(
     State(s): State<AppState>,
     Json(sc): Json<Scenario>,
 ) -> Result<Json<Scenario>, ApiError> {
-    let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     validate_payload_artifacts(&s.db, &sc).await?;
     validate_capture_artifact(&s.db, &sc).await?;
@@ -1237,11 +1234,7 @@ async fn list_scenarios(State(s): State<AppState>) -> Result<Json<Vec<Scenario>>
         .await?;
     Ok(Json(
         rows.into_iter()
-            .filter_map(|r| {
-                serde_json::from_str::<Scenario>(r.get("body"))
-                    .ok()
-                    .map(Scenario::migrate)
-            })
+            .filter_map(|r| serde_json::from_str::<Scenario>(r.get("body")).ok())
             .collect(),
     ))
 }
@@ -1264,9 +1257,8 @@ async fn start_run(
         StartRunPayload::Wrapped { scenario, run_name } => (scenario, run_name),
         StartRunPayload::Legacy(scenario) => (scenario, None),
     };
-    let sc = sc.migrate();
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
-    let artifact_ids: HashSet<Uuid> = [sc.request_payload(), sc.response_payload()]
+    let artifact_ids: HashSet<Uuid> = [sc.request_payload.clone(), sc.response_payload.clone()]
         .into_iter()
         .filter(|payload| payload.kind == PayloadKind::File)
         .filter_map(|payload| payload.artifact_id)
@@ -1356,7 +1348,7 @@ async fn start_run(
     if let Err(error) = preparation {
         sqlx::query("UPDATE runs SET status='failed',finished_at=?,error=? WHERE id=?")
             .bind(Utc::now().to_rfc3339())
-            .bind(&error.1)
+            .bind(&error.message)
             .bind(run_id.to_string())
             .execute(&s.db)
             .await?;
@@ -1396,7 +1388,7 @@ async fn start_run(
         }
         sqlx::query("UPDATE runs SET status='failed',finished_at=?,error=? WHERE id=?")
             .bind(Utc::now().to_rfc3339())
-            .bind(&error.1)
+            .bind(&error.message)
             .bind(run_id.to_string())
             .execute(&s.db)
             .await?;
@@ -1496,8 +1488,8 @@ const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
 
 async fn validate_payload_artifacts(db: &SqlitePool, scenario: &Scenario) -> Result<(), ApiError> {
     for (direction, payload) in [
-        ("request", scenario.request_payload()),
-        ("response", scenario.response_payload()),
+        ("request", scenario.request_payload.clone()),
+        ("response", scenario.response_payload.clone()),
     ] {
         if payload.kind != PayloadKind::File {
             continue;
@@ -1902,7 +1894,7 @@ async fn run_summary_detail(
 }
 
 fn result_payload_metadata(body: &str, samples: &[serde_json::Value]) -> serde_json::Value {
-    let Ok(scenario) = serde_json::from_str::<Scenario>(body).map(Scenario::migrate) else {
+    let Ok(scenario) = serde_json::from_str::<Scenario>(body) else {
         return serde_json::Value::Null;
     };
     if scenario.payload_mode == PayloadMode::CaptureReplay {
@@ -1938,8 +1930,8 @@ fn result_payload_metadata(body: &str, samples: &[serde_json::Value]) -> serde_j
         };
     serde_json::json!({
         "mode": "manual",
-        "request": metadata("client_to_server", scenario.request_payload(), random_hash(1, "request_random_sha256")),
-        "response": metadata("server_to_client", scenario.response_payload(), random_hash(2, "response_random_sha256"))
+        "request": metadata("client_to_server", scenario.request_payload.clone(), random_hash(1, "request_random_sha256")),
+        "response": metadata("server_to_client", scenario.response_payload.clone(), random_hash(2, "response_random_sha256"))
     })
 }
 
@@ -2179,24 +2171,48 @@ async fn schedule_disconnect_failure(state: AppState, agent_id: String) {
 }
 
 #[derive(Debug)]
-struct ApiError(StatusCode, String);
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
 impl ApiError {
     fn bad(s: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, s.into())
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_request",
+            message: s.into(),
+        }
     }
     fn conflict(s: impl Into<String>) -> Self {
-        Self(StatusCode::CONFLICT, s.into())
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: s.into(),
+        }
     }
     fn not_found(s: impl Into<String>) -> Self {
-        Self(StatusCode::NOT_FOUND, s.into())
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: s.into(),
+        }
     }
     fn internal(s: impl Into<String>) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, s.into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: s.into(),
+        }
     }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error":self.1}))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({"code":self.code,"message":self.message})),
+        )
+            .into_response()
     }
 }
 impl From<sqlx::Error> for ApiError {
@@ -2212,6 +2228,7 @@ impl From<serde_json::Error> for ApiError {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::{analyze_capture, cleanup_orphan_artifacts, migrate, result_payload_metadata};
     use chrono::Utc;
@@ -2237,17 +2254,17 @@ mod tests {
     #[test]
     fn result_payload_metadata_redacts_content_and_keeps_random_digest() {
         let mut scenario = Scenario::default();
-        scenario.request_payload = Some(PayloadProfile {
+        scenario.request_payload = PayloadProfile {
             kind: PayloadKind::Text,
             text: "DLP-비밀".into(),
             ..Default::default()
-        });
-        scenario.response_payload = Some(PayloadProfile {
+        };
+        scenario.response_payload = PayloadProfile {
             kind: PayloadKind::Random,
             size_bytes: 1024,
             random_format: RandomFormat::PrintableAscii,
             ..Default::default()
-        });
+        };
         let samples = vec![serde_json::json!({
             "role": 2,
             "metrics": {"response_random_sha256": "abc123"}

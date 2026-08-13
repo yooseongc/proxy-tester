@@ -6,13 +6,6 @@ use uuid::Uuid;
 pub const SCENARIO_VERSION: u32 = 4;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Topology {
-    ExplicitProxy,
-    TransparentProxy,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScenarioPath {
@@ -96,11 +89,10 @@ pub enum Protocol {
     Tcp,
     Http1,
     Http2,
-    Connect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub version: u32,
     pub id: Uuid,
@@ -109,14 +101,12 @@ pub struct Scenario {
     pub protocol: Protocol,
     pub virtual_clients: u32,
     pub duration_secs: u64,
-    pub warmup_secs: u64,
     pub load_stages: Vec<LoadStage>,
     pub request: HttpRequestProfile,
     pub http2: Http2Profile,
     pub tcp: TcpPayloadProfile,
-    /// Scenario v2 payloads. `None` is retained solely for v1 JSON migration.
-    pub request_payload: Option<PayloadProfile>,
-    pub response_payload: Option<PayloadProfile>,
+    pub request_payload: PayloadProfile,
+    pub response_payload: PayloadProfile,
     pub payload_mode: PayloadMode,
     pub capture_artifact_id: Option<Uuid>,
     pub tls: TlsProfile,
@@ -141,13 +131,12 @@ impl Default for Scenario {
             protocol: Protocol::Tcp,
             virtual_clients: 1,
             duration_secs: 10,
-            warmup_secs: 0,
             load_stages: vec![],
             request: HttpRequestProfile::default(),
             http2: Http2Profile::default(),
             tcp: TcpPayloadProfile::default(),
-            request_payload: Some(PayloadProfile::fixed(64)),
-            response_payload: Some(PayloadProfile::fixed(64)),
+            request_payload: PayloadProfile::fixed(64),
+            response_payload: PayloadProfile::fixed(64),
             payload_mode: PayloadMode::Manual,
             capture_artifact_id: None,
             tls: TlsProfile::default(),
@@ -388,10 +377,6 @@ pub enum ValidationError {
 }
 
 impl Scenario {
-    pub fn migrate(self) -> Self {
-        self
-    }
-
     pub fn is_explicit_proxy(&self) -> bool {
         matches!(self.path, ScenarioPath::ExplicitProxy { .. })
     }
@@ -433,28 +418,6 @@ impl Scenario {
         }
     }
 
-    pub fn request_payload(&self) -> PayloadProfile {
-        self.request_payload.clone().unwrap_or_else(|| {
-            PayloadProfile::fixed(
-                if matches!(self.protocol, Protocol::Http1 | Protocol::Http2) {
-                    self.request.request_body_bytes
-                } else {
-                    self.tcp.tx_bytes
-                },
-            )
-        })
-    }
-    pub fn response_payload(&self) -> PayloadProfile {
-        self.response_payload.clone().unwrap_or_else(|| {
-            PayloadProfile::fixed(
-                if matches!(self.protocol, Protocol::Http1 | Protocol::Http2) {
-                    self.request.response_body_bytes
-                } else {
-                    self.tcp.rx_bytes
-                },
-            )
-        })
-    }
     pub fn effective_duration_secs(&self) -> u64 {
         if self.load_stages.is_empty() {
             self.duration_secs
@@ -522,8 +485,8 @@ impl Scenario {
             ));
         }
         for (direction, payload) in [
-            ("request", self.request_payload()),
-            ("response", self.response_payload()),
+            ("request", self.request_payload.clone()),
+            ("response", self.response_payload.clone()),
         ] {
             if payload.byte_len() > MAX_PAYLOAD_BYTES {
                 return Err(ValidationError::Invalid(format!(
@@ -601,16 +564,6 @@ impl Scenario {
                     "TLS 인증서 검증을 사용하려면 CA PEM이 필요합니다".into(),
                 ));
             }
-        }
-        if self.warmup_secs > 0 {
-            return Err(ValidationError::Invalid(
-                "warmup 구간은 아직 구현되지 않았습니다".into(),
-            ));
-        }
-        if self.protocol == Protocol::Connect {
-            return Err(ValidationError::Invalid(
-                "CONNECT는 시험 프로토콜이 아닙니다. explicit proxy와 TCP를 선택하세요".into(),
-            ));
         }
         if self.protocol == Protocol::Http2 {
             if !self.tls.enabled {
@@ -829,11 +782,23 @@ pub struct MetricsSnapshot {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     #[test]
     fn default_is_valid() {
         assert!(Scenario::default().validate().is_ok());
+    }
+
+    #[test]
+    fn scenario_v4_rejects_legacy_and_missing_payload_fields() {
+        let json = serde_json::to_value(Scenario::default()).unwrap();
+        let mut legacy = json.clone();
+        legacy["topology"] = serde_json::json!("transparent_proxy");
+        assert!(serde_json::from_value::<Scenario>(legacy).is_err());
+        let mut missing = json;
+        missing.as_object_mut().unwrap().remove("request_payload");
+        assert!(serde_json::from_value::<Scenario>(missing).is_err());
     }
 
     #[test]
@@ -881,13 +846,13 @@ mod tests {
     #[test]
     fn text_uses_utf8_length_and_payload_limit_is_enforced() {
         let mut scenario = Scenario::default();
-        scenario.request_payload = Some(PayloadProfile {
+        scenario.request_payload = PayloadProfile {
             kind: PayloadKind::Text,
             text: "가".into(),
             ..Default::default()
-        });
-        assert_eq!(scenario.request_payload().byte_len(), 3);
-        scenario.response_payload = Some(PayloadProfile::fixed(MAX_PAYLOAD_BYTES + 1));
+        };
+        assert_eq!(scenario.request_payload.byte_len(), 3);
+        scenario.response_payload = PayloadProfile::fixed(MAX_PAYLOAD_BYTES + 1);
         assert!(
             scenario
                 .validate()
@@ -940,18 +905,6 @@ mod tests {
         let mut scenario = Scenario::default();
         scenario.tls.enabled = true;
         assert!(scenario.validate().unwrap_err().to_string().contains("TLS"));
-
-        let scenario = Scenario {
-            warmup_secs: 1,
-            ..Scenario::default()
-        };
-        assert!(
-            scenario
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("warmup")
-        );
     }
 
     #[test]

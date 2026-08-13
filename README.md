@@ -77,9 +77,7 @@ HTTP/2는 TLS+ALPN `h2` 전용이며 직접 연결과 HTTP CONNECT를 지원한�
 - observation interface를 지정하면 client/server Linux NIC의 wire B/W, PPS와 TCP retransmission을 별도로 저장합니다.
 - 시험 이력에서 최대 2개 run을 비교하고 원본 sample을 CSV 또는 JSON으로 내보낼 수 있습니다.
 
-## 현재 제한사항
-
-- warmup 구간과 source IP binding은 아직 구현되지 않았으며 설정 시 validation error를 반환합니다.
+Scenario 입력은 v4만 지원하며 이전 버전과 legacy topology 필드는 거부합니다. 자세한 계약은 [Scenario v4](docs/SCENARIO_V4.md)를 참고하십시오.
 
 ## UI 테마와 다단계 부하
 

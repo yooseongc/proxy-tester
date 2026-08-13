@@ -336,8 +336,8 @@ function App() {
     if(kind==="cps")Object.assign(next,{name:"TCP CPS",virtual_clients:1000});
     if(kind==="http1")Object.assign(next,{name:"HTTP/1.1 TPS",protocol:"http1"});
     if(kind==="http2")Object.assign(next,{name:"HTTP/2 Multiplex TPS",protocol:"http2",tls:{...next.tls,enabled:true}});
-    if(kind==="bandwidth")Object.assign(next,{name:"양방향 B/W",request_payload:{...next.request_payload!,size_bytes:1024*1024},response_payload:{...next.response_payload!,size_bytes:1024*1024}});
-    if(kind==="dlp")Object.assign(next,{name:"DLP 양방향 문자열",request_payload:{...next.request_payload!,kind:"text",text:"DLP request sentinel"},response_payload:{...next.response_payload!,kind:"text",text:"DLP response sentinel"}});
+    if(kind==="bandwidth")Object.assign(next,{name:"양방향 B/W",request_payload:{...next.request_payload,size_bytes:1024*1024},response_payload:{...next.response_payload,size_bytes:1024*1024}});
+    if(kind==="dlp")Object.assign(next,{name:"DLP 양방향 문자열",request_payload:{...next.request_payload,kind:"text",text:"DLP request sentinel"},response_payload:{...next.response_payload,kind:"text",text:"DLP response sentinel"}});
     if(kind==="pcap")Object.assign(next,{name:"PCAP 세션 재현",payload_mode:"capture_replay"});
     setScenario(next);
   };
@@ -517,11 +517,7 @@ function App() {
                   <div className="grid gap-3 sm:grid-cols-2">
                     <Field label="시험 프로토콜">
                       <select
-                        value={
-                          scenario.protocol === "connect"
-                            ? "tcp"
-                            : scenario.protocol
-                        }
+                        value={scenario.protocol}
                         onChange={(e) => {
                           const protocol=e.target.value as Scenario["protocol"];
                           patch({protocol,tls:protocol==="http2"?{...scenario.tls,enabled:true}:scenario.tls});
@@ -576,7 +572,7 @@ function App() {
                     <div className="grid gap-3 sm:grid-cols-2">
                       <PayloadEditor
                         label="요청 · Client → Server"
-                        value={scenario.request_payload!}
+                        value={scenario.request_payload}
                         artifacts={artifacts}
                         uploading={uploading}
                         onUpload={uploadPayload}
@@ -586,7 +582,7 @@ function App() {
                       />
                       <PayloadEditor
                         label="응답 · Server → Client"
-                        value={scenario.response_payload!}
+                        value={scenario.response_payload}
                         artifacts={artifacts}
                         uploading={uploading}
                         onUpload={uploadPayload}

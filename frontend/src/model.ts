@@ -70,13 +70,13 @@ export function recentActiveMaximum(points:Point[],windowMs=60_000){
 
 export type Scenario={
  version:number;id:string;name:string;path:ScenarioPath;
- protocol:'tcp'|'http1'|'http2'|'connect';virtual_clients:number;
- duration_secs:number;warmup_secs:number;
+ protocol:'tcp'|'http1'|'http2';virtual_clients:number;
+ duration_secs:number;
  load_stages:LoadStage[];
  request:{method:string;path:string;host:string;request_body_bytes:number;response_body_bytes:number;keep_alive:boolean;transactions_per_connection:number;think_time_ms:number};
  http2:{max_concurrent_streams:number};
  tcp:{tx_bytes:number;rx_bytes:number};
- payload_mode:'manual'|'capture_replay';capture_artifact_id:string|null;request_payload:PayloadProfile|null;response_payload:PayloadProfile|null;
+ payload_mode:'manual'|'capture_replay';capture_artifact_id:string|null;request_payload:PayloadProfile;response_payload:PayloadProfile;
  tls:{enabled:boolean;verify_peer:boolean;version:'tls12'|'tls13';cipher_suite:string|null;server_name:string;ca_pem:string|null;server_cert_pem:string|null;server_key_pem:string|null};
  timeouts:{connect_ms:number;proxy_connect_ms:number;response_ms:number};
 };
@@ -87,7 +87,7 @@ export type LoadStage={name:string;mode:'ramp'|'hold';duration_secs:number;targe
 
 export const initialScenario=():Scenario=>({
  version:4,id:crypto.randomUUID(),name:'기본 TCP 시험',path:{kind:'managed_direct',profile_revision_id:'00000000-0000-0000-0000-000000000000',server_port:8080},protocol:'tcp',
- virtual_clients:100,duration_secs:50,warmup_secs:0,
+ virtual_clients:100,duration_secs:50,
  load_stages:[
   {name:'Ramp-up',mode:'ramp',duration_secs:10,target_virtual_clients:100,include_in_results:false},
   {name:'Steady state',mode:'hold',duration_secs:30,target_virtual_clients:100,include_in_results:true},
