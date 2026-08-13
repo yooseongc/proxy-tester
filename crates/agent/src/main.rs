@@ -201,7 +201,10 @@ impl Counters {
 
     fn connection_opened(&self) -> ActiveConnection<'_> {
         let now = Instant::now();
-        let mut active = self.active.lock().unwrap();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         active.account_until(now);
         active.current += 1;
         active.min = active.min.min(active.current);
@@ -211,7 +214,10 @@ impl Counters {
 
     fn active_snapshot(&self) -> (u64, f64, u64, u64) {
         let now = Instant::now();
-        let mut active = self.active.lock().unwrap();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         active.account_until(now);
         let elapsed = now
             .saturating_duration_since(active.window_started)
@@ -234,7 +240,11 @@ impl Counters {
 impl Drop for ActiveConnection<'_> {
     fn drop(&mut self) {
         let now = Instant::now();
-        let mut active = self.0.active.lock().unwrap();
+        let mut active = self
+            .0
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         active.account_until(now);
         active.current = active.current.saturating_sub(1);
         active.min = active.min.min(active.current);
@@ -1222,11 +1232,18 @@ async fn report_metrics(
         prev_wire_tx = wire_tx;
         prev_wire_rx = wire_rx;
         prev_retransmissions = retransmissions;
+        let metrics_json = match serde_json::to_string(&m) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, %run_id, "failed to serialize telemetry");
+                break;
+            }
+        };
         if tx
             .send(AgentMessage {
                 body: Some(agent_message::Body::Telemetry(Telemetry {
                     run_id: run_id.to_string(),
-                    metrics_json: serde_json::to_string(&m).unwrap(),
+                    metrics_json,
                     endpoint_role: role.proto(),
                 })),
             })
@@ -2069,11 +2086,11 @@ async fn serve_http2_connection(
                     .body(())?;
                 let mut send = respond.send_response(response, response_len == 0)?;
                 if response_len > 0 {
-                    if replay_response
+                    if let Some(body) = replay_response
                         .as_ref()
-                        .is_some_and(|body| body.len() == response_len)
+                        .filter(|body| body.len() == response_len)
                     {
-                        send_h2_body(&mut send, replay_response.as_ref().unwrap()).await?;
+                        send_h2_body(&mut send, body).await?;
                     } else if response_len == payloads.response.len() {
                         send_h2_body(&mut send, &payloads.response).await?;
                     } else {
