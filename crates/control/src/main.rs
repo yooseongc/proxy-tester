@@ -45,6 +45,8 @@ use tower_http::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+mod error;
+use error::ApiError;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -2347,63 +2349,6 @@ async fn schedule_disconnect_failure(state: AppState, agent_id: String) {
         )
         .await;
     });
-}
-
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-impl ApiError {
-    fn bad(s: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_request",
-            message: s.into(),
-        }
-    }
-    fn conflict(s: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            code: "conflict",
-            message: s.into(),
-        }
-    }
-    fn not_found(s: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            code: "not_found",
-            message: s.into(),
-        }
-    }
-    fn internal(s: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal_error",
-            message: s.into(),
-        }
-    }
-}
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({"code":self.code,"message":self.message})),
-        )
-            .into_response()
-    }
-}
-impl From<sqlx::Error> for ApiError {
-    fn from(e: sqlx::Error) -> Self {
-        error!(%e);
-        Self::internal("database error")
-    }
-}
-impl From<serde_json::Error> for ApiError {
-    fn from(e: serde_json::Error) -> Self {
-        Self::bad(e.to_string())
-    }
 }
 
 #[cfg(test)]
