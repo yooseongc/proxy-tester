@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiClientError, api } from "./api";
+import { ApiClientError, api, localizeApiMessage } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -30,8 +30,18 @@ describe("api", () => {
     await expect(api("/api/health")).rejects.toMatchObject({
       status: 0,
       code: "network_error",
-      message: "connection refused",
+      message: "서버에 연결할 수 없습니다. Control 서비스 상태를 확인해 주세요.",
     });
+  });
+
+  it("localizes known validation messages and preserves unknown details", () => {
+    expect(localizeApiMessage("managed_direct requires profile_revision_id")).toBe(
+      "직접 연결을 사용하려면 준비된 네트워크 프로파일을 선택해야 합니다.",
+    );
+    expect(localizeApiMessage("response payload exceeds 64 MiB")).toBe(
+      "응답 payload는 64MiB를 초과할 수 없습니다.",
+    );
+    expect(localizeApiMessage("agent node-a is offline")).toBe("agent node-a is offline");
   });
 
   it("adds JSON content type without discarding caller headers", async () => {
