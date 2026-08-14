@@ -17,6 +17,7 @@ import {
   Play,
   Radio,
   Save,
+  ScrollText,
   Server,
   ShieldCheck,
   Square,
@@ -58,6 +59,7 @@ import {
 } from "./ui";
 import "./styles.css";
 import { NetworkSetup } from "./NetworkSetup";
+import { DiagnosticDrawer, type DiagnosticContext } from "./Diagnostics";
 
 type Tab = "setup" | "live" | "results";
 const tabFromHash = (): Tab =>
@@ -79,12 +81,13 @@ function App() {
     refreshScenarios,
     scenarios: savedScenarios,
   } = useControlResources();
-  const { activeRun, points, setPoints, setStatus, status } = useRunTelemetry();
+  const { activeRun, diagnosticRevision, points, setPoints, setStatus, status } = useRunTelemetry();
   const [scenario, setScenario] = useState(initialScenario);
   const [saveMessage, setSaveMessage] = useState("");
   const [uploading, setUploading] = useState(false);
   const [runName, setRunName] = useState("");
   const [error, setError] = useState("");
+  const [diagnosticContext, setDiagnosticContext] = useState<DiagnosticContext | null>(null);
   const [tab, setTab] = useState<Tab>(tabFromHash),
     [theme, setTheme] = useState<Theme>(initialTheme);
   const clientPoints = useMemo(() => points.filter((p) => p.role === 1), [points]),
@@ -376,6 +379,7 @@ function App() {
           <>
             <NetworkSetup
               agents={agents}
+              onOpenDiagnostics={(id) => setDiagnosticContext({ kind: "network", id })}
               onPrepared={(profile_revision_id) =>
                 patch({
                   path: {
@@ -1072,6 +1076,10 @@ function App() {
               aside={
                 activeRun && (
                   <div className="flex gap-2">
+                    <Button onClick={() => setDiagnosticContext({ kind: "run", id: activeRun })}>
+                      <ScrollText size={14} />
+                      로그
+                    </Button>
                     {status === "일시정지" ? (
                       <Button onClick={() => control("resume")}>
                         <Play size={14} />
@@ -1163,10 +1171,19 @@ function App() {
         )}
         {tab === "results" && (
           <Suspense fallback={<p role="status">결과 불러오는 중…</p>}>
-            <RunHistory refreshKey={`${activeRun ?? ""}:${status}`} theme={theme} />
+            <RunHistory
+              refreshKey={`${activeRun ?? ""}:${status}`}
+              theme={theme}
+              onOpenDiagnostics={(id) => setDiagnosticContext({ kind: "run", id })}
+            />
           </Suspense>
         )}
       </main>
+      <DiagnosticDrawer
+        context={diagnosticContext}
+        refreshKey={diagnosticRevision}
+        onClose={() => setDiagnosticContext(null)}
+      />
     </div>
   );
 }

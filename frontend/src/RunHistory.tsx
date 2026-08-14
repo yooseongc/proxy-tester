@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Download, FileJson2, History, Scale } from "lucide-react";
+import { CheckCircle2, Download, FileJson2, History, Scale, ScrollText } from "lucide-react";
 import { api } from "./api";
 import { TelemetryCharts } from "./TelemetryCharts";
 import { Button, Panel, SectionTitle, StatusBadge, type Theme } from "./ui";
@@ -43,7 +43,15 @@ export const resultMetrics = (detail: RunDetail | undefined) => {
   };
 };
 
-export function RunHistory({ refreshKey, theme }: { refreshKey: string; theme: Theme }) {
+export function RunHistory({
+  refreshKey,
+  theme,
+  onOpenDiagnostics,
+}: {
+  refreshKey: string;
+  theme: Theme;
+  onOpenDiagnostics: (runId: string) => void;
+}) {
   const [runs, setRuns] = useState<RunSummary[]>([]),
     [cursor, setCursor] = useState<number | null>(null),
     [selected, setSelected] = useState<string[]>([]),
@@ -101,6 +109,13 @@ export function RunHistory({ refreshKey, theme }: { refreshKey: string; theme: T
         title="시험 이력 및 비교"
         aside={
           <div className="flex gap-2">
+            <Button
+              disabled={!selected[0]}
+              onClick={() => selected[0] && onOpenDiagnostics(selected[0])}
+            >
+              <ScrollText size={14} />
+              로그
+            </Button>
             <Button disabled={!active} onClick={() => exportRun("csv")}>
               <Download size={14} />
               CSV

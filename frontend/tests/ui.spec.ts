@@ -88,6 +88,79 @@ test("managed direct without a prepared revision blocks start and explains the r
   await expect(page.getByText("managed_direct requires profile_revision_id")).toHaveCount(0);
 });
 
+test("network plan exposes advanced commands and operation timeline on demand", async ({
+  page,
+}) => {
+  const agents = ["client-1", "server-1"].map((id) => ({
+    id,
+    hostname: id,
+    role: 0,
+    online: true,
+    inventory: { interfaces: [{ name: "eth0" }, { name: "eth1" }] },
+  }));
+  const nodePlan = (node: string, role: string, address: string) => ({
+    node_id: node,
+    inventory_fingerprint: `${node}-fingerprint`,
+    semantic_changes: [`move eth1 into pt-test-${role}`],
+    warnings: [],
+    endpoints: [{ role, namespace: `pt-test-${role}`, interface: "eth1", addresses: [address] }],
+    commands: [{ program: "ip", args: ["netns", "add", `pt-test-${role}`] }],
+    rollback_commands: [{ program: "ip", args: ["netns", "del", `pt-test-${role}`] }],
+  });
+  await page.route("**/api/agents", (route) => route.fulfill({ json: agents }));
+  await page.route("**/api/network/**", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/operations/op-1")) {
+      await route.fulfill({
+        json: {
+          id: "op-1",
+          status: "planned",
+          events: [
+            {
+              source: "network",
+              node_id: "client-1",
+              stage: "plan",
+              status: "completed",
+              detail: nodePlan("client-1", "client", "10.20.0.10/24"),
+              created_at: "2026-08-14T00:00:00Z",
+            },
+          ],
+        },
+      });
+    } else if (url.endsWith("/plan")) {
+      await route.fulfill({
+        json: {
+          operation_id: "op-1",
+          profile_revision_id: "revision-1",
+          plan_token: "token-1",
+          expires_at: "2026-08-14T01:00:00Z",
+          detail: {
+            plans: {
+              "client-1": nodePlan("client-1", "client", "10.20.0.10/24"),
+              "server-1": nodePlan("server-1", "server", "10.20.0.100/24"),
+            },
+          },
+        },
+      });
+    } else {
+      await route.fulfill({ json: {} });
+    }
+  });
+  await page.goto("/#setup");
+  await page.getByLabel("Node").nth(0).selectOption("client-1");
+  await page.getByLabel("Interface").nth(0).selectOption("eth1");
+  await page.getByLabel("Node").nth(1).selectOption("server-1");
+  await page.getByLabel("Interface").nth(1).selectOption("eth1");
+  await page.getByRole("button", { name: "저장 및 계획" }).click();
+  await expect(page.getByText("move eth1 into pt-test-client")).toBeVisible();
+  await expect(page.getByText("ip netns add pt-test-client")).toBeHidden();
+  await page.getByText("실행 명령과 rollback").first().click();
+  await expect(page.getByText("ip netns add pt-test-client")).toBeVisible();
+  await page.getByRole("button", { name: "상세 로그" }).click();
+  await expect(page.getByRole("complementary", { name: "상세 로그" })).toContainText("plan");
+  await expect(page.getByRole("complementary", { name: "상세 로그" })).toContainText("client-1");
+});
+
 test("traffic-first payload, summary, capture analysis and advanced fields react to selections", async ({
   page,
 }) => {

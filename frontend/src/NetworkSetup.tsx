@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { api } from "./api";
+import { NetworkPlanDetails, type NetworkNodePlan } from "./Diagnostics";
 import { Button, Field, Panel, SectionTitle, StatusBadge } from "./ui";
 import type { Agent } from "./model";
 
@@ -18,7 +19,7 @@ type Plan = {
   profile_revision_id: string;
   plan_token: string;
   expires_at: string;
-  detail: { plans: Record<string, { semantic_changes?: string[]; warnings?: string[] }> };
+  detail: { plans: Record<string, NetworkNodePlan> };
 };
 type Revision = { id: string; revision: number; sha256: string; body: Draft };
 
@@ -32,9 +33,11 @@ const endpoint = (node = "", iface = "eth1", cidr = "10.20.0.10/24"): Endpoint =
 export function NetworkSetup({
   agents,
   onPrepared,
+  onOpenDiagnostics,
 }: {
   agents: Agent[];
   onPrepared: (revisionId: string) => void;
+  onOpenDiagnostics: (operationId: string) => void;
 }) {
   const first = agents[0]?.id ?? "",
     second = agents[1]?.id ?? first;
@@ -210,21 +213,7 @@ export function NetworkSetup({
       {plan && !revision && (
         <div className="my-4 rounded-xl border border-signal/30 bg-signal/5 p-3 text-xs">
           <strong>적용 계획</strong>
-          {Object.entries(plan.detail.plans).map(([node, value]) => (
-            <div key={node} className="mt-2">
-              <span className="font-bold">{node}</span>
-              <ul>
-                {value.semantic_changes?.map((change) => (
-                  <li key={change}>{change}</li>
-                ))}
-              </ul>
-              {value.warnings?.map((w) => (
-                <p className="text-warn" key={w}>
-                  {w}
-                </p>
-              ))}
-            </div>
-          ))}
+          <NetworkPlanDetails plans={plan.detail.plans} />
           <p className="mt-2 text-dim">토큰 만료: {new Date(plan.expires_at).toLocaleString()}</p>
         </div>
       )}
@@ -249,6 +238,7 @@ export function NetworkSetup({
             </Button>
           </>
         )}
+        {plan && <Button onClick={() => onOpenDiagnostics(plan.operation_id)}>상세 로그</Button>}
       </div>
     </Panel>
   );

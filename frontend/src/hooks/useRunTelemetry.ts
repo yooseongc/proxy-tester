@@ -14,11 +14,14 @@ export function useRunTelemetry() {
   const [points, setPoints] = useState<Point[]>([]);
   const [status, setStatus] = useState("대기 중");
   const [activeRun, setActiveRun] = useState<string | null>(null);
+  const [diagnosticRevision, setDiagnosticRevision] = useState(0);
 
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${protocol}://${window.location.host}/api/events/ws`);
-    socket.onmessage = (event) => {
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let disposed = false;
+    const onMessage = (event: MessageEvent) => {
       let message: EventMessage;
       try {
         message = JSON.parse(event.data) as EventMessage;
@@ -41,9 +44,29 @@ export function useRunTelemetry() {
         setStatus(message.status ?? "완료");
         setActiveRun(null);
       }
+      if (
+        ["network_progress", "agent_event", "run_state", "run_started", "run_finished"].includes(
+          message.type,
+        )
+      ) {
+        setDiagnosticRevision((current) => current + 1);
+      }
     };
-    return () => socket.close();
+    const connect = () => {
+      socket = new WebSocket(`${protocol}://${window.location.host}/api/events/ws`);
+      socket.onmessage = onMessage;
+      socket.onopen = () => setDiagnosticRevision((current) => current + 1);
+      socket.onclose = () => {
+        if (!disposed) reconnectTimer = window.setTimeout(connect, 1_000);
+      };
+    };
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
   }, []);
 
-  return { activeRun, points, setPoints, setStatus, status };
+  return { activeRun, diagnosticRevision, points, setPoints, setStatus, status };
 }
