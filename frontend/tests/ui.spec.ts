@@ -29,6 +29,8 @@ test("technical console setup, local fonts and themes are available", async ({ p
   await page.getByRole("button", { name: "+ Stage 추가" }).click();
   await expect(page.getByLabel("Stage 4 이름")).toBeVisible();
   await page.getByRole("textbox", { name: "트래픽 구성 이름", exact: true }).fill(profileName);
+  await page.getByText("연결 고급 설정").click();
+  await page.getByLabel("연결 경로").selectOption("explicit_proxy");
   await page.getByRole("button", { name: "현재 구성 저장" }).click();
   await expect(page.getByText("저장됨")).toBeVisible();
   await expect(
@@ -74,6 +76,17 @@ for (const viewport of [
     await expect(page.getByLabel("시험 프로토콜")).toBeVisible();
     await expectNoPageOverflow(page);
   });
+
+test("managed direct without a prepared revision blocks start and explains the required action", async ({
+  page,
+}) => {
+  await page.goto("/#setup");
+  await expect(page.getByRole("button", { name: "시험 시작" })).toBeDisabled();
+  await expect(page.getByRole("alert")).toContainText(
+    "네트워크 구성을 저장·계획한 뒤 적용해야 합니다",
+  );
+  await expect(page.getByText("managed_direct requires profile_revision_id")).toHaveCount(0);
+});
 
 test("traffic-first payload, summary, capture analysis and advanced fields react to selections", async ({
   page,

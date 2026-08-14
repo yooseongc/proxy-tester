@@ -303,6 +303,9 @@ function App() {
         : scenario.protocol === "http1"
           ? (selectedCapture.analysis?.http_flow_count ?? 0) === 0
           : (selectedCapture.analysis?.supported_flow_count ?? 0) === 0));
+  const networkRevisionMissing =
+    scenario.path.kind === "managed_direct" &&
+    scenario.path.profile_revision_id === "00000000-0000-0000-0000-000000000000";
   const tabs: [Tab, string, React.ElementType][] = [
     ["setup", "시험 구성", Layers3],
     ["live", "실시간 모니터링", Activity],
@@ -1021,8 +1024,20 @@ function App() {
                 </p>
               </div>
               {error && (
-                <p className="mt-4 rounded-xl border border-critical/30 bg-critical/10 p-3 text-xs text-critical">
+                <p
+                  role="alert"
+                  className="mt-4 rounded-xl border border-critical/30 bg-critical/10 p-3 text-xs text-critical"
+                >
                   {error}
+                </p>
+              )}
+              {networkRevisionMissing && (
+                <p
+                  role="alert"
+                  className="mt-4 rounded-xl border border-warn/30 bg-warn/10 p-3 text-xs text-warn"
+                >
+                  관리형 직접 연결을 사용하려면 위에서 네트워크 구성을 저장·계획한 뒤 적용해야
+                  합니다.
                 </p>
               )}
               {captureBlocked && (
@@ -1039,7 +1054,9 @@ function App() {
                 variant="primary"
                 className="mt-5 w-full py-3"
                 onClick={start}
-                disabled={!!activeRun || agents.length < 2 || captureBlocked}
+                disabled={
+                  !!activeRun || agents.length < 2 || captureBlocked || networkRevisionMissing
+                }
               >
                 <Play size={15} />
                 시험 시작
