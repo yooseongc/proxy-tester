@@ -37,34 +37,18 @@ import {
   formatBandwidth,
   initialScenario,
   recentActiveMaximum,
-  type Agent,
+  type Artifact,
   type LoadStage,
   type PayloadProfile,
-  type Point,
   type Scenario,
 } from "./model";
+import { useControlResources } from "./hooks/useControlResources";
+import { useRunTelemetry } from "./hooks/useRunTelemetry";
 import { Button, Field, MetricCard, Panel, SectionTitle, StatusBadge, type Theme } from "./ui";
 import "./styles.css";
 import { NetworkSetup } from "./NetworkSetup";
 
 type Tab = "setup" | "live" | "results";
-type Artifact = {
-  id: string;
-  kind: "payload" | "pcap";
-  name: string;
-  sha256: string;
-  size_bytes: number;
-  format: string;
-  analysis?: {
-    supported_flow_count?: number;
-    http_flow_count?: number;
-    http_transaction_count?: number;
-    http2_flow_count?: number;
-    http2_transaction_count?: number;
-    retransmitted_bytes?: number;
-    exclusions?: Record<string, number>;
-  };
-};
 const tabFromHash = (): Tab =>
   location.hash === "#live" ? "live" : location.hash === "#results" ? "results" : "setup";
 const initialTheme = (): Theme => {
@@ -77,17 +61,19 @@ const initialTheme = (): Theme => {
 };
 
 function App() {
-  const [agents, setAgents] = useState<Agent[]>([]),
-    [scenario, setScenario] = useState(initialScenario),
-    [points, setPoints] = useState<Point[]>([]);
-  const [savedScenarios, setSavedScenarios] = useState<Scenario[]>([]),
-    [saveMessage, setSaveMessage] = useState("");
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]),
-    [uploading, setUploading] = useState(false);
+  const {
+    agents,
+    artifacts,
+    refreshArtifacts,
+    refreshScenarios,
+    scenarios: savedScenarios,
+  } = useControlResources();
+  const { activeRun, points, setPoints, setStatus, status } = useRunTelemetry();
+  const [scenario, setScenario] = useState(initialScenario);
+  const [saveMessage, setSaveMessage] = useState("");
+  const [uploading, setUploading] = useState(false);
   const [runName, setRunName] = useState("");
-  const [status, setStatus] = useState("대기 중"),
-    [error, setError] = useState(""),
-    [activeRun, setActiveRun] = useState<string | null>(null);
+  const [error, setError] = useState("");
   const [tab, setTab] = useState<Tab>(tabFromHash),
     [theme, setTheme] = useState<Theme>(initialTheme);
   const clientPoints = useMemo(() => points.filter((p) => p.role === 1), [points]),
@@ -111,49 +97,6 @@ function App() {
     const hash = () => setTab(tabFromHash());
     addEventListener("hashchange", hash);
     return () => removeEventListener("hashchange", hash);
-  }, []);
-  useEffect(() => {
-    const load = () =>
-      api<Agent[]>("/api/agents")
-        .then(setAgents)
-        .catch(() => {});
-    load();
-    const timer = setInterval(load, 3000);
-    const ws = new WebSocket(
-      `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/events/ws`,
-    );
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === "metrics")
-        setPoints((p) => [...p, { ...m.data, agent_id: m.agent_id, role: m.role }].slice(-7200));
-      if (m.type === "run_started") {
-        setStatus("실행 중");
-        setActiveRun(m.run_id);
-      }
-      if (m.type === "run_state") setStatus(m.status === "paused" ? "일시정지" : "실행 중");
-      if (m.type === "run_finished") {
-        setStatus(m.status);
-        setActiveRun(null);
-      }
-    };
-    return () => {
-      clearInterval(timer);
-      ws.close();
-    };
-  }, []);
-  const refreshScenarios = () =>
-    api<Scenario[]>("/api/scenarios")
-      .then(setSavedScenarios)
-      .catch(() => {});
-  useEffect(() => {
-    refreshScenarios();
-  }, []);
-  const refreshArtifacts = () =>
-    api<Artifact[]>("/api/artifacts")
-      .then(setArtifacts)
-      .catch(() => {});
-  useEffect(() => {
-    refreshArtifacts();
   }, []);
   const navigate = (next: Tab) => {
       window.history.pushState(null, "", `#${next}`);

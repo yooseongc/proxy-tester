@@ -17,6 +17,24 @@ export type Agent = {
   };
 };
 
+export type Artifact = {
+  id: string;
+  kind: "payload" | "pcap";
+  name: string;
+  sha256: string;
+  size_bytes: number;
+  format: string;
+  analysis?: {
+    supported_flow_count?: number;
+    http_flow_count?: number;
+    http_transaction_count?: number;
+    http2_flow_count?: number;
+    http2_transaction_count?: number;
+    retransmitted_bytes?: number;
+    exclusions?: Record<string, number>;
+  };
+};
+
 export type Metrics = {
   unix_ms: number;
   elapsed_ms: number;
