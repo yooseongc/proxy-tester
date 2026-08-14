@@ -209,12 +209,7 @@ pub(crate) async fn apply(
             .ok_or_else(|| ApiError::internal(format!("network plan missing node {node}")))?;
         if let Err(error) = command(state, node, operation_id, "stage", plan, lease).await {
             rollback_nodes(state, operation_id, &staged, lease).await;
-            sqlx::query("UPDATE network_operations SET status='failed',detail_json=?,updated_at=? WHERE id=?")
-                .bind(serde_json::json!({"error":error.message,"plans":plans}).to_string())
-                .bind(Utc::now().to_rfc3339())
-                .bind(operation_id.to_string())
-                .execute(&state.db)
-                .await?;
+            mark_failed(state, operation_id, &error, &plans).await?;
             return Err(error);
         }
         staged.push(node.clone());
@@ -231,6 +226,7 @@ pub(crate) async fn apply(
         .await
         {
             rollback_nodes(state, operation_id, &staged, lease).await;
+            mark_failed(state, operation_id, &error, &plans).await?;
             return Err(error);
         }
     }
@@ -240,7 +236,7 @@ pub(crate) async fn apply(
         .bind(operation_id.to_string())
         .execute(&state.db)
         .await?;
-    set_prepared(state, revision_id, profile_id, true).await?;
+    repository::network_profiles::set_prepared(&state.db, revision_id, profile_id, true).await?;
     Ok(
         serde_json::json!({"operation_id":operation_id,"profile_revision_id":revision_id,"status":"prepared"}),
     )
@@ -291,7 +287,7 @@ pub(crate) async fn teardown(
             return Err(error);
         }
     }
-    set_prepared(state, revision_id, profile_id, false).await?;
+    repository::network_profiles::set_prepared(&state.db, revision_id, profile_id, false).await?;
     sqlx::query("UPDATE network_operations SET status='completed',updated_at=? WHERE id=?")
         .bind(Utc::now().to_rfc3339())
         .bind(operation_id.to_string())
@@ -309,23 +305,19 @@ async fn revision_context(
         .ok_or_else(|| ApiError::not_found("network profile revision not found"))
 }
 
-async fn set_prepared(
+async fn mark_failed(
     state: &AppState,
-    revision_id: Uuid,
-    profile_id: Uuid,
-    prepared: bool,
+    operation_id: Uuid,
+    error: &ApiError,
+    plans: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ApiError> {
-    let status = if prepared { "prepared" } else { "unprepared" };
-    sqlx::query("UPDATE network_profile_revisions SET status=? WHERE id=?")
-        .bind(status)
-        .bind(revision_id.to_string())
-        .execute(&state.db)
-        .await?;
-    sqlx::query("UPDATE network_profiles SET status=?,updated_at=? WHERE id=?")
-        .bind(status)
-        .bind(Utc::now().to_rfc3339())
-        .bind(profile_id.to_string())
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE network_operations SET status='failed',detail_json=?,updated_at=? WHERE id=?",
+    )
+    .bind(serde_json::json!({"error":error.message,"plans":plans}).to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(operation_id.to_string())
+    .execute(&state.db)
+    .await?;
     Ok(())
 }

@@ -124,3 +124,25 @@ pub(crate) async fn revision_context(
         .map_err(|error| sqlx::Error::Decode(error.into()))?;
     Ok(Some((draft, nodes, profile_id)))
 }
+
+pub(crate) async fn set_prepared(
+    db: &SqlitePool,
+    revision_id: Uuid,
+    profile_id: Uuid,
+    prepared: bool,
+) -> Result<(), sqlx::Error> {
+    let status = if prepared { "prepared" } else { "unprepared" };
+    let mut transaction = db.begin().await?;
+    sqlx::query("UPDATE network_profile_revisions SET status=? WHERE id=?")
+        .bind(status)
+        .bind(revision_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("UPDATE network_profiles SET status=?,updated_at=? WHERE id=?")
+        .bind(status)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(profile_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
+}
