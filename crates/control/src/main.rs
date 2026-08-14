@@ -29,14 +29,10 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use std::{
-    collections::{HashMap, HashSet},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashSet, pin::Pin, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
 use tower_http::{
@@ -48,11 +44,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 mod database;
 mod error;
+mod state;
 
 #[cfg(test)]
 use database::schema_fallback_url;
 use database::{apply_retention, cleanup_orphan_artifacts, migrate, open_database};
 use error::ApiError;
+use state::{AgentSession, AppState, CommandAckResult};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -80,43 +78,6 @@ struct Args {
     agent_grace_secs: u64,
     #[arg(long, env = "PROXY_TESTER_COMMAND_TIMEOUT_SECS", default_value_t = 10)]
     command_timeout_secs: u64,
-}
-
-#[derive(Clone)]
-struct AgentSession {
-    instance_id: String,
-    generation: Uuid,
-    role: i32,
-    hostname: String,
-    interfaces: Vec<String>,
-    inventory_json: String,
-    last_seen_ms: i64,
-    tx: mpsc::Sender<Result<ControlMessage, Status>>,
-}
-
-#[derive(Clone)]
-struct AppState {
-    db: SqlitePool,
-    database_url: Arc<String>,
-    database_fallback: bool,
-    agents: Arc<RwLock<HashMap<String, AgentSession>>>,
-    events: broadcast::Sender<String>,
-    active_run: Arc<Mutex<Option<Uuid>>>,
-    run_agents: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
-    completed_agents: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
-    expected_endpoints: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
-    pending_acks: Arc<Mutex<HashMap<String, oneshot::Sender<CommandAckResult>>>>,
-    pending_network: Arc<Mutex<HashMap<String, oneshot::Sender<NetworkProgress>>>>,
-    agent_grace_secs: u64,
-    command_timeout_secs: u64,
-    artifact_dir: Arc<std::path::PathBuf>,
-}
-
-#[derive(Debug)]
-struct CommandAckResult {
-    agent_id: String,
-    ok: bool,
-    error: String,
 }
 
 #[tokio::main]
