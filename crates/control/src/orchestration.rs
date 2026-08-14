@@ -20,6 +20,30 @@ use crate::{
 
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
 
+async fn record_run_event(
+    state: &AppState,
+    run_id: Uuid,
+    source: &str,
+    agent_id: Option<&str>,
+    stage: &str,
+    status: &str,
+    detail: serde_json::Value,
+) -> Result<(), ApiError> {
+    repository::diagnostics::append_run_event(
+        &state.db,
+        repository::diagnostics::RunEvent {
+            run_id: &run_id.to_string(),
+            source,
+            agent_id,
+            stage,
+            status,
+            detail,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 pub(crate) type EndpointRuntime = (String, String, String, Vec<String>);
 
 pub(crate) async fn scenario_nodes(
@@ -195,6 +219,16 @@ pub(crate) async fn start_run(
         },
     )
     .await?;
+    record_run_event(
+        state,
+        run_id,
+        "control",
+        None,
+        "prepare",
+        "started",
+        serde_json::json!({"run_name":run_name}),
+    )
+    .await?;
 
     let prepare = ControlMessage {
         body: Some(control_message::Body::Prepare(PrepareRun {
@@ -249,6 +283,16 @@ pub(crate) async fn start_run(
             Some(&error.message),
         )
         .await?;
+        record_run_event(
+            state,
+            run_id,
+            "control",
+            None,
+            "prepare",
+            "failed",
+            serde_json::json!({"error":error.message}),
+        )
+        .await?;
         return Err(error);
     }
 
@@ -278,11 +322,31 @@ pub(crate) async fn start_run(
             Some(&error.message),
         )
         .await?;
+        record_run_event(
+            state,
+            run_id,
+            "control",
+            None,
+            "start",
+            "failed",
+            serde_json::json!({"error":error.message}),
+        )
+        .await?;
         return Err(error);
     }
 
     repository::runs::mark_running(&state.db, &run_id.to_string(), &started_at.to_rfc3339())
         .await?;
+    record_run_event(
+        state,
+        run_id,
+        "control",
+        None,
+        "run",
+        "running",
+        serde_json::Value::Null,
+    )
+    .await?;
     *active = Some(run_id);
     state.run_agents.lock().await.insert(
         run_id,
@@ -387,6 +451,16 @@ pub(crate) async fn set_run_paused(
     }
     let status = if paused { "paused" } else { "running" };
     repository::runs::set_status(&state.db, &run_id.to_string(), status).await?;
+    record_run_event(
+        state,
+        run_id,
+        "control",
+        None,
+        if paused { "pause" } else { "resume" },
+        status,
+        serde_json::Value::Null,
+    )
+    .await?;
     let _ = state
         .events
         .send(serde_json::json!({"type":"run_state","run_id":run_id,"status":status}).to_string());
@@ -431,6 +505,16 @@ pub(crate) async fn command_agent(
         },
     )
     .await?;
+    record_run_event(
+        state,
+        run_id,
+        "control",
+        Some(agent_id),
+        phase,
+        "sent",
+        serde_json::json!({"command_id":command_id}),
+    )
+    .await?;
     if agent
         .tx
         .send(Ok(with_command_id(message, &command_id)))
@@ -438,6 +522,16 @@ pub(crate) async fn command_agent(
         .is_err()
     {
         state.pending_acks.lock().await.remove(&command_id);
+        record_run_event(
+            state,
+            run_id,
+            "control",
+            Some(agent_id),
+            phase,
+            "failed",
+            serde_json::json!({"error":"agent channel closed"}),
+        )
+        .await?;
         return Err(ApiError::internal(format!(
             "{agent_id} channel closed during {phase}"
         )));
@@ -450,18 +544,48 @@ pub(crate) async fn command_agent(
     {
         Ok(Ok(acknowledgement)) => acknowledgement,
         Ok(Err(_)) => {
+            record_run_event(
+                state,
+                run_id,
+                "control",
+                Some(agent_id),
+                phase,
+                "failed",
+                serde_json::json!({"error":"acknowledgement channel closed"}),
+            )
+            .await?;
             return Err(ApiError::internal(format!(
                 "{agent_id} {phase} acknowledgement channel closed"
             )));
         }
         Err(_) => {
             state.pending_acks.lock().await.remove(&command_id);
+            record_run_event(
+                state,
+                run_id,
+                "control",
+                Some(agent_id),
+                phase,
+                "timeout",
+                serde_json::json!({"error":"acknowledgement timed out"}),
+            )
+            .await?;
             return Err(ApiError::internal(format!(
                 "{agent_id} {phase} acknowledgement timed out"
             )));
         }
     };
     if !acknowledgement.ok {
+        record_run_event(
+            state,
+            run_id,
+            "agent",
+            Some(agent_id),
+            phase,
+            "failed",
+            serde_json::json!({"error":acknowledgement.error}),
+        )
+        .await?;
         return Err(ApiError::internal(format!(
             "{} {phase} failed: {}",
             acknowledgement.agent_id, acknowledgement.error
@@ -472,6 +596,16 @@ pub(crate) async fn command_agent(
         &run_id.to_string(),
         agent_id,
         phase,
+    )
+    .await?;
+    record_run_event(
+        state,
+        run_id,
+        "agent",
+        Some(agent_id),
+        phase,
+        "acknowledged",
+        serde_json::Value::Null,
     )
     .await?;
     Ok(())
@@ -620,6 +754,16 @@ pub(crate) async fn finish_run(
     error: Option<&str>,
 ) -> Result<(), ApiError> {
     repository::runs::finish(&state.db, &run_id.to_string(), status, error).await?;
+    record_run_event(
+        state,
+        run_id,
+        "control",
+        None,
+        "finish",
+        status,
+        serde_json::json!({"error":error}),
+    )
+    .await?;
     let mut active = state.active_run.lock().await;
     if *active == Some(run_id) {
         *active = None;

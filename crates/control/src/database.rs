@@ -33,6 +33,8 @@ pub(crate) async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS metric_samples(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,agent_id TEXT NOT NULL,role INTEGER NOT NULL,unix_ms INTEGER NOT NULL,metrics_json TEXT NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_metrics_run_time ON metric_samples(run_id,unix_ms)",
         "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,unix_ms INTEGER NOT NULL,level TEXT NOT NULL,message TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS run_operation_events(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,source TEXT NOT NULL,agent_id TEXT,stage TEXT NOT NULL,status TEXT NOT NULL,detail_json TEXT NOT NULL,created_at TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_run_operation_events_run ON run_operation_events(run_id,id)",
         "CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,name TEXT NOT NULL,sha256 TEXT NOT NULL UNIQUE,size_bytes INTEGER NOT NULL,format TEXT NOT NULL,packet_count INTEGER NOT NULL,captured_bytes INTEGER NOT NULL,path TEXT NOT NULL,created_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS run_participants(run_id TEXT NOT NULL,agent_id TEXT NOT NULL,instance_id TEXT NOT NULL,role INTEGER NOT NULL,phase TEXT NOT NULL,last_command_id TEXT,error TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(run_id,agent_id))",
     ] {
@@ -122,6 +124,7 @@ pub(crate) async fn apply_retention(db: &SqlitePool, days: i64) -> anyhow::Resul
     let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
     sqlx::query("DELETE FROM metric_samples WHERE run_id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?)").bind(&cutoff).execute(db).await?;
     sqlx::query("DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?)").bind(&cutoff).execute(db).await?;
+    sqlx::query("DELETE FROM run_operation_events WHERE run_id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?)").bind(&cutoff).execute(db).await?;
     sqlx::query("DELETE FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?")
         .bind(&cutoff)
         .execute(db)

@@ -12,10 +12,11 @@ use tower_http::{
 use crate::{
     active_run, agents, apply_network_profile, archive_network_profile, diagnose_network,
     events_ws, export_run, generate_tls_certificate, health, list_artifacts, list_network_profiles,
-    list_network_revisions, list_runs, list_runs_page, list_scenarios, network_audit, pause_run,
-    plan_network_profile, preflight, reconcile_node, resume_run, run_detail, run_samples,
-    run_summary_detail, save_network_profile, save_scenario, start_run, state::AppState, stop_run,
-    teardown_network_profile, upload_artifact, validate_scenario,
+    list_network_revisions, list_runs, list_runs_page, list_scenarios, network_audit,
+    network_operation_detail, pause_run, plan_network_profile, preflight, reconcile_node,
+    resume_run, run_detail, run_diagnostics, run_samples, run_summary_detail, save_network_profile,
+    save_scenario, start_run, state::AppState, stop_run, teardown_network_profile, upload_artifact,
+    validate_scenario,
 };
 
 pub(crate) fn build(state: AppState, static_dir: &str) -> Router {
@@ -39,6 +40,10 @@ pub(crate) fn build(state: AppState, static_dir: &str) -> Router {
             post(apply_network_profile),
         )
         .route(
+            "/api/network/operations/{id}",
+            get(network_operation_detail),
+        )
+        .route(
             "/api/network/revisions/{id}/teardown",
             post(teardown_network_profile),
         )
@@ -57,6 +62,7 @@ pub(crate) fn build(state: AppState, static_dir: &str) -> Router {
         .route("/api/runs/{id}", get(run_detail))
         .route("/api/runs/{id}/summary", get(run_summary_detail))
         .route("/api/runs/{id}/samples", get(run_samples))
+        .route("/api/runs/{id}/diagnostics", get(run_diagnostics))
         .route("/api/runs/{id}/export", get(export_run))
         .route("/api/runs/{id}/stop", post(stop_run))
         .route("/api/runs/{id}/pause", post(pause_run))

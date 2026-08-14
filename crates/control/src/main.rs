@@ -331,10 +331,25 @@ async fn teardown_network_profile(
     ))
 }
 
+#[derive(Deserialize)]
+struct DiagnosticsQuery {
+    limit: Option<i64>,
+}
+
+fn diagnostic_limit(value: Option<i64>, default: i64) -> Result<i64, ApiError> {
+    let limit = value.unwrap_or(default);
+    if !(1..=500).contains(&limit) {
+        return Err(ApiError::bad("diagnostic limit must be between 1 and 500"));
+    }
+    Ok(limit)
+}
+
 async fn network_audit(
     State(s): State<AppState>,
+    Query(query): Query<DiagnosticsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let rows=sqlx::query("SELECT id,profile_revision_id,kind,status,detail_json,created_at,updated_at FROM network_operations ORDER BY created_at DESC LIMIT 500").fetch_all(&s.db).await?;
+    let limit = diagnostic_limit(query.limit, 50)?;
+    let rows=sqlx::query("SELECT id,profile_revision_id,kind,status,detail_json,created_at,updated_at FROM network_operations ORDER BY created_at DESC LIMIT ?").bind(limit).fetch_all(&s.db).await?;
     let mut result = Vec::with_capacity(rows.len());
     for r in rows {
         let operation_id: String = r.get("id");
@@ -348,6 +363,18 @@ async fn network_audit(
         result.push(serde_json::json!({"id":operation_id,"profile_revision_id":r.get::<String,_>("profile_revision_id"),"kind":r.get::<String,_>("kind"),"status":r.get::<String,_>("status"),"detail":serde_json::from_str::<serde_json::Value>(r.get("detail_json")).unwrap_or_default(),"events":events,"created_at":r.get::<String,_>("created_at"),"updated_at":r.get::<String,_>("updated_at")}));
     }
     Ok(Json(result))
+}
+
+async fn network_operation_detail(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<DiagnosticsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = diagnostic_limit(query.limit, 200)?;
+    repository::diagnostics::network_operation(&s.db, &id.to_string(), limit)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("network operation not found"))
 }
 
 #[derive(Deserialize)]
@@ -902,6 +929,18 @@ async fn run_summary_detail(
     Ok(Json(detail))
 }
 
+async fn run_diagnostics(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<DiagnosticsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = diagnostic_limit(query.limit, 200)?;
+    repository::diagnostics::run_diagnostics(&s.db, &id.to_string(), limit)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("run not found"))
+}
+
 fn result_payload_metadata(body: &str, samples: &[serde_json::Value]) -> serde_json::Value {
     let Ok(scenario) = serde_json::from_str::<Scenario>(body) else {
         return serde_json::Value::Null;
@@ -1059,6 +1098,18 @@ impl AgentControl for ControlSvc {
                         .bind(&e.level)
                         .bind(&e.message)
                         .execute(&state.db)
+                        .await;
+                        let _ = repository::diagnostics::append_run_event(
+                            &state.db,
+                            repository::diagnostics::RunEvent {
+                                run_id: &e.run_id,
+                                source: "agent",
+                                agent_id: Some(&id),
+                                stage: "agent_event",
+                                status: &e.level,
+                                detail: serde_json::json!({"message":e.message}),
+                            },
+                        )
                         .await;
                         if e.level == "error"
                             && let Ok(run_id) = Uuid::parse_str(&e.run_id)
