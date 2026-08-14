@@ -19,6 +19,19 @@
 
 따라서 App와 Wire 값은 같아야 하는 불변식이 아니다. 직접 연결에서는 Client App TX와 Server App RX가 같아야 하지만 explicit proxy는 CONNECT 및 header 변환 때문에 endpoint byte 합계가 달라질 수 있다. Wire 값이 0이면 관찰 interface 이름, namespace와 권한을 확인한다. 멀티스레드 Agent에서 `/proc/net/dev`는 process leader의 namespace를 가리킬 수 있으므로 구현과 문제 분석에는 thread-local 경로를 사용해야 한다.
 
+## TCP direct와 CONNECT 결과 해석
+
+TCP direct CPS는 client-to-server 경로에서 성립한 workload 연결 수다. TCP CONNECT CPS는 proxy tunnel 수립까지 성공한 workload 연결 수이며, proxy가 내부에서 연 모든 socket의 개수가 아니다. 일반적인 경로는 다음과 같다.
+
+```text
+TCP direct:  client ---------------- server
+TCP CONNECT: client ---- proxy ----- server
+```
+
+CONNECT 계측에는 HTTP CONNECT 교환, proxy 정책 및 요청 처리, proxy의 upstream 연결 수립과 이후 byte relay 비용이 포함된다. 따라서 direct와 CONNECT는 동일한 endpoint-only 부하가 아니라 서로 다른 traffic path의 결과로 비교한다.
+
+저장소의 Docker HTTP proxy는 Python asyncio 기반 기능 시험 fixture다. CONNECT 동작, 오류 집계와 telemetry 연결을 확인하는 데 사용할 수 있지만 이 fixture의 CPS, bandwidth와 latency를 운영 proxy의 성능 기준으로 사용하면 안 된다. 용량 시험에서는 실제 측정 대상 proxy를 지정하고 해당 Run과 함께 자원 제한 및 네트워크 topology를 기록한다.
+
 UI의 ACTIVE 카드는 `현재 / 최근 1분 최대` 순서로 표시한다. 최근 60개의 1초 표본에 포함된 `active_connections_max` 중 최댓값을 사용한다. 현재 값은 실시간 순간 상태 확인에, 1분 최대값은 짧게 유지되는 동시 연결의 규모와 최근 추세를 안정적으로 판단하는 데 사용한다. 차트는 기존 정책대로 `active_connections` 원본 순간값을 사용하며 이동평균이나 보간을 적용하지 않는다.
 
 ## 카운터 안전성

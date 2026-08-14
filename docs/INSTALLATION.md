@@ -17,6 +17,8 @@ Invoke-RestMethod http://localhost:18080/api/agents
 
 기본 compose의 `proxy`는 explicit proxy 기능 시험용 fixture이며 운영 구성 요소가 아닙니다. Docker Desktop은 기능 검증에만 사용하고 실제 처리량은 Linux 장비에서 측정하세요.
 
+이 fixture에서 얻은 direct와 CONNECT 결과는 로컬 경로 동작을 비교하는 용도로만 사용합니다. CONNECT에는 fixture의 요청 처리, upstream 연결과 relay 비용이 포함되므로 운영 proxy의 용량으로 해석하면 안 됩니다. 실제 proxy를 계측할 때는 fixture 주소 대신 측정 대상 proxy endpoint를 지정하고 client, server 및 control-plane topology를 Run 기록과 함께 보관하세요.
+
 ### Docker managed-direct 기능 시험
 
 `compose.managed-direct.yaml`을 추가하면 Client와 Server에 내부 L2 test-plane을 연결합니다. bootstrap은 Docker가 시험 NIC에 할당한 주소를 Agent 시작 전에 제거하므로, Agent inventory에는 관리 route를 가진 `eth0`와 주소가 없는 `eth1`이 구분되어 나타납니다.
