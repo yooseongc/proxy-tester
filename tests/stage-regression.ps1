@@ -1,19 +1,25 @@
-param([string]$BaseUrl = 'http://localhost:18080')
+param(
+    [string]$BaseUrl = 'http://localhost:18080',
+    [string]$ProfileRevisionId
+)
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/scenario-v4-helpers.ps1"
 $scenario = @{
-    version = 1; id = [guid]::NewGuid().ToString(); name = 'ramp-hold-down'
-    topology = 'transparent_proxy'; protocol = 'http1'
-    client_agent_id = 'client-1'; server_agent_id = 'server-1'; proxy_addr = $null
-    target_addr = 'server:8080'; source_ips = @(); virtual_clients = 6
-    duration_secs = 6; warmup_secs = 0
+    version = 4; id = [guid]::NewGuid().ToString(); name = 'ramp-hold-down'
+    path = New-ScenarioPath $BaseUrl 'managed_direct' $ProfileRevisionId
+    protocol = 'http1'; virtual_clients = 6; duration_secs = 6
     load_stages = @(
         @{ name = 'warmup'; mode = 'ramp'; duration_secs = 2; target_virtual_clients = 6; include_in_results = $false },
         @{ name = 'measure'; mode = 'hold'; duration_secs = 2; target_virtual_clients = 6; include_in_results = $true },
         @{ name = 'ramp-down'; mode = 'ramp'; duration_secs = 2; target_virtual_clients = 0; include_in_results = $true }
     )
     request = @{ method = 'GET'; path = '/'; host = 'proxy-tester.local'; request_body_bytes = 0; response_body_bytes = 256; keep_alive = $true; transactions_per_connection = 0; think_time_ms = 5 }
+    http2 = @{ max_concurrent_streams = 100 }
     tcp = @{ tx_bytes = 64; rx_bytes = 64 }
-    tls = @{ enabled = $false; verify_peer = $false; server_name = 'proxy-tester.local'; ca_pem = $null; server_cert_pem = $null; server_key_pem = $null }
+    payload_mode = 'manual'; capture_artifact_id = $null
+    request_payload = @{ kind = 'empty'; size_bytes = 0; text = ''; artifact_id = $null; random_format = 'binary' }
+    response_payload = @{ kind = 'fixed'; size_bytes = 256; text = ''; artifact_id = $null; random_format = 'binary' }
+    tls = @{ enabled = $false; verify_peer = $false; version = 'tls13'; cipher_suite = $null; server_name = 'proxy-tester.local'; ca_pem = $null; server_cert_pem = $null; server_key_pem = $null }
     timeouts = @{ connect_ms = 3000; proxy_connect_ms = 3000; response_ms = 5000 }
     observation_interfaces = @()
 }

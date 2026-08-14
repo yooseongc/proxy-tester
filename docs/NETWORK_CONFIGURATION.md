@@ -30,6 +30,8 @@ The packaged Agent needs `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_SYS_ADMIN` (fo
 
 `GET /api/network/audit` returns operations with their ordered, per-Node stage events. `POST /api/network/diagnose` verifies revision validity, Node liveness and current inventory availability; run preflight performs the final namespace path check. `POST /api/network/nodes/{id}/reconcile` requests local journal reconciliation after an interrupted operation.
 
+An Agent restart rolls back a prepared local journal before reconnecting. Control does not resume traffic workers automatically; use Teardown or Reconcile before planning another revision. Inventory is captured when the Agent connects, so a namespace-changing recovery must finish before reconnect or be followed by an Agent reconnect to refresh the UI snapshot.
+
 The plan review UI shows endpoint, namespace, address assignment, semantic changes and warnings per Node. Actual commands, rollback commands and the inventory fingerprint stay collapsed under advanced details. `GET /api/network/operations/{id}` backs the contextual diagnostics drawer with an ordered event timeline; the drawer refreshes from persisted state whenever a matching WebSocket event arrives.
 
 ## Failure recovery

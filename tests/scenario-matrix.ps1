@@ -1,17 +1,22 @@
-param([string]$BaseUrl = 'http://localhost:18080')
+param(
+    [string]$BaseUrl = 'http://localhost:18080',
+    [string]$ProfileRevisionId
+)
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/scenario-v4-helpers.ps1"
 
-function New-Scenario($name, $topology, $protocol, $transactions, $keepAlive = $true) {
+function New-Scenario($name, $pathKind, $protocol, $transactions, $keepAlive = $true) {
     @{
-        version = 1; id = [guid]::NewGuid().ToString(); name = $name
-        topology = $topology; protocol = $protocol
-        client_agent_id = 'client-1'; server_agent_id = 'server-1'
-        proxy_addr = if ($topology -eq 'explicit_proxy') { 'proxy:3128' } else { $null }
-        target_addr = 'server:8080'; source_ips = @(); virtual_clients = 4
-        duration_secs = 2; warmup_secs = 0
+        version = 4; id = [guid]::NewGuid().ToString(); name = $name
+        path = New-ScenarioPath $BaseUrl $pathKind $ProfileRevisionId
+        protocol = $protocol; virtual_clients = 4; duration_secs = 2; load_stages = @()
         request = @{ method = 'GET'; path = '/'; host = 'proxy-tester.local'; request_body_bytes = 128; response_body_bytes = 1024; keep_alive = $keepAlive; transactions_per_connection = $transactions; think_time_ms = 0 }
+        http2 = @{ max_concurrent_streams = 100 }
         tcp = @{ tx_bytes = 256; rx_bytes = 512 }
-        tls = @{ enabled = $false; verify_peer = $true; server_name = 'proxy-tester.local'; ca_pem = $null }
+        payload_mode = 'manual'; capture_artifact_id = $null
+        request_payload = @{ kind = 'fixed'; size_bytes = 128; text = ''; artifact_id = $null; random_format = 'binary' }
+        response_payload = @{ kind = 'fixed'; size_bytes = 1024; text = ''; artifact_id = $null; random_format = 'binary' }
+        tls = @{ enabled = $false; verify_peer = $false; version = 'tls13'; cipher_suite = $null; server_name = 'proxy-tester.local'; ca_pem = $null; server_cert_pem = $null; server_key_pem = $null }
         timeouts = @{ connect_ms = 3000; proxy_connect_ms = 3000; response_ms = 5000 }
         observation_interfaces = @('eth0')
     }
@@ -31,7 +36,7 @@ function Invoke-Scenario($scenario) {
     if ($client.Count -lt 1 -or $server.Count -lt 1) { throw "$($scenario.name): missing telemetry" }
     $cm = $client[-1].metrics; $sm = $server[-1].metrics
     if ($cm.transactions -le 0) { throw "$($scenario.name): no transactions" }
-    if ($scenario.topology -eq 'transparent_proxy') {
+    if ($scenario.path.kind -eq 'managed_direct') {
         if ($cm.bytes_tx -ne $sm.bytes_rx -or $cm.bytes_rx -ne $sm.bytes_tx) {
             throw "$($scenario.name): endpoint byte invariant failed"
         }
@@ -64,10 +69,10 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
 }
 
 $scenarios = @(
-    (New-Scenario 'tcp-direct' 'transparent_proxy' 'tcp' 1),
-    (New-Scenario 'http-single-direct' 'transparent_proxy' 'http1' 1 $false),
-    (New-Scenario 'http-fixed-direct' 'transparent_proxy' 'http1' 5),
-    (New-Scenario 'http-continuous-direct' 'transparent_proxy' 'http1' 0),
+    (New-Scenario 'tcp-direct' 'managed_direct' 'tcp' 1),
+    (New-Scenario 'http-single-direct' 'managed_direct' 'http1' 1 $false),
+    (New-Scenario 'http-fixed-direct' 'managed_direct' 'http1' 5),
+    (New-Scenario 'http-continuous-direct' 'managed_direct' 'http1' 0),
     (New-Scenario 'tcp-explicit-connect' 'explicit_proxy' 'tcp' 1),
     (New-Scenario 'http-explicit-forward' 'explicit_proxy' 'http1' 5)
 )

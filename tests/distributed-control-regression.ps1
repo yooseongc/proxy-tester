@@ -1,16 +1,19 @@
 param([string]$BaseUrl = 'http://localhost:18080')
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/scenario-v4-helpers.ps1"
 
 function New-Scenario([string]$name, [int]$duration) {
     @{
-        version = 1; id = [guid]::NewGuid().ToString(); name = $name
-        topology = 'transparent_proxy'; protocol = 'http1'
-        client_agent_id = 'client-1'; server_agent_id = 'server-1'; proxy_addr = $null
-        target_addr = 'server:8080'; source_ips = @(); virtual_clients = 2
-        duration_secs = $duration; warmup_secs = 0
+        version = 4; id = [guid]::NewGuid().ToString(); name = $name
+        path = New-ScenarioPath $BaseUrl 'explicit_proxy' ''
+        protocol = 'http1'; virtual_clients = 2; duration_secs = $duration; load_stages = @()
         request = @{ method = 'GET'; path = '/'; host = 'proxy-tester.local'; request_body_bytes = 16; response_body_bytes = 128; keep_alive = $true; transactions_per_connection = 0; think_time_ms = 5 }
+        http2 = @{ max_concurrent_streams = 100 }
         tcp = @{ tx_bytes = 16; rx_bytes = 128 }
-        tls = @{ enabled = $false; verify_peer = $false; server_name = 'proxy-tester.local'; ca_pem = $null }
+        payload_mode = 'manual'; capture_artifact_id = $null
+        request_payload = @{ kind = 'fixed'; size_bytes = 16; text = ''; artifact_id = $null; random_format = 'binary' }
+        response_payload = @{ kind = 'fixed'; size_bytes = 128; text = ''; artifact_id = $null; random_format = 'binary' }
+        tls = @{ enabled = $false; verify_peer = $false; version = 'tls13'; cipher_suite = $null; server_name = 'proxy-tester.local'; ca_pem = $null; server_cert_pem = $null; server_key_pem = $null }
         timeouts = @{ connect_ms = 3000; proxy_connect_ms = 3000; response_ms = 5000 }
         observation_interfaces = @()
     }
@@ -31,7 +34,7 @@ function Wait-Terminal([string]$id, [int]$attempts = 40) {
 
 $run = Start-Scenario (New-Scenario 'agent-reconnect-no-resume' 30)
 Start-Sleep -Seconds 2
-docker compose restart client | Out-Null
+docker compose -f compose.yaml -f compose.managed-direct.yaml restart client | Out-Null
 $sawDegraded = $false
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
     $detail = Invoke-RestMethod "$BaseUrl/api/runs/$($run.id)"

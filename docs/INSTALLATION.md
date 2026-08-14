@@ -26,12 +26,21 @@ docker compose -f compose.yaml -f compose.managed-direct.yaml build
 docker compose -f compose.yaml -f compose.managed-direct.yaml up -d
 ```
 
+managed-direct 환경을 시작한 뒤 일부 서비스만 빌드하거나 재시작할 때도 두 Compose 파일을 항상 함께 지정합니다. override를 빼면 Client/Server가 test-plane 없는 기본 구성으로 재생성될 수 있습니다. Proxy fixture만 갱신할 때는 의존 Agent를 건드리지 않도록 다음처럼 실행합니다.
+
+```powershell
+docker compose -f compose.yaml -f compose.managed-direct.yaml build proxy
+docker compose -f compose.yaml -f compose.managed-direct.yaml up -d --no-deps proxy
+```
+
 UI의 네트워크 프로파일은 다음 값으로 준비합니다.
 
 - Client: `client-1`, `eth1`, `172.31.0.10/24`, 주소 수 `1`
 - Server: `server-1`, `eth1`, `172.31.0.20/24`, 주소 수 `1`
 
 Docker bridge는 IPAM에 등록되지 않은 주소의 forwarding을 제한하므로 이 구성은 단일 주소의 plan/apply/run/teardown 기능 검증용입니다. 여러 source IP, 실제 inline 장비 경유와 처리량 측정에는 별도 물리 NIC 또는 Docker 외부에서 구성한 전용 bridge를 사용합니다. 로컬 Docker 주소 풀과 `172.31.0.0/24`가 충돌하면 override의 subnet, 고정 주소와 `PROXY_TESTER_TEST_IPV4_PREFIX`를 함께 변경해야 합니다.
+
+Docker 회귀 스크립트는 Scenario v4만 전송합니다. managed-direct 경로가 포함된 스크립트에는 UI/API에서 apply한 revision ID를 `-ProfileRevisionId`로 전달합니다. explicit proxy endpoint 주소는 컨테이너 재생성 때 달라질 수 있으므로 스크립트가 Agent inventory에서 node ID별 `eth0` 주소를 조회합니다.
 
 ## 단일 호스트 운영
 
