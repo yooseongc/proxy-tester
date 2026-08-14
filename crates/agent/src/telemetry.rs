@@ -1,9 +1,9 @@
 use std::{
     sync::{
-        Mutex as StdMutex,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::Mutex;
@@ -175,5 +175,91 @@ impl Drop for ActiveConnection<'_> {
         active.account_until(now);
         active.current = active.current.saturating_sub(1);
         active.min = active.min.min(active.current);
+    }
+}
+
+pub(crate) async fn monitor_interfaces(
+    interfaces: Vec<String>,
+    counters: Arc<Counters>,
+    running: Arc<AtomicBool>,
+) {
+    let baseline_tx = sum_interface_stats(&interfaces, "tx_packets");
+    let baseline_rx = sum_interface_stats(&interfaces, "rx_packets");
+    let baseline_tx_bytes = sum_interface_stats(&interfaces, "tx_bytes");
+    let baseline_rx_bytes = sum_interface_stats(&interfaces, "rx_bytes");
+    let baseline_retransmissions = read_tcp_retransmissions();
+    while running.load(Ordering::Relaxed) {
+        let tx = sum_interface_stats(&interfaces, "tx_packets");
+        let rx = sum_interface_stats(&interfaces, "rx_packets");
+        let tx_bytes = sum_interface_stats(&interfaces, "tx_bytes");
+        let rx_bytes = sum_interface_stats(&interfaces, "rx_bytes");
+        counters
+            .packets_tx
+            .store(tx.saturating_sub(baseline_tx), Ordering::Relaxed);
+        counters
+            .packets_rx
+            .store(rx.saturating_sub(baseline_rx), Ordering::Relaxed);
+        counters.wire_tx_bytes.store(
+            tx_bytes.saturating_sub(baseline_tx_bytes),
+            Ordering::Relaxed,
+        );
+        counters.wire_rx_bytes.store(
+            rx_bytes.saturating_sub(baseline_rx_bytes),
+            Ordering::Relaxed,
+        );
+        counters.tcp_retransmissions.store(
+            read_tcp_retransmissions().saturating_sub(baseline_retransmissions),
+            Ordering::Relaxed,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn sum_interface_stats(interfaces: &[String], stat: &str) -> u64 {
+    interfaces
+        .iter()
+        .map(|interface| read_interface_stat(interface, stat))
+        .sum()
+}
+
+fn read_tcp_retransmissions() -> u64 {
+    std::fs::read_to_string("/proc/net/snmp")
+        .ok()
+        .and_then(|contents| tcp_retransmissions_from(&contents))
+        .unwrap_or(0)
+}
+
+fn tcp_retransmissions_from(snmp: &str) -> Option<u64> {
+    let mut lines = snmp.lines().filter(|line| line.starts_with("Tcp:"));
+    let (Some(header), Some(values)) = (lines.next(), lines.next()) else {
+        return None;
+    };
+    header
+        .split_whitespace()
+        .skip(1)
+        .zip(values.split_whitespace().skip(1))
+        .find_map(|(name, value)| {
+            (name == "RetransSegs")
+                .then(|| value.parse().ok())
+                .flatten()
+        })
+}
+
+fn read_interface_stat(interface: &str, stat: &str) -> u64 {
+    std::fs::read_to_string(format!("/sys/class/net/{interface}/statistics/{stat}"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_retransmissions_by_header_name() {
+        let snmp = "Tcp: RtoAlgorithm ActiveOpens RetransSegs InErrs\nTcp: 1 12 34 5\n";
+        assert_eq!(tcp_retransmissions_from(snmp), Some(34));
+        assert_eq!(tcp_retransmissions_from("Tcp: ActiveOpens\n"), None);
     }
 }

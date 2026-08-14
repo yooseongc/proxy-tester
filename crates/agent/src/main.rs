@@ -624,7 +624,7 @@ async fn run_job(
     let counters = Arc::new(Counters::default());
     let started = Instant::now();
     let interface_task = job.scenario.runtime_interface.clone().map(|interface| {
-        tokio::spawn(monitor_interfaces(
+        tokio::spawn(telemetry::monitor_interfaces(
             vec![interface],
             counters.clone(),
             running.clone(),
@@ -877,94 +877,6 @@ fn percentile_ms(samples: &[u64], percentile: f64) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     sorted[((sorted.len() - 1) as f64 * percentile) as usize] as f64 / 1000.0
-}
-
-async fn monitor_interfaces(
-    interfaces: Vec<String>,
-    counters: Arc<Counters>,
-    running: Arc<AtomicBool>,
-) {
-    let baseline_tx: u64 = interfaces
-        .iter()
-        .map(|i| read_interface_stat(i, "tx_packets"))
-        .sum();
-    let baseline_rx: u64 = interfaces
-        .iter()
-        .map(|i| read_interface_stat(i, "rx_packets"))
-        .sum();
-    let baseline_tx_bytes: u64 = interfaces
-        .iter()
-        .map(|i| read_interface_stat(i, "tx_bytes"))
-        .sum();
-    let baseline_rx_bytes: u64 = interfaces
-        .iter()
-        .map(|i| read_interface_stat(i, "rx_bytes"))
-        .sum();
-    let baseline_retransmissions = read_tcp_retransmissions();
-    while running.load(Ordering::Relaxed) {
-        let tx: u64 = interfaces
-            .iter()
-            .map(|i| read_interface_stat(i, "tx_packets"))
-            .sum();
-        let rx: u64 = interfaces
-            .iter()
-            .map(|i| read_interface_stat(i, "rx_packets"))
-            .sum();
-        let tx_bytes: u64 = interfaces
-            .iter()
-            .map(|i| read_interface_stat(i, "tx_bytes"))
-            .sum();
-        let rx_bytes: u64 = interfaces
-            .iter()
-            .map(|i| read_interface_stat(i, "rx_bytes"))
-            .sum();
-        counters
-            .packets_tx
-            .store(tx.saturating_sub(baseline_tx), Ordering::Relaxed);
-        counters
-            .packets_rx
-            .store(rx.saturating_sub(baseline_rx), Ordering::Relaxed);
-        counters.wire_tx_bytes.store(
-            tx_bytes.saturating_sub(baseline_tx_bytes),
-            Ordering::Relaxed,
-        );
-        counters.wire_rx_bytes.store(
-            rx_bytes.saturating_sub(baseline_rx_bytes),
-            Ordering::Relaxed,
-        );
-        counters.tcp_retransmissions.store(
-            read_tcp_retransmissions().saturating_sub(baseline_retransmissions),
-            Ordering::Relaxed,
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-fn read_tcp_retransmissions() -> u64 {
-    let Ok(snmp) = std::fs::read_to_string("/proc/net/snmp") else {
-        return 0;
-    };
-    let mut lines = snmp.lines().filter(|line| line.starts_with("Tcp:"));
-    let (Some(header), Some(values)) = (lines.next(), lines.next()) else {
-        return 0;
-    };
-    let names = header.split_whitespace().skip(1);
-    let values = values.split_whitespace().skip(1);
-    names
-        .zip(values)
-        .find_map(|(name, value)| {
-            (name == "RetransSegs")
-                .then(|| value.parse().ok())
-                .flatten()
-        })
-        .unwrap_or(0)
-}
-
-fn read_interface_stat(interface: &str, stat: &str) -> u64 {
-    std::fs::read_to_string(format!("/sys/class/net/{interface}/statistics/{stat}"))
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
 }
 
 async fn run_client(
