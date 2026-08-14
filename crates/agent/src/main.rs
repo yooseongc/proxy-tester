@@ -21,7 +21,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     sync::{Mutex, mpsc},
 };
@@ -40,6 +39,7 @@ use connector::IoStream;
 use network::{NetworkManager, NetworkPlan};
 use payload::{CompletedArtifact, PreparedPayloads};
 use telemetry::Counters;
+use workload::WorkerGate;
 use workload::tcp::{replay_client, replay_server_detect};
 
 #[derive(Parser, Debug)]
@@ -245,22 +245,6 @@ fn rewrite_http_request(request: &[u8], scenario: &Scenario, role: Role) -> Vec<
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(&request[header_end..]);
     output
-}
-
-struct WorkerGate<'a> {
-    running: &'a AtomicBool,
-    paused: &'a AtomicBool,
-    generating: &'a AtomicBool,
-    desired_clients: &'a AtomicU32,
-    worker_index: u32,
-}
-
-impl WorkerGate<'_> {
-    fn enabled(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
-            && self.generating.load(Ordering::Relaxed)
-            && self.worker_index < self.desired_clients.load(Ordering::Relaxed)
-    }
 }
 
 #[tokio::main]
@@ -1125,7 +1109,7 @@ async fn transact(
         match sc.protocol {
             Protocol::Http1 => {
                 let absolute = sc.is_explicit_proxy() && !sc.tls.enabled;
-                http_transactions(&mut *stream, sc, payloads, absolute, c, gate).await
+                workload::http1::transactions(&mut *stream, sc, payloads, absolute, c, gate).await
             }
             _ => workload::tcp::transaction(&mut *stream, sc, payloads, c).await,
         }
@@ -1134,85 +1118,6 @@ async fn transact(
         c.transaction_completed();
     }
     result
-}
-
-async fn http_transactions(
-    stream: &mut (impl IoStream + ?Sized),
-    sc: &Scenario,
-    payloads: &PreparedPayloads,
-    absolute: bool,
-    c: &Counters,
-    gate: &WorkerGate<'_>,
-) -> anyhow::Result<()> {
-    let mut pending = Vec::with_capacity(8192);
-    let mut index = 0;
-    while gate.enabled() {
-        if sc.request.transactions_per_connection > 0
-            && index >= sc.request.transactions_per_connection
-        {
-            break;
-        }
-        while gate.paused.load(Ordering::Relaxed)
-            && gate.running.load(Ordering::Relaxed)
-            && gate.generating.load(Ordering::Relaxed)
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if !gate.enabled() {
-            break;
-        }
-        let transaction_started = Instant::now();
-        let target = if absolute {
-            format!("http://{}{}", sc.target_addr(), sc.request.path)
-        } else {
-            sc.request.path.clone()
-        };
-        let last = sc.request.transactions_per_connection > 0
-            && index + 1 == sc.request.transactions_per_connection;
-        let connection = if sc.request.keep_alive && !last {
-            "keep-alive"
-        } else {
-            "close"
-        };
-        let req = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: {}\r\nContent-Length: {}\r\nX-Response-Bytes: {}\r\n\r\n",
-            sc.request.method,
-            target,
-            sc.request.host,
-            connection,
-            payloads.request.len(),
-            payloads.response.len()
-        );
-        stream.write_all(req.as_bytes()).await?;
-        stream.write_all(&payloads.request).await?;
-        c.tx.fetch_add(
-            (req.len() + payloads.request.len()) as u64,
-            Ordering::Relaxed,
-        );
-        let (response, body_len) = tokio::time::timeout(
-            Duration::from_millis(sc.timeouts.response_ms),
-            read_http_message(stream, &mut pending, 64 * 1024),
-        )
-        .await??;
-        c.rx.fetch_add((response.len() + body_len) as u64, Ordering::Relaxed);
-        if !response.starts_with(b"HTTP/1.1 2") {
-            let status = response
-                .split(|byte| *byte == b' ')
-                .nth(1)
-                .unwrap_or_default();
-            bail!("HTTP error response {}", String::from_utf8_lossy(status))
-        }
-        c.transaction_completed();
-        c.http_latencies_us
-            .lock()
-            .await
-            .push(transaction_started.elapsed().as_micros() as u64);
-        index += 1;
-        if !last && sc.request.think_time_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(sc.request.think_time_ms)).await;
-        }
-    }
-    Ok(())
 }
 
 async fn send_h2_body(send: &mut h2::SendStream<Bytes>, payload: &[u8]) -> anyhow::Result<()> {
@@ -1389,7 +1294,7 @@ async fn run_server(
             } else if let Some(plan) = replay {
                 replay_server_detect(&mut *stream, &plan.flows, &sc, &c2).await
             } else if sc.protocol == Protocol::Http1 {
-                serve_http_connection(&mut *stream, &payloads, &c2).await
+                workload::http1::serve(&mut *stream, &payloads, &c2).await
             } else {
                 workload::tcp::serve(&mut *stream, &payloads, &c2).await
             };
@@ -1467,97 +1372,6 @@ async fn serve_http2_connection(
     }
     while let Some(result) = tasks.join_next().await {
         result?;
-    }
-    Ok(())
-}
-async fn serve_http_connection(
-    stream: &mut (impl IoStream + ?Sized),
-    payloads: &PreparedPayloads,
-    c: &Counters,
-) -> anyhow::Result<()> {
-    let mut pending = Vec::with_capacity(8192);
-    loop {
-        let (headers, body_len) = read_http_message(stream, &mut pending, 64 * 1024).await?;
-        c.rx.fetch_add((headers.len() + body_len) as u64, Ordering::Relaxed);
-        let response_len =
-            parse_header(&headers, "x-response-bytes").unwrap_or(payloads.response.len());
-        let keep_alive = header_equals(&headers, "connection", "keep-alive");
-        let connection = if keep_alive { "keep-alive" } else { "close" };
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {response_len}\r\nConnection: {connection}\r\n\r\n"
-        );
-        stream.write_all(head.as_bytes()).await?;
-        if response_len == payloads.response.len() {
-            stream.write_all(&payloads.response).await?;
-        } else {
-            write_zeroes(stream, response_len).await?;
-        }
-        c.tx.fetch_add((head.len() + response_len) as u64, Ordering::Relaxed);
-        c.transaction_completed();
-        if !keep_alive {
-            return Ok(());
-        }
-    }
-}
-
-async fn read_http_message(
-    stream: &mut (impl AsyncRead + Unpin + ?Sized),
-    pending: &mut Vec<u8>,
-    max_headers: usize,
-) -> anyhow::Result<(Vec<u8>, usize)> {
-    let header_end = loop {
-        if let Some(position) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
-            break position + 4;
-        }
-        if pending.len() > max_headers {
-            bail!("headers too large")
-        }
-        let mut chunk = [0u8; 8192];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            bail!("connection closed before HTTP message")
-        }
-        pending.extend_from_slice(&chunk[..n]);
-    };
-    let remainder = pending.split_off(header_end);
-    let headers = std::mem::replace(pending, remainder);
-    let body_len = parse_header(&headers, "content-length").unwrap_or(0);
-    while pending.len() < body_len {
-        let mut chunk = [0u8; 8192];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            bail!("connection closed before HTTP body")
-        }
-        pending.extend_from_slice(&chunk[..n]);
-    }
-    pending.drain(..body_len);
-    Ok((headers, body_len))
-}
-
-fn parse_header(raw: &[u8], name: &str) -> Option<usize> {
-    let text = String::from_utf8_lossy(raw);
-    text.lines()
-        .filter_map(|l| l.split_once(':'))
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .and_then(|(_, v)| v.trim().parse().ok())
-}
-fn header_equals(raw: &[u8], name: &str, expected: &str) -> bool {
-    let text = String::from_utf8_lossy(raw);
-    text.lines()
-        .filter_map(|line| line.split_once(':'))
-        .any(|(header, value)| {
-            header.eq_ignore_ascii_case(name) && value.trim().eq_ignore_ascii_case(expected)
-        })
-}
-async fn write_zeroes(
-    stream: &mut (impl AsyncWrite + Unpin + ?Sized),
-    mut n: usize,
-) -> anyhow::Result<()> {
-    static ZERO: [u8; 65536] = [0; 65536];
-    while n > 0 {
-        let size = n.min(ZERO.len());
-        stream.write_all(&ZERO[..size]).await?;
-        n -= size;
     }
     Ok(())
 }
