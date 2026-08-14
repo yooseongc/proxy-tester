@@ -23,14 +23,16 @@ Rust workspace는 다음 책임 경계를 따른다.
 - `control`: HTTP/gRPC 제어, 실행 orchestration과 저장소
 - `agent`: network 준비와 TCP/HTTP workload 실행
 
-Control의 `main`은 bootstrap과 서버 lifecycle을 담당하고, Router/middleware는 `routes`, 공유 상태와 pending command registry는 `state`, SQLite schema lifecycle은 `database`에 둔다. API 오류는 `error::ApiError`를 통해서만 HTTP 응답으로 변환한다.
+Control의 `main`은 bootstrap과 서버 lifecycle을 담당하고, Router/middleware는 `routes`, 공유 상태와 pending command registry는 `state`, SQLite schema lifecycle은 `database`에 둔다. Scenario, Artifact, Run과 metric sample의 영속성 SQL은 `repository` 아래의 리소스별 모듈에 두며 handler는 저장 형식이나 `sqlx::Row`를 알지 못해야 한다. API 오류는 `error::ApiError`를 통해서만 HTTP 응답으로 변환한다.
 
-Agent의 `main`은 control stream과 workload orchestration을 담당한다. Linux namespace 변경은 `network`, 인증서 검증·cipher·TLS version·ALPN 정책은 `tls` 모듈에 둔다. client와 responder는 같은 TLS helper를 사용해야 한다.
+Agent의 `main`은 control stream과 workload orchestration을 담당한다. artifact chunk 수신과 무결성 검증은 `artifact`, Run별 payload 준비는 `payload`, 누적 카운터·오류 분류·활성 연결 시간가중 집계는 `telemetry`에 둔다. Linux namespace 변경은 `network`, 인증서 검증·cipher·TLS version·ALPN 정책은 `tls` 모듈에 둔다. client와 responder는 같은 TLS helper를 사용해야 한다.
 
 ## 변경 규칙
 
 - REST path, protobuf field number, Scenario v4 JSON과 DB schema 변경은 별도 호환성 작업으로 취급한다.
 - domain↔protobuf 변환을 control이나 agent에 다시 구현하지 않는다.
 - handler에 새 SQL을 추가하기 전에 database/repository 경계에서 재사용 가능한지 확인한다.
+- repository는 저장소 레코드를 반환하고, redaction과 API JSON 구성은 handler 경계에서 수행한다.
+- 고빈도 계측 경로의 atomic counter는 `Relaxed` ordering을 사용하되, 연결 수의 시간가중 snapshot처럼 여러 값을 일관되게 바꾸는 상태는 전용 lock 안에서 갱신한다.
 - 비동기 작업은 오류를 무시하지 않고 API error, command ACK 또는 agent event 중 하나로 전달한다.
 - 각 구조 변경은 `cargo fmt`, clippy `-D warnings`, workspace test, frontend format/lint/typecheck/Vitest를 통과한 뒤 커밋한다.
