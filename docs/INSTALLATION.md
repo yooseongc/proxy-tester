@@ -42,6 +42,12 @@ Docker bridge는 IPAM에 등록되지 않은 주소의 forwarding을 제한하�
 
 Docker 회귀 스크립트는 Scenario v4만 전송합니다. managed-direct 경로가 포함된 스크립트에는 UI/API에서 apply한 revision ID를 `-ProfileRevisionId`로 전달합니다. explicit proxy endpoint 주소는 컨테이너 재생성 때 달라질 수 있으므로 스크립트가 Agent inventory에서 node ID별 `eth0` 주소를 조회합니다.
 
+대표 경로를 조금 더 긴 부하로 확인할 때는 다음 명령을 사용합니다. 기본값은 8 VU, 3초 ramp-up, 9초 hold, 3초 ramp-down과 요청 16KiB/응답 64KiB이며 Docker 처리량을 운영 성능 기준으로 사용하지 않습니다.
+
+```powershell
+.\tests\elevated-measurement-regression.ps1 -ProfileRevisionId <prepared-revision-id>
+```
+
 ## 단일 호스트 운영
 
 `.env.example`을 `.env`로 복사해 image와 포트를 지정한 뒤 실행합니다.
