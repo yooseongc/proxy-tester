@@ -17,7 +17,7 @@ use proxy_tester_domain::{
     Scenario,
 };
 use proxy_tester_proto::v1::{
-    AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, SetPaused, StopRun,
+    AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -1007,100 +1007,27 @@ async fn start_run(
 }
 
 async fn stop_run(
-    State(s): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let current = *s.active_run.lock().await;
-    if current != Some(id) {
-        return Err(ApiError::bad("실행 중인 run이 아닙니다"));
-    }
-    let agents = s.agents.read().await.clone();
-    let participant_ids = s
-        .run_agents
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .unwrap_or_default();
-    for agent_id in participant_ids {
-        if let Some(agent) = agents.get(&agent_id) {
-            let _ = orchestration::command_agent(
-                &s,
-                &agent_id,
-                agent,
-                id,
-                "stop",
-                ControlMessage {
-                    body: Some(control_message::Body::Stop(StopRun {
-                        run_id: id.to_string(),
-                        command_id: String::new(),
-                        endpoint_role: 0,
-                    })),
-                },
-            )
-            .await;
-        }
-    }
-    orchestration::finish_run(&s, id, "cancelled", None).await?;
+    orchestration::stop_run(&state, id).await?;
     Ok(Json(serde_json::json!({"id":id,"status":"cancelled"})))
 }
 async fn pause_run(
-    State(s): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    set_run_paused(&s, id, true).await
-}
-async fn resume_run(
-    State(s): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    set_run_paused(&s, id, false).await
-}
-async fn set_run_paused(
-    s: &AppState,
-    id: Uuid,
-    paused: bool,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if *s.active_run.lock().await != Some(id) {
-        return Err(ApiError::bad("실행 중인 run이 아닙니다"));
-    }
-    let message = ControlMessage {
-        body: Some(control_message::Body::SetPaused(SetPaused {
-            run_id: id.to_string(),
-            paused,
-            command_id: String::new(),
-            endpoint_role: 0,
-        })),
-    };
-    let agents = s.agents.read().await.clone();
-    let participant_ids = s
-        .run_agents
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .unwrap_or_default();
-    for agent_id in participant_ids {
-        let agent = agents
-            .get(&agent_id)
-            .ok_or_else(|| ApiError::internal(format!("{agent_id} is disconnected")))?;
-        orchestration::command_agent(
-            s,
-            &agent_id,
-            agent,
-            id,
-            if paused { "pause" } else { "resume" },
-            message.clone(),
-        )
-        .await?;
-    }
-    let status = if paused { "paused" } else { "running" };
-    repository::runs::set_status(&s.db, &id.to_string(), status).await?;
-    let _ = s
-        .events
-        .send(serde_json::json!({"type":"run_state","run_id":id,"status":status}).to_string());
+    let status = orchestration::set_run_paused(&state, id, true).await?;
     Ok(Json(serde_json::json!({"id":id,"status":status})))
 }
+async fn resume_run(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let status = orchestration::set_run_paused(&state, id, false).await?;
+    Ok(Json(serde_json::json!({"id":id,"status":status})))
+}
+
 async fn active_run(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"run_id":*s.active_run.lock().await}))
 }

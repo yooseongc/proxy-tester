@@ -5,7 +5,7 @@ use proxy_tester_domain::{
     NetworkProfileDraft, PayloadKind, PayloadMode, Protocol, Scenario, ScenarioPath,
 };
 use proxy_tester_proto::v1::{
-    ArtifactChunk, ControlMessage, PrepareRun, StartRun, StopRun, control_message,
+    ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun, control_message,
 };
 use sqlx::{Row, SqlitePool};
 use tokio::io::AsyncReadExt;
@@ -311,6 +311,86 @@ async fn stop_agents<'a>(run_id: Uuid, agents: impl IntoIterator<Item = &'a Agen
             }))
             .await;
     }
+}
+
+pub(crate) async fn stop_run(state: &AppState, run_id: Uuid) -> Result<(), ApiError> {
+    if *state.active_run.lock().await != Some(run_id) {
+        return Err(ApiError::bad("실행 중인 run이 아닙니다"));
+    }
+    let agents = state.agents.read().await.clone();
+    let participant_ids = state
+        .run_agents
+        .lock()
+        .await
+        .get(&run_id)
+        .cloned()
+        .unwrap_or_default();
+    for agent_id in participant_ids {
+        if let Some(agent) = agents.get(&agent_id) {
+            let _ = command_agent(
+                state,
+                &agent_id,
+                agent,
+                run_id,
+                "stop",
+                ControlMessage {
+                    body: Some(control_message::Body::Stop(StopRun {
+                        run_id: run_id.to_string(),
+                        command_id: String::new(),
+                        endpoint_role: 0,
+                    })),
+                },
+            )
+            .await;
+        }
+    }
+    finish_run(state, run_id, "cancelled", None).await
+}
+
+pub(crate) async fn set_run_paused(
+    state: &AppState,
+    run_id: Uuid,
+    paused: bool,
+) -> Result<&'static str, ApiError> {
+    if *state.active_run.lock().await != Some(run_id) {
+        return Err(ApiError::bad("실행 중인 run이 아닙니다"));
+    }
+    let message = ControlMessage {
+        body: Some(control_message::Body::SetPaused(SetPaused {
+            run_id: run_id.to_string(),
+            paused,
+            command_id: String::new(),
+            endpoint_role: 0,
+        })),
+    };
+    let agents = state.agents.read().await.clone();
+    let participant_ids = state
+        .run_agents
+        .lock()
+        .await
+        .get(&run_id)
+        .cloned()
+        .unwrap_or_default();
+    for agent_id in participant_ids {
+        let agent = agents
+            .get(&agent_id)
+            .ok_or_else(|| ApiError::internal(format!("{agent_id} is disconnected")))?;
+        command_agent(
+            state,
+            &agent_id,
+            agent,
+            run_id,
+            if paused { "pause" } else { "resume" },
+            message.clone(),
+        )
+        .await?;
+    }
+    let status = if paused { "paused" } else { "running" };
+    repository::runs::set_status(&state.db, &run_id.to_string(), status).await?;
+    let _ = state
+        .events
+        .send(serde_json::json!({"type":"run_state","run_id":run_id,"status":status}).to_string());
+    Ok(status)
 }
 
 fn with_command_id(mut message: ControlMessage, command_id: &str) -> ControlMessage {
