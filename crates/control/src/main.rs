@@ -1,13 +1,12 @@
 use anyhow::Context;
 use axum::{
-    Json, Router,
+    Json,
     extract::{
-        DefaultBodyLimit, Multipart, Path, Query, State, WebSocketUpgrade,
+        Multipart, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use chrono::Utc;
 use clap::Parser;
@@ -35,15 +34,11 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
-use tower_http::{
-    cors::CorsLayer,
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
 use tracing::{info, warn};
 use uuid::Uuid;
 mod database;
 mod error;
+mod routes;
 mod state;
 
 #[cfg(test)]
@@ -139,58 +134,7 @@ async fn main() -> anyhow::Result<()> {
             .await
     });
 
-    let static_dir = args.static_dir.clone();
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/agents", get(agents))
-        .route(
-            "/api/network/profiles",
-            get(list_network_profiles).post(save_network_profile),
-        )
-        .route(
-            "/api/network/profiles/{id}/plan",
-            post(plan_network_profile),
-        )
-        .route(
-            "/api/network/profiles/{id}/archive",
-            post(archive_network_profile),
-        )
-        .route(
-            "/api/network/operations/{id}/apply",
-            post(apply_network_profile),
-        )
-        .route(
-            "/api/network/revisions/{id}/teardown",
-            post(teardown_network_profile),
-        )
-        .route("/api/network/audit", get(network_audit))
-        .route("/api/network/diagnose", post(diagnose_network))
-        .route("/api/network/nodes/{id}/reconcile", post(reconcile_node))
-        .route("/api/network/revisions", get(list_network_revisions))
-        .route("/api/scenarios", get(list_scenarios).post(save_scenario))
-        .route("/api/scenarios/validate", post(validate_scenario))
-        .route("/api/preflight", post(preflight))
-        .route("/api/tls/certificates", post(generate_tls_certificate))
-        .route("/api/artifacts", get(list_artifacts).post(upload_artifact))
-        .route("/api/runs", get(list_runs).post(start_run))
-        .route("/api/runs/page", get(list_runs_page))
-        .route("/api/runs/active", get(active_run))
-        .route("/api/runs/{id}", get(run_detail))
-        .route("/api/runs/{id}/summary", get(run_summary_detail))
-        .route("/api/runs/{id}/samples", get(run_samples))
-        .route("/api/runs/{id}/export", get(export_run))
-        .route("/api/runs/{id}/stop", post(stop_run))
-        .route("/api/runs/{id}/pause", post(pause_run))
-        .route("/api/runs/{id}/resume", post(resume_run))
-        .route("/api/events/ws", get(events_ws))
-        .fallback_service(
-            ServeDir::new(&static_dir)
-                .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
-        )
-        .layer(DefaultBodyLimit::max(513 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = routes::build(state, &args.static_dir);
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
     info!(addr=%args.http_addr,"control HTTP listening");
     let http_shutdown = shutdown_rx;
