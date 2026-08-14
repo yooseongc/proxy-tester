@@ -1018,8 +1018,7 @@ async fn upload_artifact(
 async fn list_artifacts(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let rows = sqlx::query("SELECT id,kind,name,sha256,size_bytes,format,packet_count,captured_bytes,analysis_json,created_at FROM artifacts ORDER BY created_at DESC").fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r| { let analysis=r.get::<Option<String>,_>("analysis_json").and_then(|v|serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default(); serde_json::json!({"id":r.get::<String,_>("id"),"kind":r.get::<String,_>("kind"),"name":r.get::<String,_>("name"),"sha256":r.get::<String,_>("sha256"),"size_bytes":r.get::<i64,_>("size_bytes"),"format":r.get::<String,_>("format"),"packet_count":r.get::<i64,_>("packet_count"),"captured_bytes":r.get::<i64,_>("captured_bytes"),"analysis":analysis,"created_at":r.get::<String,_>("created_at")})}).collect()))
+    Ok(Json(repository::artifacts::list(&s.db).await?))
 }
 
 #[cfg(test)]
@@ -1351,19 +1350,15 @@ async fn validate_payload_artifacts(db: &SqlitePool, scenario: &Scenario) -> Res
         let id = payload.artifact_id.ok_or_else(|| {
             ApiError::bad(format!("{direction} file payload requires artifact_id"))
         })?;
-        let row = sqlx::query("SELECT kind,size_bytes FROM artifacts WHERE id=?")
-            .bind(id.to_string())
-            .fetch_optional(db)
-            .await?
-            .ok_or_else(|| {
-                ApiError::bad(format!("{direction} payload artifact {id} does not exist"))
-            })?;
-        if row.get::<String, _>("kind") != "payload" {
+        let artifact = repository::artifacts::find(db, id).await?.ok_or_else(|| {
+            ApiError::bad(format!("{direction} payload artifact {id} does not exist"))
+        })?;
+        if artifact.kind != "payload" {
             return Err(ApiError::bad(format!(
                 "{direction} artifact {id} is not a payload artifact"
             )));
         }
-        let stored_size = row.get::<i64, _>("size_bytes") as usize;
+        let stored_size = artifact.size_bytes as usize;
         if stored_size != payload.size_bytes {
             return Err(ApiError::bad(format!(
                 "{direction} artifact size changed: scenario={}, stored={stored_size}",
@@ -1381,20 +1376,15 @@ async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Resu
     let id = scenario
         .capture_artifact_id
         .ok_or_else(|| ApiError::bad("capture replay requires capture_artifact_id"))?;
-    let row = sqlx::query("SELECT kind,analysis_json FROM artifacts WHERE id=?")
-        .bind(id.to_string())
-        .fetch_optional(db)
+    let artifact = repository::artifacts::find(db, id)
         .await?
         .ok_or_else(|| ApiError::bad(format!("capture artifact {id} does not exist")))?;
-    if row.get::<String, _>("kind") != "pcap" {
+    if artifact.kind != "pcap" {
         return Err(ApiError::bad(format!(
             "artifact {id} is not a PCAP artifact"
         )));
     }
-    let analysis = row
-        .get::<Option<String>, _>("analysis_json")
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .unwrap_or_default();
+    let analysis = artifact.analysis;
     let count_key = match scenario.protocol {
         Protocol::Http1 => "http_flow_count",
         Protocol::Http2 => "http2_flow_count",
@@ -1416,20 +1406,18 @@ async fn send_artifacts(
     artifact_ids: &HashSet<Uuid>,
 ) -> Result<(), ApiError> {
     for artifact_id in artifact_ids {
-        let row = sqlx::query("SELECT kind,sha256,size_bytes,path FROM artifacts WHERE id=?")
-            .bind(artifact_id.to_string())
-            .fetch_optional(db)
+        let artifact = repository::artifacts::find(db, *artifact_id)
             .await?
             .ok_or_else(|| {
                 ApiError::bad(format!("payload artifact {artifact_id} does not exist"))
             })?;
-        let kind: String = row.get("kind");
+        let kind = artifact.kind;
         if kind != "payload" && kind != "pcap" {
             return Err(ApiError::bad(format!(
                 "artifact {artifact_id} has unsupported kind {kind}"
             )));
         }
-        let total_size = row.get::<i64, _>("size_bytes") as u64;
+        let total_size = artifact.size_bytes;
         let limit = if kind == "pcap" {
             512 * 1024 * 1024
         } else {
@@ -1440,8 +1428,8 @@ async fn send_artifacts(
                 "{kind} artifact {artifact_id} exceeds its size limit"
             )));
         }
-        let sha256: String = row.get("sha256");
-        let path: String = row.get("path");
+        let sha256 = artifact.sha256;
+        let path = artifact.path;
         let mut file = tokio::fs::File::open(&path)
             .await
             .map_err(|e| ApiError::internal(format!("open artifact {artifact_id}: {e}")))?;
