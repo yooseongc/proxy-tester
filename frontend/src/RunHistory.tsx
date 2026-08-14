@@ -1,30 +1,252 @@
-import {useEffect,useMemo,useState} from 'react';
-import {CheckCircle2,Download,FileJson2,History,Radio,Scale} from 'lucide-react';
-import {api} from './api';
-import {TelemetryCharts} from './TelemetryCharts';
-import {Button,Panel,SectionTitle,StatusBadge,type Theme} from './ui';
-import type {Metrics,Point,Scenario} from './model';
+import { useEffect, useMemo, useState } from "react";
+import { CheckCircle2, Download, FileJson2, History, Scale } from "lucide-react";
+import { api } from "./api";
+import { TelemetryCharts } from "./TelemetryCharts";
+import { Button, Panel, SectionTitle, StatusBadge, type Theme } from "./ui";
+import type { Metrics, Point, Scenario } from "./model";
 
-type RunSummary={id:string;run_name:string|null;status:string;started_at:string|null;finished_at:string|null;error:string|null;scenario:Scenario};
-type Sample={agent_id:string;role:number;unix_ms:number;metrics:Metrics};
-type RunDetail={id:string;run_name:string|null;started_at:string|null;status:string;scenario:Scenario;samples:Sample[]};
-type RunPage={items:RunSummary[];next_cursor:number|null};
-const number=(value:number|undefined)=>value?.toLocaleString()??'—',mbps=(value:number|undefined)=>value===undefined?'—':`${(value/1_000_000).toFixed(2)} Mbps`;
-export const resultMetrics=(detail:RunDetail|undefined)=>{const client=detail?.samples.filter(sample=>sample.role===1)??[];return {connections:Math.max(0,...client.map(s=>s.metrics.connections_established)),transactions:Math.max(0,...client.map(s=>s.metrics.transactions)),cps:Math.max(0,...client.map(s=>s.metrics.cps)),tps:Math.max(0,...client.map(s=>s.metrics.tps)),app:Math.max(0,...client.map(s=>Math.max(s.metrics.tx_bps??0,s.metrics.rx_bps??0))),wire:Math.max(0,...client.map(s=>Math.max(s.metrics.wire_tx_bps??0,s.metrics.wire_rx_bps??0))),p99:Math.max(0,...client.map(s=>s.metrics.http_latency_p99_ms??0))}};
+type RunSummary = {
+  id: string;
+  run_name: string | null;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  scenario: Scenario;
+};
+type Sample = { agent_id: string; role: number; unix_ms: number; metrics: Metrics };
+type RunDetail = {
+  id: string;
+  run_name: string | null;
+  started_at: string | null;
+  status: string;
+  scenario: Scenario;
+  samples: Sample[];
+};
+type RunPage = { items: RunSummary[]; next_cursor: number | null };
+const number = (value: number | undefined) => value?.toLocaleString() ?? "—",
+  mbps = (value: number | undefined) =>
+    value === undefined ? "—" : `${(value / 1_000_000).toFixed(2)} Mbps`;
+export const resultMetrics = (detail: RunDetail | undefined) => {
+  const client = detail?.samples.filter((sample) => sample.role === 1) ?? [];
+  return {
+    connections: Math.max(0, ...client.map((s) => s.metrics.connections_established)),
+    transactions: Math.max(0, ...client.map((s) => s.metrics.transactions)),
+    cps: Math.max(0, ...client.map((s) => s.metrics.cps)),
+    tps: Math.max(0, ...client.map((s) => s.metrics.tps)),
+    app: Math.max(0, ...client.map((s) => Math.max(s.metrics.tx_bps ?? 0, s.metrics.rx_bps ?? 0))),
+    wire: Math.max(
+      0,
+      ...client.map((s) => Math.max(s.metrics.wire_tx_bps ?? 0, s.metrics.wire_rx_bps ?? 0)),
+    ),
+    p99: Math.max(0, ...client.map((s) => s.metrics.http_latency_p99_ms ?? 0)),
+  };
+};
 
-export function RunHistory({refreshKey,theme}:{refreshKey:string;theme:Theme}){
- const [runs,setRuns]=useState<RunSummary[]>([]),[cursor,setCursor]=useState<number|null>(null),[selected,setSelected]=useState<string[]>([]),[details,setDetails]=useState<Record<string,RunDetail>>({});
- const loadPage=(next?:number)=>api<RunPage>(`/api/runs/page?limit=25${next?`&cursor=${next}`:''}`).then(page=>{setRuns(current=>next?[...current,...page.items]:page.items);setCursor(page.next_cursor)});
- useEffect(()=>{loadPage().catch(()=>{})},[refreshKey]);
- useEffect(()=>{for(const id of selected)if(!details[id])Promise.all([api<RunDetail>(`/api/runs/${id}/summary`),api<{samples:Sample[]}>(`/api/runs/${id}/samples?max_points=2000`)]).then(([detail,samples])=>setDetails(current=>({...current,[id]:{...detail,samples:samples.samples,scenario:{...detail.scenario,name:detail.run_name??detail.scenario.name}}}))).catch(()=>{})},[selected,details]);
- const active=selected[0]?details[selected[0]]:undefined,comparisons=useMemo(()=>selected.map(id=>({detail:details[id],metrics:resultMetrics(details[id])})),[selected,details]);
- const chartPoints:Point[]=active?.samples.map(sample=>({...sample.metrics,agent_id:sample.agent_id,role:sample.role,unix_ms:sample.unix_ms}))??[];
- const toggle=(id:string)=>setSelected(current=>current.includes(id)?current.filter(value=>value!==id):[...current.slice(-1),id]);
- const exportRun=(format:'json'|'csv')=>{if(active)window.location.assign(`/api/runs/${active.id}/export?format=${format}`)};
- return <Panel className="p-4 sm:p-6"><SectionTitle eyebrow="RESULT ARCHIVE" title="시험 이력 및 비교" aside={<div className="flex gap-2"><Button disabled={!active} onClick={()=>exportRun('csv')}><Download size={14}/>CSV</Button><Button disabled={!active} onClick={()=>exportRun('json')}><FileJson2 size={14}/>JSON</Button></div>}/>
-  <div className="grid min-w-0 gap-4 lg:grid-cols-[340px_minmax(0,1fr)]"><aside className="max-h-[460px] overflow-auto rounded-2xl border border-line bg-inset p-1.5">{runs.length?runs.map(run=><label key={run.id} className={`mb-1 grid cursor-pointer grid-cols-[auto_1fr_auto] items-center gap-3 rounded-xl border p-3 transition last:mb-0 ${selected.includes(run.id)?'border-signal/35 bg-signal/10':'border-transparent hover:bg-raised'}`}><input type="checkbox" checked={selected.includes(run.id)} onChange={()=>toggle(run.id)} className="size-4 accent-signal"/><span className="min-w-0"><b className="block truncate text-xs">{run.scenario?.name??run.id.slice(0,8)}</b><small className="mt-1 block truncate font-mono text-[8px] text-dim">{run.scenario?.protocol?.toUpperCase()} · {run.started_at?new Date(run.started_at).toLocaleString():'—'}</small></span><StatusBadge tone={run.status==='completed'?'live':run.status==='failed'?'danger':'neutral'}>{run.status}</StatusBadge></label>):<div className="grid min-h-48 place-items-center text-center text-xs text-dim"><div><History className="mx-auto mb-3"/><p>저장된 시험이 없습니다.</p></div></div>}{cursor&&<Button className="mt-2 w-full" onClick={()=>loadPage(cursor)}>이전 Run 더 보기</Button>}</aside>
-   <div className="min-w-0 overflow-auto rounded-2xl border border-line bg-raised/45">{comparisons.length?<table className="w-full min-w-[520px] border-collapse text-xs"><thead><tr><th className="border-b border-line p-3 text-left font-mono text-[9px] uppercase tracking-wider text-dim">Metric</th>{comparisons.map(({detail},index)=><th className="border-b border-line p-3 text-right" key={index}>{detail?.scenario.name??'불러오는 중'}</th>)}</tr></thead><tbody>{[['상태',(item:typeof comparisons[number])=>item.detail?.status??'—'],['집계 연결',(item:typeof comparisons[number])=>number(item.metrics.connections)],['집계 Transaction',(item:typeof comparisons[number])=>number(item.metrics.transactions)],['최대 CPS',(item:typeof comparisons[number])=>number(Math.round(item.metrics.cps))],['최대 TPS',(item:typeof comparisons[number])=>number(Math.round(item.metrics.tps))],['최대 App B/W',(item:typeof comparisons[number])=>mbps(item.metrics.app)],['최대 Wire B/W',(item:typeof comparisons[number])=>mbps(item.metrics.wire)],['HTTP P99 최대',(item:typeof comparisons[number])=>`${item.metrics.p99.toFixed(2)} ms`]].map(([label,read])=><tr key={String(label)}><td className="border-b border-line p-3 text-dim">{String(label)}</td>{comparisons.map((item,index)=><td className="mono-numbers border-b border-line p-3 text-right" key={index}>{(read as (value:typeof item)=>string)(item)}</td>)}</tr>)}</tbody></table>:<div className="grid min-h-64 place-items-center text-center"><div><Scale className="mx-auto mb-3 text-signal"/><h3 className="text-sm">Run을 선택해 비교하세요</h3><p className="mt-2 max-w-sm text-xs leading-relaxed text-dim">최대 2개 Run의 핵심 결과를 나란히 비교하고 첫 번째 Run의 전체 시계열을 탐색할 수 있습니다.</p></div></div>}</div>
-  </div>
-  {active&&<section className="mt-6 border-t border-line pt-5"><div className="mb-2 flex items-end justify-between gap-3"><div><p className="font-mono text-[9px] font-bold uppercase tracking-[.16em] text-signal">Selected run telemetry</p><h3 className="mt-1 text-base font-bold">{active.scenario.name}</h3></div><span className="flex items-center gap-2 text-[10px] text-dim"><CheckCircle2 size={13} className="text-signal"/>첫 번째 선택 Run · 읽기 전용</span></div><TelemetryCharts points={chartPoints} scenario={active.scenario} theme={theme}/></section>}
- </Panel>;
+export function RunHistory({ refreshKey, theme }: { refreshKey: string; theme: Theme }) {
+  const [runs, setRuns] = useState<RunSummary[]>([]),
+    [cursor, setCursor] = useState<number | null>(null),
+    [selected, setSelected] = useState<string[]>([]),
+    [details, setDetails] = useState<Record<string, RunDetail>>({});
+  const loadPage = (next?: number) =>
+    api<RunPage>(`/api/runs/page?limit=25${next ? `&cursor=${next}` : ""}`).then((page) => {
+      setRuns((current) => (next ? [...current, ...page.items] : page.items));
+      setCursor(page.next_cursor);
+    });
+  useEffect(() => {
+    loadPage().catch(() => {});
+  }, [refreshKey]);
+  useEffect(() => {
+    for (const id of selected)
+      if (!details[id])
+        Promise.all([
+          api<RunDetail>(`/api/runs/${id}/summary`),
+          api<{ samples: Sample[] }>(`/api/runs/${id}/samples?max_points=2000`),
+        ])
+          .then(([detail, samples]) =>
+            setDetails((current) => ({
+              ...current,
+              [id]: {
+                ...detail,
+                samples: samples.samples,
+                scenario: { ...detail.scenario, name: detail.run_name ?? detail.scenario.name },
+              },
+            })),
+          )
+          .catch(() => {});
+  }, [selected, details]);
+  const active = selected[0] ? details[selected[0]] : undefined,
+    comparisons = useMemo(
+      () => selected.map((id) => ({ detail: details[id], metrics: resultMetrics(details[id]) })),
+      [selected, details],
+    );
+  const chartPoints: Point[] =
+    active?.samples.map((sample) => ({
+      ...sample.metrics,
+      agent_id: sample.agent_id,
+      role: sample.role,
+      unix_ms: sample.unix_ms,
+    })) ?? [];
+  const toggle = (id: string) =>
+    setSelected((current) =>
+      current.includes(id) ? current.filter((value) => value !== id) : [...current.slice(-1), id],
+    );
+  const exportRun = (format: "json" | "csv") => {
+    if (active) window.location.assign(`/api/runs/${active.id}/export?format=${format}`);
+  };
+  return (
+    <Panel className="p-4 sm:p-6">
+      <SectionTitle
+        eyebrow="RESULT ARCHIVE"
+        title="시험 이력 및 비교"
+        aside={
+          <div className="flex gap-2">
+            <Button disabled={!active} onClick={() => exportRun("csv")}>
+              <Download size={14} />
+              CSV
+            </Button>
+            <Button disabled={!active} onClick={() => exportRun("json")}>
+              <FileJson2 size={14} />
+              JSON
+            </Button>
+          </div>
+        }
+      />
+      <div className="grid min-w-0 gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
+        <aside className="max-h-[460px] overflow-auto rounded-2xl border border-line bg-inset p-1.5">
+          {runs.length ? (
+            runs.map((run) => (
+              <label
+                key={run.id}
+                className={`mb-1 grid cursor-pointer grid-cols-[auto_1fr_auto] items-center gap-3 rounded-xl border p-3 transition last:mb-0 ${selected.includes(run.id) ? "border-signal/35 bg-signal/10" : "border-transparent hover:bg-raised"}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.includes(run.id)}
+                  onChange={() => toggle(run.id)}
+                  className="size-4 accent-signal"
+                />
+                <span className="min-w-0">
+                  <b className="block truncate text-xs">
+                    {run.scenario?.name ?? run.id.slice(0, 8)}
+                  </b>
+                  <small className="mt-1 block truncate font-mono text-[8px] text-dim">
+                    {run.scenario?.protocol?.toUpperCase()} ·{" "}
+                    {run.started_at ? new Date(run.started_at).toLocaleString() : "—"}
+                  </small>
+                </span>
+                <StatusBadge
+                  tone={
+                    run.status === "completed"
+                      ? "live"
+                      : run.status === "failed"
+                        ? "danger"
+                        : "neutral"
+                  }
+                >
+                  {run.status}
+                </StatusBadge>
+              </label>
+            ))
+          ) : (
+            <div className="grid min-h-48 place-items-center text-center text-xs text-dim">
+              <div>
+                <History className="mx-auto mb-3" />
+                <p>저장된 시험이 없습니다.</p>
+              </div>
+            </div>
+          )}
+          {cursor && (
+            <Button className="mt-2 w-full" onClick={() => loadPage(cursor)}>
+              이전 Run 더 보기
+            </Button>
+          )}
+        </aside>
+        <div className="min-w-0 overflow-auto rounded-2xl border border-line bg-raised/45">
+          {comparisons.length ? (
+            <table className="w-full min-w-[520px] border-collapse text-xs">
+              <thead>
+                <tr>
+                  <th className="border-b border-line p-3 text-left font-mono text-[9px] uppercase tracking-wider text-dim">
+                    Metric
+                  </th>
+                  {comparisons.map(({ detail }, index) => (
+                    <th className="border-b border-line p-3 text-right" key={index}>
+                      {detail?.scenario.name ?? "불러오는 중"}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  ["상태", (item: (typeof comparisons)[number]) => item.detail?.status ?? "—"],
+                  [
+                    "집계 연결",
+                    (item: (typeof comparisons)[number]) => number(item.metrics.connections),
+                  ],
+                  [
+                    "집계 Transaction",
+                    (item: (typeof comparisons)[number]) => number(item.metrics.transactions),
+                  ],
+                  [
+                    "최대 CPS",
+                    (item: (typeof comparisons)[number]) => number(Math.round(item.metrics.cps)),
+                  ],
+                  [
+                    "최대 TPS",
+                    (item: (typeof comparisons)[number]) => number(Math.round(item.metrics.tps)),
+                  ],
+                  ["최대 App B/W", (item: (typeof comparisons)[number]) => mbps(item.metrics.app)],
+                  [
+                    "최대 Wire B/W",
+                    (item: (typeof comparisons)[number]) => mbps(item.metrics.wire),
+                  ],
+                  [
+                    "HTTP P99 최대",
+                    (item: (typeof comparisons)[number]) => `${item.metrics.p99.toFixed(2)} ms`,
+                  ],
+                ].map(([label, read]) => (
+                  <tr key={String(label)}>
+                    <td className="border-b border-line p-3 text-dim">{String(label)}</td>
+                    {comparisons.map((item, index) => (
+                      <td className="mono-numbers border-b border-line p-3 text-right" key={index}>
+                        {(read as (value: typeof item) => string)(item)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="grid min-h-64 place-items-center text-center">
+              <div>
+                <Scale className="mx-auto mb-3 text-signal" />
+                <h3 className="text-sm">Run을 선택해 비교하세요</h3>
+                <p className="mt-2 max-w-sm text-xs leading-relaxed text-dim">
+                  최대 2개 Run의 핵심 결과를 나란히 비교하고 첫 번째 Run의 전체 시계열을 탐색할 수
+                  있습니다.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      {active && (
+        <section className="mt-6 border-t border-line pt-5">
+          <div className="mb-2 flex items-end justify-between gap-3">
+            <div>
+              <p className="font-mono text-[9px] font-bold uppercase tracking-[.16em] text-signal">
+                Selected run telemetry
+              </p>
+              <h3 className="mt-1 text-base font-bold">{active.scenario.name}</h3>
+            </div>
+            <span className="flex items-center gap-2 text-[10px] text-dim">
+              <CheckCircle2 size={13} className="text-signal" />첫 번째 선택 Run · 읽기 전용
+            </span>
+          </div>
+          <TelemetryCharts points={chartPoints} scenario={active.scenario} theme={theme} />
+        </section>
+      )}
+    </Panel>
+  );
 }

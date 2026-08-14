@@ -1,0 +1,7 @@
+dist
+node_modules
+test-results
+playwright-report
+tsconfig.tsbuildinfo
+debug.log
+package-lock.json

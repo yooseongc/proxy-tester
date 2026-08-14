@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:e2e": "playwright test"
@@ -27,7 +30,13 @@
     "@tailwindcss/vite": "^4.3.3",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "eslint": "^9.39.5",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.11.0",
+    "prettier": "^3.9.6",
     "tailwindcss": "^4.3.3",
+    "typescript-eslint": "^8.67.0",
     "vitest": "latest"
   }
 }

@@ -17,7 +17,11 @@ describe("api", () => {
 
     const error = await api("/api/scenarios").catch((value) => value);
     expect(error).toBeInstanceOf(ApiClientError);
-    expect(error).toMatchObject({ status: 422, code: "invalid_scenario", message: "invalid payload" });
+    expect(error).toMatchObject({
+      status: 422,
+      code: "invalid_scenario",
+      message: "invalid payload",
+    });
   });
 
   it("classifies transport failures", async () => {

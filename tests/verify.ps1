@@ -23,6 +23,10 @@ try {
     try {
         npm run typecheck
         Assert-NativeSuccess 'frontend typecheck'
+        npm run format:check
+        Assert-NativeSuccess 'frontend format check'
+        npm run lint
+        Assert-NativeSuccess 'frontend lint'
         npm test
         Assert-NativeSuccess 'frontend unit tests'
         if ($Mode -eq 'Full') {
