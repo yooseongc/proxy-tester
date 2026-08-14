@@ -296,78 +296,7 @@ async fn plan_network_profile(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row = sqlx::query("SELECT draft_json FROM network_profiles WHERE id=? AND archived=0")
-        .bind(id.to_string())
-        .fetch_optional(&s.db)
-        .await?
-        .ok_or_else(|| ApiError::not_found("network profile not found"))?;
-    let draft: NetworkProfileDraft =
-        serde_json::from_str(row.get::<String, _>("draft_json").as_str())
-            .map_err(|e| ApiError::bad(e.to_string()))?;
-    draft.validate().map_err(|e| ApiError::bad(e.to_string()))?;
-    let body = serde_json::to_string(&draft)?;
-    let sha = format!("{:x}", Sha256::digest(body.as_bytes()));
-    let existing = sqlx::query("SELECT id,revision FROM network_profile_revisions WHERE sha256=?")
-        .bind(&sha)
-        .fetch_optional(&s.db)
-        .await?;
-    let (revision_id, revision) = if let Some(r) = existing {
-        (r.get::<String, _>("id"), r.get::<i64, _>("revision"))
-    } else {
-        let revision: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(revision),0)+1 FROM network_profile_revisions WHERE profile_id=?",
-        )
-        .bind(id.to_string())
-        .fetch_one(&s.db)
-        .await?;
-        let revision_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO network_profile_revisions(id,profile_id,revision,sha256,body_json,status,created_at) VALUES(?,?,?,?,?,'unprepared',?)").bind(&revision_id).bind(id.to_string()).bind(revision).bind(&sha).bind(&body).bind(Utc::now().to_rfc3339()).execute(&s.db).await?;
-        (revision_id, revision)
-    };
-    let token = Uuid::new_v4().to_string();
-    let operation_id = Uuid::new_v4();
-    let now = Utc::now();
-    let expires = now + chrono::Duration::minutes(5);
-    let mut nodes = vec![
-        draft.client_endpoint.node_id.clone(),
-        draft.server_endpoint.node_id.clone(),
-    ];
-    nodes.sort();
-    nodes.dedup();
-    let mut detail = serde_json::json!({"nodes":nodes,"plans":{}});
-    sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,plan_token_hash,expires_at,detail_json,created_at,updated_at) VALUES(?,?,'plan','planned',?,?,?,?,?)").bind(operation_id.to_string()).bind(&revision_id).bind(format!("{:x}",Sha256::digest(token.as_bytes()))).bind(expires.to_rfc3339()).bind(detail.to_string()).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&s.db).await?;
-    let mut plans = serde_json::Map::new();
-    for node in &nodes {
-        let progress = network_orchestration::command(
-            &s,
-            node,
-            operation_id,
-            "plan",
-            serde_json::json!({"profile_revision_id":revision_id,"draft":draft}),
-            expires.timestamp_millis(),
-        )
-        .await?;
-        plans.insert(
-            node.clone(),
-            wire::plan_to_json(
-                progress
-                    .plan
-                    .ok_or_else(|| ApiError::internal("agent plan response is missing plan"))?,
-            ),
-        );
-    }
-    detail["plans"] = serde_json::Value::Object(plans);
-    sqlx::query(
-        "UPDATE network_operations SET status='planned',detail_json=?,updated_at=? WHERE id=?",
-    )
-    .bind(detail.to_string())
-    .bind(Utc::now().to_rfc3339())
-    .bind(operation_id.to_string())
-    .execute(&s.db)
-    .await?;
-    Ok(Json(
-        serde_json::json!({"operation_id":operation_id,"profile_revision_id":revision_id,"revision":revision,"sha256":sha,"plan_token":token,"expires_at":expires,"detail":detail}),
-    ))
+    Ok(Json(network_orchestration::plan(&s, id).await?))
 }
 
 #[derive(Deserialize)]
@@ -388,103 +317,8 @@ async fn apply_network_profile(
     Path(operation_id): Path<Uuid>,
     Json(request): Json<ApplyNetworkRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if s.active_run.lock().await.is_some() {
-        return Err(ApiError::conflict(
-            "network profile cannot be applied during a run",
-        ));
-    }
-    let row=sqlx::query("SELECT profile_revision_id,status,plan_token_hash,expires_at,detail_json FROM network_operations WHERE id=? AND kind='plan'").bind(operation_id.to_string()).fetch_optional(&s.db).await?.ok_or_else(||ApiError::not_found("network plan not found"))?;
-    if row.get::<String, _>("status") != "planned" {
-        return Err(ApiError::conflict("network plan token is single-use"));
-    }
-    let expected: String = row.get("plan_token_hash");
-    if expected != format!("{:x}", Sha256::digest(request.plan_token.as_bytes())) {
-        return Err(ApiError::bad("invalid plan token"));
-    }
-    let expires: chrono::DateTime<Utc> = row
-        .get::<String, _>("expires_at")
-        .parse()
-        .map_err(|_| ApiError::bad("invalid plan expiry"))?;
-    if expires < Utc::now() {
-        return Err(ApiError::conflict("network plan expired"));
-    }
-    let revision_id = Uuid::parse_str(row.get::<String, _>("profile_revision_id").as_str())
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let (_draft, nodes, profile_id) = revision_nodes(&s.db, revision_id).await?;
-    let lease = Utc::now().timestamp_millis() + 180_000;
-    sqlx::query("UPDATE network_operations SET status='applying',updated_at=? WHERE id=?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(operation_id.to_string())
-        .execute(&s.db)
-        .await?;
-    let mut staged: Vec<String> = Vec::new();
-    let saved: serde_json::Value =
-        serde_json::from_str(row.get::<String, _>("detail_json").as_str())?;
-    let plans = saved["plans"]
-        .as_object()
-        .cloned()
-        .ok_or_else(|| ApiError::internal("network plan has no node plans"))?;
-    for node in &nodes {
-        let plan = plans
-            .get(node)
-            .cloned()
-            .ok_or_else(|| ApiError::internal(format!("network plan missing node {node}")))?;
-        if let Err(error) =
-            network_orchestration::command(&s, node, operation_id, "stage", plan, lease).await
-        {
-            for applied in &staged {
-                let _ = network_orchestration::command(
-                    &s,
-                    applied,
-                    operation_id,
-                    "rollback",
-                    serde_json::Value::Null,
-                    lease,
-                )
-                .await;
-            }
-            sqlx::query("UPDATE network_operations SET status='failed',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"error":error.message,"plans":plans}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation_id.to_string()).execute(&s.db).await?;
-            return Err(error);
-        }
-        staged.push(node.clone());
-    }
-    for node in &nodes {
-        if let Err(error) = network_orchestration::command(
-            &s,
-            node,
-            operation_id,
-            "commit",
-            serde_json::Value::Null,
-            lease,
-        )
-        .await
-        {
-            for applied in &staged {
-                let _ = network_orchestration::command(
-                    &s,
-                    applied,
-                    operation_id,
-                    "rollback",
-                    serde_json::Value::Null,
-                    lease,
-                )
-                .await;
-            }
-            return Err(error);
-        }
-    }
-    sqlx::query("UPDATE network_operations SET status='completed',detail_json=?,plan_token_hash=NULL,updated_at=? WHERE id=?").bind(serde_json::json!({"plans":plans}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation_id.to_string()).execute(&s.db).await?;
-    sqlx::query("UPDATE network_profile_revisions SET status='prepared' WHERE id=?")
-        .bind(revision_id.to_string())
-        .execute(&s.db)
-        .await?;
-    sqlx::query("UPDATE network_profiles SET status='prepared',updated_at=? WHERE id=?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(profile_id.to_string())
-        .execute(&s.db)
-        .await?;
     Ok(Json(
-        serde_json::json!({"operation_id":operation_id,"profile_revision_id":revision_id,"status":"prepared"}),
+        network_orchestration::apply(&s, operation_id, &request.plan_token).await?,
     ))
 }
 
@@ -492,44 +326,8 @@ async fn teardown_network_profile(
     State(s): State<AppState>,
     Path(revision_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if s.active_run.lock().await.is_some() {
-        return Err(ApiError::conflict("active run must finish before teardown"));
-    }
-    let (_draft, nodes, profile_id) = revision_nodes(&s.db, revision_id).await?;
-    let operation = Uuid::new_v4();
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,detail_json,created_at,updated_at) VALUES(?,?,'teardown','tearing_down','{}',?,?)").bind(operation.to_string()).bind(revision_id.to_string()).bind(&now).bind(&now).execute(&s.db).await?;
-    for node in &nodes {
-        if let Err(error) = network_orchestration::command(
-            &s,
-            node,
-            operation,
-            "teardown",
-            serde_json::Value::Null,
-            Utc::now().timestamp_millis() + 180_000,
-        )
-        .await
-        {
-            sqlx::query("UPDATE network_operations SET status='quarantined',detail_json=?,updated_at=? WHERE id=?").bind(serde_json::json!({"node":node,"error":error.message}).to_string()).bind(Utc::now().to_rfc3339()).bind(operation.to_string()).execute(&s.db).await?;
-            return Err(error);
-        }
-    }
-    sqlx::query("UPDATE network_profile_revisions SET status='unprepared' WHERE id=?")
-        .bind(revision_id.to_string())
-        .execute(&s.db)
-        .await?;
-    sqlx::query("UPDATE network_profiles SET status='unprepared',updated_at=? WHERE id=?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(profile_id.to_string())
-        .execute(&s.db)
-        .await?;
-    sqlx::query("UPDATE network_operations SET status='completed',updated_at=? WHERE id=?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(operation.to_string())
-        .execute(&s.db)
-        .await?;
     Ok(Json(
-        serde_json::json!({"operation_id":operation,"status":"unprepared"}),
+        network_orchestration::teardown(&s, revision_id).await?,
     ))
 }
 
