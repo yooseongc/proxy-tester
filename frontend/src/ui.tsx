@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, ElementType, HTMLAttributes, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 
 export type Theme = "light" | "dark";
@@ -49,6 +49,42 @@ export function SectionTitle({
       </div>
       {aside}
     </div>
+  );
+}
+
+export function ConfigSection({
+  icon: Icon,
+  title,
+  description,
+  children,
+}: {
+  icon: ElementType;
+  title: string;
+  description: string;
+  children: ReactNode;
+}) {
+  const order = title.startsWith("1.")
+    ? "order-1"
+    : title.startsWith("2.")
+      ? "order-2"
+      : title.startsWith("3.")
+        ? "order-3"
+        : "order-4";
+  return (
+    <section
+      className={`${order} min-w-0 overflow-hidden rounded-2xl border border-line bg-raised/45 p-4`}
+    >
+      <div className="mb-4 flex min-w-0 gap-3">
+        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-signal/10 text-signal">
+          <Icon size={16} />
+        </span>
+        <div className="min-w-0">
+          <h3 className="m-0 text-sm font-bold">{title}</h3>
+          <p className="mt-1 text-[10px] leading-relaxed text-dim">{description}</p>
+        </div>
+      </div>
+      <div className="min-w-0 space-y-3">{children}</div>
+    </section>
   );
 }
 export function Field({

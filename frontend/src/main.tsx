@@ -46,7 +46,16 @@ import {
 } from "./model";
 import { useControlResources } from "./hooks/useControlResources";
 import { useRunTelemetry } from "./hooks/useRunTelemetry";
-import { Button, Field, MetricCard, Panel, SectionTitle, StatusBadge, type Theme } from "./ui";
+import {
+  Button,
+  ConfigSection,
+  Field,
+  MetricCard,
+  Panel,
+  SectionTitle,
+  StatusBadge,
+  type Theme,
+} from "./ui";
 import "./styles.css";
 import { NetworkSetup } from "./NetworkSetup";
 
@@ -1142,42 +1151,6 @@ function App() {
         )}
       </main>
     </div>
-  );
-}
-
-function ConfigSection({
-  icon: Icon,
-  title,
-  description,
-  children,
-}: {
-  icon: React.ElementType;
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}) {
-  const order = title.startsWith("1.")
-    ? "order-1"
-    : title.startsWith("2.")
-      ? "order-2"
-      : title.startsWith("3.")
-        ? "order-3"
-        : "order-4";
-  return (
-    <section
-      className={`${order} min-w-0 overflow-hidden rounded-2xl border border-line bg-raised/45 p-4`}
-    >
-      <div className="mb-4 flex min-w-0 gap-3">
-        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-signal/10 text-signal">
-          <Icon size={16} />
-        </span>
-        <div className="min-w-0">
-          <h3 className="m-0 text-sm font-bold">{title}</h3>
-          <p className="mt-1 text-[10px] leading-relaxed text-dim">{description}</p>
-        </div>
-      </div>
-      <div className="min-w-0 space-y-3">{children}</div>
-    </section>
   );
 }
 
