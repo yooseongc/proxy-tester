@@ -1,0 +1,27 @@
+services:
+  client:
+    entrypoint: ["/bin/sh", "/managed-direct-entrypoint.sh"]
+    command: ["/proxy-client"]
+    environment:
+      PROXY_TESTER_TEST_IPV4_PREFIX: "172.31."
+    networks:
+      default: {}
+      test-plane:
+        ipv4_address: 172.31.0.10
+
+  server:
+    entrypoint: ["/bin/sh", "/managed-direct-entrypoint.sh"]
+    command: ["/proxy-server"]
+    environment:
+      PROXY_TESTER_TEST_IPV4_PREFIX: "172.31."
+    networks:
+      default: {}
+      test-plane:
+        ipv4_address: 172.31.0.20
+
+networks:
+  test-plane:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

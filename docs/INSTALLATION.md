@@ -17,6 +17,22 @@ Invoke-RestMethod http://localhost:18080/api/agents
 
 기본 compose의 `proxy`는 explicit proxy 기능 시험용 fixture이며 운영 구성 요소가 아닙니다. Docker Desktop은 기능 검증에만 사용하고 실제 처리량은 Linux 장비에서 측정하세요.
 
+### Docker managed-direct 기능 시험
+
+`compose.managed-direct.yaml`을 추가하면 Client와 Server에 내부 L2 test-plane을 연결합니다. bootstrap은 Docker가 시험 NIC에 할당한 주소를 Agent 시작 전에 제거하므로, Agent inventory에는 관리 route를 가진 `eth0`와 주소가 없는 `eth1`이 구분되어 나타납니다.
+
+```powershell
+docker compose -f compose.yaml -f compose.managed-direct.yaml build
+docker compose -f compose.yaml -f compose.managed-direct.yaml up -d
+```
+
+UI의 네트워크 프로파일은 다음 값으로 준비합니다.
+
+- Client: `client-1`, `eth1`, `172.31.0.10/24`, 주소 수 `1`
+- Server: `server-1`, `eth1`, `172.31.0.20/24`, 주소 수 `1`
+
+Docker bridge는 IPAM에 등록되지 않은 주소의 forwarding을 제한하므로 이 구성은 단일 주소의 plan/apply/run/teardown 기능 검증용입니다. 여러 source IP, 실제 inline 장비 경유와 처리량 측정에는 별도 물리 NIC 또는 Docker 외부에서 구성한 전용 bridge를 사용합니다. 로컬 Docker 주소 풀과 `172.31.0.0/24`가 충돌하면 override의 subnet, 고정 주소와 `PROXY_TESTER_TEST_IPV4_PREFIX`를 함께 변경해야 합니다.
+
 ## 단일 호스트 운영
 
 `.env.example`을 `.env`로 복사해 image와 포트를 지정한 뒤 실행합니다.

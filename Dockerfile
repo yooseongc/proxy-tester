@@ -21,6 +21,7 @@ ENTRYPOINT ["/proxy-control"]
 FROM alpine:3.23 AS agent
 RUN apk add --no-cache iproute2 ethtool iputils
 COPY --from=backend /src/target/x86_64-unknown-linux-musl/release/proxy-agent /proxy-agent
+COPY tests/managed-direct-entrypoint.sh /managed-direct-entrypoint.sh
 ENTRYPOINT ["/proxy-agent"]
 
 FROM agent AS client
