@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 mod database;
 mod error;
+mod orchestration;
 mod repository;
 mod routes;
 mod state;
@@ -1505,7 +1506,7 @@ async fn stop_run(
             .await;
         }
     }
-    finish_run(&s, id, "cancelled", None).await?;
+    orchestration::finish_run(&s, id, "cancelled", None).await?;
     Ok(Json(serde_json::json!({"id":id,"status":"cancelled"})))
 }
 async fn pause_run(
@@ -1568,32 +1569,6 @@ async fn set_run_paused(
         .events
         .send(serde_json::json!({"type":"run_state","run_id":id,"status":status}).to_string());
     Ok(Json(serde_json::json!({"id":id,"status":status})))
-}
-async fn finish_run(
-    s: &AppState,
-    id: Uuid,
-    status: &str,
-    error: Option<&str>,
-) -> Result<(), ApiError> {
-    sqlx::query("UPDATE runs SET status=?,finished_at=?,error=? WHERE id=?")
-        .bind(status)
-        .bind(Utc::now().to_rfc3339())
-        .bind(error)
-        .bind(id.to_string())
-        .execute(&s.db)
-        .await?;
-    let mut active = s.active_run.lock().await;
-    if *active == Some(id) {
-        *active = None;
-    }
-    drop(active);
-    s.run_agents.lock().await.remove(&id);
-    s.completed_agents.lock().await.remove(&id);
-    s.expected_endpoints.lock().await.remove(&id);
-    let _ = s
-        .events
-        .send(serde_json::json!({"type":"run_finished","run_id":id,"status":status}).to_string());
-    Ok(())
 }
 async fn active_run(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"run_id":*s.active_run.lock().await}))
@@ -1941,7 +1916,9 @@ impl AgentControl for ControlSvc {
                                     .await;
                             }
                             let reason = format!("endpoint_worker_failed: {}", e.message);
-                            let _ = finish_run(&state, run_id, "failed", Some(&reason)).await;
+                            let _ =
+                                orchestration::finish_run(&state, run_id, "failed", Some(&reason))
+                                    .await;
                         }
                         if e.message == "run_completed"
                             && let Ok(run_id) = Uuid::parse_str(&e.run_id)
@@ -1965,7 +1942,9 @@ impl AgentControl for ControlSvc {
                                     .is_some_and(|items| expected.is_subset(items));
                             drop(completed);
                             if all_completed {
-                                let _ = finish_run(&state, run_id, "completed", None).await;
+                                let _ =
+                                    orchestration::finish_run(&state, run_id, "completed", None)
+                                        .await;
                             }
                         }
                         let _=state.events.send(serde_json::json!({"type":"agent_event","agent_id":id,"run_id":e.run_id,"level":e.level,"message":e.message}).to_string());
@@ -2040,7 +2019,7 @@ async fn schedule_disconnect_failure(state: AppState, agent_id: String) {
                 }))
                 .await;
         }
-        let _ = finish_run(
+        let _ = orchestration::finish_run(
             &state,
             run_id,
             "failed",

@@ -94,3 +94,19 @@ pub(crate) async fn samples(
         .await?;
     Ok(rows.into_iter().map(sample_from_row).collect())
 }
+
+pub(crate) async fn finish(
+    db: &SqlitePool,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE runs SET status=?,finished_at=?,error=? WHERE id=?")
+        .bind(status)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(error)
+        .bind(run_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
