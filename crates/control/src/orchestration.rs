@@ -1,9 +1,12 @@
 use std::collections::HashSet;
 
+use chrono::Utc;
 use proxy_tester_domain::{
     NetworkProfileDraft, PayloadKind, PayloadMode, Protocol, Scenario, ScenarioPath,
 };
-use proxy_tester_proto::v1::{ArtifactChunk, ControlMessage, control_message};
+use proxy_tester_proto::v1::{
+    ArtifactChunk, ControlMessage, PrepareRun, StartRun, StopRun, control_message,
+};
 use sqlx::{Row, SqlitePool};
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
@@ -118,6 +121,195 @@ pub(crate) async fn scenario_runtime(
                 ),
             ))
         }
+    }
+}
+
+pub(crate) async fn start_run(
+    state: &AppState,
+    scenario: Scenario,
+    requested_name: Option<String>,
+) -> Result<Uuid, ApiError> {
+    scenario
+        .validate()
+        .map_err(|error| ApiError::bad(error.to_string()))?;
+    validate_artifacts(&state.db, &scenario).await?;
+    let mut artifact_ids: HashSet<Uuid> = [
+        scenario.request_payload.clone(),
+        scenario.response_payload.clone(),
+    ]
+    .into_iter()
+    .filter(|payload| payload.kind == PayloadKind::File)
+    .filter_map(|payload| payload.artifact_id)
+    .collect();
+    if let Some(capture_id) = scenario
+        .capture_artifact_id
+        .filter(|_| scenario.payload_mode == PayloadMode::CaptureReplay)
+    {
+        artifact_ids.insert(capture_id);
+    }
+    let mut active = state.active_run.lock().await;
+    if active.is_some() {
+        return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
+    }
+    let (client_id, server_id, profile_ready) = scenario_nodes(&state.db, &scenario).await?;
+    if !profile_ready {
+        return Err(ApiError::conflict(
+            "referenced network profile revision is not prepared",
+        ));
+    }
+    let sessions = state.agents.read().await;
+    let online_cutoff = Utc::now().timestamp_millis() - 15_000;
+    let client = sessions
+        .get(&client_id)
+        .filter(|agent| agent.last_seen_ms >= online_cutoff)
+        .ok_or_else(|| ApiError::bad("client agent가 연결되지 않았습니다"))?
+        .clone();
+    let server = sessions
+        .get(&server_id)
+        .filter(|agent| agent.last_seen_ms >= online_cutoff)
+        .ok_or_else(|| ApiError::bad("server agent가 연결되지 않았습니다"))?
+        .clone();
+    drop(sessions);
+
+    let run_id = Uuid::new_v4();
+    let scenario_json = serde_json::to_string(&scenario)?;
+    let (client_runtime, server_runtime) = scenario_runtime(&state.db, &scenario).await?;
+    let started_at = Utc::now();
+    let run_name = requested_name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{} · {}",
+                scenario.name,
+                started_at.format("%Y-%m-%d %H:%M:%S UTC")
+            )
+        });
+    repository::runs::create(
+        &state.db,
+        repository::runs::NewRun {
+            id: &run_id.to_string(),
+            scenario_id: &scenario.id.to_string(),
+            scenario_json: &scenario_json,
+            run_name: &run_name,
+        },
+    )
+    .await?;
+
+    let prepare = ControlMessage {
+        body: Some(control_message::Body::Prepare(PrepareRun {
+            run_id: run_id.to_string(),
+            scenario_json,
+            command_id: String::new(),
+            endpoint_role: 1,
+            target_addr: client_runtime.0,
+            interface_name: client_runtime.1,
+            namespace: client_runtime.2,
+            source_ips: client_runtime.3,
+        })),
+    };
+    let preparation = async {
+        send_artifacts(&state.db, &client, &artifact_ids).await?;
+        if client_id != server_id {
+            send_artifacts(&state.db, &server, &artifact_ids).await?;
+        }
+        command_agent(
+            state,
+            &client_id,
+            &client,
+            run_id,
+            "prepare",
+            prepare.clone(),
+        )
+        .await?;
+        let mut server_prepare = prepare;
+        if let Some(control_message::Body::Prepare(value)) = server_prepare.body.as_mut() {
+            value.endpoint_role = 2;
+            value.target_addr = server_runtime.0;
+            value.interface_name = server_runtime.1;
+            value.namespace = server_runtime.2;
+            value.source_ips = server_runtime.3;
+        }
+        command_agent(
+            state,
+            &server_id,
+            &server,
+            run_id,
+            "prepare",
+            server_prepare,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = preparation {
+        repository::runs::finish(
+            &state.db,
+            &run_id.to_string(),
+            "failed",
+            Some(&error.message),
+        )
+        .await?;
+        return Err(error);
+    }
+
+    let start = ControlMessage {
+        body: Some(control_message::Body::Start(StartRun {
+            run_id: run_id.to_string(),
+            start_unix_ms: Utc::now().timestamp_millis() + 1000,
+            command_id: String::new(),
+            endpoint_role: 1,
+        })),
+    };
+    let starting = async {
+        command_agent(state, &client_id, &client, run_id, "start", start.clone()).await?;
+        let mut server_start = start;
+        if let Some(control_message::Body::Start(value)) = server_start.body.as_mut() {
+            value.endpoint_role = 2;
+        }
+        command_agent(state, &server_id, &server, run_id, "start", server_start).await
+    }
+    .await;
+    if let Err(error) = starting {
+        stop_agents(run_id, [&client, &server]).await;
+        repository::runs::finish(
+            &state.db,
+            &run_id.to_string(),
+            "failed",
+            Some(&error.message),
+        )
+        .await?;
+        return Err(error);
+    }
+
+    repository::runs::mark_running(&state.db, &run_id.to_string(), &started_at.to_rfc3339())
+        .await?;
+    *active = Some(run_id);
+    state.run_agents.lock().await.insert(
+        run_id,
+        HashSet::from([client_id.clone(), server_id.clone()]),
+    );
+    state.expected_endpoints.lock().await.insert(
+        run_id,
+        HashSet::from([format!("{client_id}:1"), format!("{server_id}:2")]),
+    );
+    let _ = state
+        .events
+        .send(serde_json::json!({"type":"run_started","run_id":run_id}).to_string());
+    Ok(run_id)
+}
+
+async fn stop_agents<'a>(run_id: Uuid, agents: impl IntoIterator<Item = &'a AgentSession>) {
+    for agent in agents {
+        let _ = agent
+            .tx
+            .send(Ok(ControlMessage {
+                body: Some(control_message::Body::Stop(StopRun {
+                    run_id: run_id.to_string(),
+                    command_id: Uuid::new_v4().to_string(),
+                    endpoint_role: 0,
+                })),
+            }))
+            .await;
     }
 }
 

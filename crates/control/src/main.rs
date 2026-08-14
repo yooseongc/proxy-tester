@@ -17,8 +17,7 @@ use proxy_tester_domain::{
     Scenario,
 };
 use proxy_tester_proto::v1::{
-    AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun, SetPaused, StartRun,
-    StopRun,
+    AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, SetPaused, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -26,7 +25,7 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use std::{collections::HashSet, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 use tokio::{
     io::AsyncWriteExt,
     sync::{broadcast, mpsc, oneshot, watch},
@@ -993,161 +992,14 @@ enum StartRunPayload {
 }
 
 async fn start_run(
-    State(s): State<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<StartRunPayload>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let (sc, requested_name) = match payload {
+    let (scenario, requested_name) = match payload {
         StartRunPayload::Wrapped { scenario, run_name } => (scenario, run_name),
         StartRunPayload::Legacy(scenario) => (scenario, None),
     };
-    sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
-    let artifact_ids: HashSet<Uuid> = [sc.request_payload.clone(), sc.response_payload.clone()]
-        .into_iter()
-        .filter(|payload| payload.kind == PayloadKind::File)
-        .filter_map(|payload| payload.artifact_id)
-        .collect();
-    let mut artifact_ids = artifact_ids;
-    if let Some(capture_id) = sc
-        .capture_artifact_id
-        .filter(|_| sc.payload_mode == PayloadMode::CaptureReplay)
-    {
-        artifact_ids.insert(capture_id);
-    }
-    let mut active = s.active_run.lock().await;
-    if active.is_some() {
-        return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
-    }
-    let (client_id, server_id, profile_ready) = orchestration::scenario_nodes(&s.db, &sc).await?;
-    if !profile_ready {
-        return Err(ApiError::conflict(
-            "referenced network profile revision is not prepared",
-        ));
-    }
-    let sessions = s.agents.read().await;
-    let online_cutoff = Utc::now().timestamp_millis() - 15_000;
-    let client = sessions
-        .get(&client_id)
-        .filter(|agent| agent.last_seen_ms >= online_cutoff)
-        .ok_or_else(|| ApiError::bad("client agent가 연결되지 않았습니다"))?
-        .clone();
-    let server = sessions
-        .get(&server_id)
-        .filter(|agent| agent.last_seen_ms >= online_cutoff)
-        .ok_or_else(|| ApiError::bad("server agent가 연결되지 않았습니다"))?
-        .clone();
-    drop(sessions);
-    let run_id = Uuid::new_v4();
-    let json = serde_json::to_string(&sc)?;
-    let (client_runtime, server_runtime) = orchestration::scenario_runtime(&s.db, &sc).await?;
-    let started_at = Utc::now();
-    let run_name = requested_name
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            format!(
-                "{} · {}",
-                sc.name,
-                started_at.format("%Y-%m-%d %H:%M:%S UTC")
-            )
-        });
-    repository::runs::create(
-        &s.db,
-        repository::runs::NewRun {
-            id: &run_id.to_string(),
-            scenario_id: &sc.id.to_string(),
-            scenario_json: &json,
-            run_name: &run_name,
-        },
-    )
-    .await?;
-    let prepare = ControlMessage {
-        body: Some(control_message::Body::Prepare(PrepareRun {
-            run_id: run_id.to_string(),
-            scenario_json: json,
-            command_id: String::new(),
-            endpoint_role: 1,
-            target_addr: client_runtime.0,
-            interface_name: client_runtime.1,
-            namespace: client_runtime.2,
-            source_ips: client_runtime.3,
-        })),
-    };
-    let preparation = async {
-        orchestration::send_artifacts(&s.db, &client, &artifact_ids).await?;
-        if client_id != server_id {
-            orchestration::send_artifacts(&s.db, &server, &artifact_ids).await?;
-        }
-        orchestration::command_agent(&s, &client_id, &client, run_id, "prepare", prepare.clone())
-            .await?;
-        let mut server_prepare = prepare;
-        if let Some(control_message::Body::Prepare(value)) = server_prepare.body.as_mut() {
-            value.endpoint_role = 2;
-            value.target_addr = server_runtime.0;
-            value.interface_name = server_runtime.1;
-            value.namespace = server_runtime.2;
-            value.source_ips = server_runtime.3;
-        }
-        orchestration::command_agent(&s, &server_id, &server, run_id, "prepare", server_prepare)
-            .await?;
-        Ok::<_, ApiError>(())
-    }
-    .await;
-    if let Err(error) = preparation {
-        repository::runs::finish(&s.db, &run_id.to_string(), "failed", Some(&error.message))
-            .await?;
-        return Err(error);
-    }
-    let start_at = Utc::now().timestamp_millis() + 1000;
-    let start = ControlMessage {
-        body: Some(control_message::Body::Start(StartRun {
-            run_id: run_id.to_string(),
-            start_unix_ms: start_at,
-            command_id: String::new(),
-            endpoint_role: 1,
-        })),
-    };
-    let starting = async {
-        orchestration::command_agent(&s, &client_id, &client, run_id, "start", start.clone())
-            .await?;
-        let mut server_start = start;
-        if let Some(control_message::Body::Start(value)) = server_start.body.as_mut() {
-            value.endpoint_role = 2;
-        }
-        orchestration::command_agent(&s, &server_id, &server, run_id, "start", server_start)
-            .await?;
-        Ok::<_, ApiError>(())
-    }
-    .await;
-    if let Err(error) = starting {
-        for agent in [&client, &server] {
-            let _ = agent
-                .tx
-                .send(Ok(ControlMessage {
-                    body: Some(control_message::Body::Stop(StopRun {
-                        run_id: run_id.to_string(),
-                        command_id: Uuid::new_v4().to_string(),
-                        endpoint_role: 0,
-                    })),
-                }))
-                .await;
-        }
-        repository::runs::finish(&s.db, &run_id.to_string(), "failed", Some(&error.message))
-            .await?;
-        return Err(error);
-    }
-    repository::runs::mark_running(&s.db, &run_id.to_string(), &started_at.to_rfc3339()).await?;
-    *active = Some(run_id);
-    s.run_agents.lock().await.insert(
-        run_id,
-        HashSet::from([client_id.clone(), server_id.clone()]),
-    );
-    s.expected_endpoints.lock().await.insert(
-        run_id,
-        HashSet::from([format!("{client_id}:1"), format!("{server_id}:2")]),
-    );
-    let _ = s
-        .events
-        .send(serde_json::json!({"type":"run_started","run_id":run_id}).to_string());
+    let run_id = orchestration::start_run(&state, scenario, requested_name).await?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({"id":run_id,"status":"running"})),
