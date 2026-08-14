@@ -97,4 +97,4 @@ API 오류는 언어에 독립적인 영문 `code`와 사용자 표시용 `messa
 - 결과: run detail/summary/samples/export 및 `GET /api/events/ws`
 - Artifact: `GET|POST /api/artifacts?kind=payload|pcap`
 
-전체 설계 진행 상황은 [로드맵](docs/ROADMAP.md), 분산 제어 동작은 [분산 제어](docs/DISTRIBUTED_CONTROL.md)에 기록되어 있습니다.
+전체 설계 진행 상황은 [로드맵](docs/ROADMAP.md), 분산 제어 동작은 [분산 제어](docs/DISTRIBUTED_CONTROL.md), 모듈 책임과 리팩터링 규칙은 [코드 구조](docs/CODE_STRUCTURE.md)에 기록되어 있습니다.
