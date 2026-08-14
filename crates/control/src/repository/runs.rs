@@ -56,6 +56,52 @@ pub(crate) async fn list_recent(
         .collect())
 }
 
+pub(crate) struct NewRun<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) scenario_id: &'a str,
+    pub(crate) scenario_json: &'a str,
+    pub(crate) run_name: &'a str,
+}
+
+pub(crate) async fn create(db: &SqlitePool, run: NewRun<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO runs(id,scenario_id,status,scenario_json,run_name) VALUES(?,?,'preparing',?,?)",
+    )
+    .bind(run.id)
+    .bind(run.scenario_id)
+    .bind(run.scenario_json)
+    .bind(run.run_name)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn mark_running(
+    db: &SqlitePool,
+    run_id: &str,
+    started_at: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE runs SET status='running',started_at=? WHERE id=?")
+        .bind(started_at)
+        .bind(run_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_status(
+    db: &SqlitePool,
+    run_id: &str,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE runs SET status=? WHERE id=?")
+        .bind(status)
+        .bind(run_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn list_page(
     db: &SqlitePool,
     cursor: i64,

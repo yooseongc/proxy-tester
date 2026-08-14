@@ -1159,14 +1159,16 @@ async fn start_run(
                 started_at.format("%Y-%m-%d %H:%M:%S UTC")
             )
         });
-    sqlx::query("INSERT INTO runs(id,scenario_id,status,scenario_json,run_name) VALUES(?,?,?,?,?)")
-        .bind(run_id.to_string())
-        .bind(sc.id.to_string())
-        .bind("preparing")
-        .bind(&json)
-        .bind(&run_name)
-        .execute(&s.db)
-        .await?;
+    repository::runs::create(
+        &s.db,
+        repository::runs::NewRun {
+            id: &run_id.to_string(),
+            scenario_id: &sc.id.to_string(),
+            scenario_json: &json,
+            run_name: &run_name,
+        },
+    )
+    .await?;
     let prepare = ControlMessage {
         body: Some(control_message::Body::Prepare(PrepareRun {
             run_id: run_id.to_string(),
@@ -1200,11 +1202,7 @@ async fn start_run(
     }
     .await;
     if let Err(error) = preparation {
-        sqlx::query("UPDATE runs SET status='failed',finished_at=?,error=? WHERE id=?")
-            .bind(Utc::now().to_rfc3339())
-            .bind(&error.message)
-            .bind(run_id.to_string())
-            .execute(&s.db)
+        repository::runs::finish(&s.db, &run_id.to_string(), "failed", Some(&error.message))
             .await?;
         return Err(error);
     }
@@ -1242,19 +1240,11 @@ async fn start_run(
                 }))
                 .await;
         }
-        sqlx::query("UPDATE runs SET status='failed',finished_at=?,error=? WHERE id=?")
-            .bind(Utc::now().to_rfc3339())
-            .bind(&error.message)
-            .bind(run_id.to_string())
-            .execute(&s.db)
+        repository::runs::finish(&s.db, &run_id.to_string(), "failed", Some(&error.message))
             .await?;
         return Err(error);
     }
-    sqlx::query("UPDATE runs SET status='running',started_at=? WHERE id=?")
-        .bind(started_at.to_rfc3339())
-        .bind(run_id.to_string())
-        .execute(&s.db)
-        .await?;
+    repository::runs::mark_running(&s.db, &run_id.to_string(), &started_at.to_rfc3339()).await?;
     *active = Some(run_id);
     s.run_agents.lock().await.insert(
         run_id,
@@ -1362,11 +1352,7 @@ async fn set_run_paused(
         .await?;
     }
     let status = if paused { "paused" } else { "running" };
-    sqlx::query("UPDATE runs SET status=? WHERE id=?")
-        .bind(status)
-        .bind(id.to_string())
-        .execute(&s.db)
-        .await?;
+    repository::runs::set_status(&s.db, &id.to_string(), status).await?;
     let _ = s
         .events
         .send(serde_json::json!({"type":"run_state","run_id":id,"status":status}).to_string());
