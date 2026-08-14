@@ -14,11 +14,11 @@ use futures::{Stream, StreamExt};
 use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
 use proxy_tester_domain::{
     MetricsSnapshot, NetworkProfileDraft, NetworkProfileRevision, PayloadKind, PayloadMode,
-    Protocol, Scenario, ScenarioPath,
+    Scenario, ScenarioPath,
 };
 use proxy_tester_proto::v1::{
-    AgentMessage, ArtifactChunk, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun,
-    SetPaused, StartRun, StopRun,
+    AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun, SetPaused, StartRun,
+    StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{collections::HashSet, pin::Pin, sync::Arc};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     sync::{broadcast, mpsc, oneshot, watch},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
@@ -740,8 +740,7 @@ async fn preflight(
     Json(sc): Json<Scenario>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
-    validate_payload_artifacts(&s.db, &sc).await?;
-    validate_capture_artifact(&s.db, &sc).await?;
+    orchestration::validate_artifacts(&s.db, &sc).await?;
     let (client_id, server_id, profile_ready) = scenario_nodes(&s.db, &sc).await?;
     let agents = s.agents.read().await;
     let client = agents.get(&client_id);
@@ -1077,8 +1076,7 @@ async fn save_scenario(
     Json(sc): Json<Scenario>,
 ) -> Result<Json<Scenario>, ApiError> {
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
-    validate_payload_artifacts(&s.db, &sc).await?;
-    validate_capture_artifact(&s.db, &sc).await?;
+    orchestration::validate_artifacts(&s.db, &sc).await?;
     let body = serde_json::to_string(&sc)?;
     repository::scenarios::upsert(&s.db, sc.id, &sc.name, &body).await?;
     Ok(Json(sc))
@@ -1182,11 +1180,12 @@ async fn start_run(
         })),
     };
     let preparation = async {
-        send_artifacts(&s.db, &client, &artifact_ids).await?;
+        orchestration::send_artifacts(&s.db, &client, &artifact_ids).await?;
         if client_id != server_id {
-            send_artifacts(&s.db, &server, &artifact_ids).await?;
+            orchestration::send_artifacts(&s.db, &server, &artifact_ids).await?;
         }
-        command_agent(&s, &client_id, &client, run_id, "prepare", prepare.clone()).await?;
+        orchestration::command_agent(&s, &client_id, &client, run_id, "prepare", prepare.clone())
+            .await?;
         let mut server_prepare = prepare;
         if let Some(control_message::Body::Prepare(value)) = server_prepare.body.as_mut() {
             value.endpoint_role = 2;
@@ -1195,7 +1194,8 @@ async fn start_run(
             value.namespace = server_runtime.2;
             value.source_ips = server_runtime.3;
         }
-        command_agent(&s, &server_id, &server, run_id, "prepare", server_prepare).await?;
+        orchestration::command_agent(&s, &server_id, &server, run_id, "prepare", server_prepare)
+            .await?;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -1218,12 +1218,14 @@ async fn start_run(
         })),
     };
     let starting = async {
-        command_agent(&s, &client_id, &client, run_id, "start", start.clone()).await?;
+        orchestration::command_agent(&s, &client_id, &client, run_id, "start", start.clone())
+            .await?;
         let mut server_start = start;
         if let Some(control_message::Body::Start(value)) = server_start.body.as_mut() {
             value.endpoint_role = 2;
         }
-        command_agent(&s, &server_id, &server, run_id, "start", server_start).await?;
+        orchestration::command_agent(&s, &server_id, &server, run_id, "start", server_start)
+            .await?;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -1271,206 +1273,6 @@ async fn start_run(
     ))
 }
 
-fn with_command_id(mut message: ControlMessage, command_id: &str) -> ControlMessage {
-    match message.body.as_mut() {
-        Some(control_message::Body::Prepare(value)) => value.command_id = command_id.into(),
-        Some(control_message::Body::Start(value)) => value.command_id = command_id.into(),
-        Some(control_message::Body::Stop(value)) => value.command_id = command_id.into(),
-        Some(control_message::Body::SetPaused(value)) => value.command_id = command_id.into(),
-        _ => {}
-    }
-    message
-}
-
-async fn command_agent(
-    s: &AppState,
-    agent_id: &str,
-    agent: &AgentSession,
-    run_id: Uuid,
-    phase: &str,
-    message: ControlMessage,
-) -> Result<(), ApiError> {
-    let command_id = Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel();
-    s.pending_acks.lock().await.insert(command_id.clone(), tx);
-    sqlx::query("INSERT INTO run_participants(run_id,agent_id,instance_id,role,phase,last_command_id,error,updated_at) VALUES(?,?,?,?,?,?,NULL,?) ON CONFLICT(run_id,agent_id) DO UPDATE SET instance_id=excluded.instance_id,phase=excluded.phase,last_command_id=excluded.last_command_id,error=NULL,updated_at=excluded.updated_at")
-        .bind(run_id.to_string()).bind(agent_id).bind(&agent.instance_id).bind(agent.role).bind(phase).bind(&command_id).bind(Utc::now().to_rfc3339()).execute(&s.db).await?;
-    if agent
-        .tx
-        .send(Ok(with_command_id(message, &command_id)))
-        .await
-        .is_err()
-    {
-        s.pending_acks.lock().await.remove(&command_id);
-        return Err(ApiError::internal(format!(
-            "{agent_id} channel closed during {phase}"
-        )));
-    }
-    let ack = match tokio::time::timeout(std::time::Duration::from_secs(s.command_timeout_secs), rx)
-        .await
-    {
-        Ok(Ok(ack)) => ack,
-        Ok(Err(_)) => {
-            return Err(ApiError::internal(format!(
-                "{agent_id} {phase} acknowledgement channel closed"
-            )));
-        }
-        Err(_) => {
-            s.pending_acks.lock().await.remove(&command_id);
-            return Err(ApiError::internal(format!(
-                "{agent_id} {phase} acknowledgement timed out"
-            )));
-        }
-    };
-    if !ack.ok {
-        return Err(ApiError::internal(format!(
-            "{} {phase} failed: {}",
-            ack.agent_id, ack.error
-        )));
-    }
-    sqlx::query("UPDATE run_participants SET phase=?,updated_at=? WHERE run_id=? AND agent_id=?")
-        .bind(format!("{phase}_acked"))
-        .bind(Utc::now().to_rfc3339())
-        .bind(run_id.to_string())
-        .bind(agent_id)
-        .execute(&s.db)
-        .await?;
-    Ok(())
-}
-
-const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
-
-async fn validate_payload_artifacts(db: &SqlitePool, scenario: &Scenario) -> Result<(), ApiError> {
-    for (direction, payload) in [
-        ("request", scenario.request_payload.clone()),
-        ("response", scenario.response_payload.clone()),
-    ] {
-        if payload.kind != PayloadKind::File {
-            continue;
-        }
-        let id = payload.artifact_id.ok_or_else(|| {
-            ApiError::bad(format!("{direction} file payload requires artifact_id"))
-        })?;
-        let artifact = repository::artifacts::find(db, id).await?.ok_or_else(|| {
-            ApiError::bad(format!("{direction} payload artifact {id} does not exist"))
-        })?;
-        if artifact.kind != "payload" {
-            return Err(ApiError::bad(format!(
-                "{direction} artifact {id} is not a payload artifact"
-            )));
-        }
-        let stored_size = artifact.size_bytes as usize;
-        if stored_size != payload.size_bytes {
-            return Err(ApiError::bad(format!(
-                "{direction} artifact size changed: scenario={}, stored={stored_size}",
-                payload.size_bytes
-            )));
-        }
-    }
-    Ok(())
-}
-
-async fn validate_capture_artifact(db: &SqlitePool, scenario: &Scenario) -> Result<(), ApiError> {
-    if scenario.payload_mode != PayloadMode::CaptureReplay {
-        return Ok(());
-    }
-    let id = scenario
-        .capture_artifact_id
-        .ok_or_else(|| ApiError::bad("capture replay requires capture_artifact_id"))?;
-    let artifact = repository::artifacts::find(db, id)
-        .await?
-        .ok_or_else(|| ApiError::bad(format!("capture artifact {id} does not exist")))?;
-    if artifact.kind != "pcap" {
-        return Err(ApiError::bad(format!(
-            "artifact {id} is not a PCAP artifact"
-        )));
-    }
-    let analysis = artifact.analysis;
-    let count_key = match scenario.protocol {
-        Protocol::Http1 => "http_flow_count",
-        Protocol::Http2 => "http2_flow_count",
-        _ => "supported_flow_count",
-    };
-    if analysis[count_key].as_u64().unwrap_or(0) == 0 {
-        return Err(ApiError::bad(match scenario.protocol {
-            Protocol::Http1 => "capture has no supported HTTP/1.1 request/response transactions",
-            Protocol::Http2 => "capture has no supported plaintext HTTP/2 transactions",
-            _ => "capture has no supported bidirectional plaintext TCP flows",
-        }));
-    }
-    Ok(())
-}
-
-async fn send_artifacts(
-    db: &SqlitePool,
-    agent: &AgentSession,
-    artifact_ids: &HashSet<Uuid>,
-) -> Result<(), ApiError> {
-    for artifact_id in artifact_ids {
-        let artifact = repository::artifacts::find(db, *artifact_id)
-            .await?
-            .ok_or_else(|| {
-                ApiError::bad(format!("payload artifact {artifact_id} does not exist"))
-            })?;
-        let kind = artifact.kind;
-        if kind != "payload" && kind != "pcap" {
-            return Err(ApiError::bad(format!(
-                "artifact {artifact_id} has unsupported kind {kind}"
-            )));
-        }
-        let total_size = artifact.size_bytes;
-        let limit = if kind == "pcap" {
-            512 * 1024 * 1024
-        } else {
-            64 * 1024 * 1024
-        };
-        if total_size > limit {
-            return Err(ApiError::bad(format!(
-                "{kind} artifact {artifact_id} exceeds its size limit"
-            )));
-        }
-        let sha256 = artifact.sha256;
-        let path = artifact.path;
-        let mut file = tokio::fs::File::open(&path)
-            .await
-            .map_err(|e| ApiError::internal(format!("open artifact {artifact_id}: {e}")))?;
-        let mut offset = 0_u64;
-        loop {
-            let mut data = vec![0; ARTIFACT_CHUNK_BYTES];
-            let read = file
-                .read(&mut data)
-                .await
-                .map_err(|e| ApiError::internal(format!("read artifact {artifact_id}: {e}")))?;
-            data.truncate(read);
-            let eof = offset + read as u64 == total_size;
-            agent
-                .tx
-                .send(Ok(ControlMessage {
-                    body: Some(control_message::Body::ArtifactChunk(ArtifactChunk {
-                        artifact_id: artifact_id.to_string(),
-                        offset,
-                        data,
-                        total_size,
-                        sha256: sha256.clone(),
-                        eof,
-                        artifact_kind: kind.clone(),
-                    })),
-                }))
-                .await
-                .map_err(|_| ApiError::internal("agent channel closed during artifact transfer"))?;
-            offset += read as u64;
-            if eof {
-                break;
-            }
-            if read == 0 {
-                return Err(ApiError::internal(format!(
-                    "artifact {artifact_id} is shorter than database metadata"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
 async fn stop_run(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1489,7 +1291,7 @@ async fn stop_run(
         .unwrap_or_default();
     for agent_id in participant_ids {
         if let Some(agent) = agents.get(&agent_id) {
-            let _ = command_agent(
+            let _ = orchestration::command_agent(
                 &s,
                 &agent_id,
                 agent,
@@ -1549,7 +1351,7 @@ async fn set_run_paused(
         let agent = agents
             .get(&agent_id)
             .ok_or_else(|| ApiError::internal(format!("{agent_id} is disconnected")))?;
-        command_agent(
+        orchestration::command_agent(
             s,
             &agent_id,
             agent,

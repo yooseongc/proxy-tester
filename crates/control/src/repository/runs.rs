@@ -110,3 +110,45 @@ pub(crate) async fn finish(
         .await?;
     Ok(())
 }
+
+pub(crate) struct ParticipantCommand<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) agent_id: &'a str,
+    pub(crate) instance_id: &'a str,
+    pub(crate) role: i32,
+    pub(crate) phase: &'a str,
+    pub(crate) command_id: &'a str,
+}
+
+pub(crate) async fn begin_participant_command(
+    db: &SqlitePool,
+    command: ParticipantCommand<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO run_participants(run_id,agent_id,instance_id,role,phase,last_command_id,error,updated_at) VALUES(?,?,?,?,?,?,NULL,?) ON CONFLICT(run_id,agent_id) DO UPDATE SET instance_id=excluded.instance_id,phase=excluded.phase,last_command_id=excluded.last_command_id,error=NULL,updated_at=excluded.updated_at")
+        .bind(command.run_id)
+        .bind(command.agent_id)
+        .bind(command.instance_id)
+        .bind(command.role)
+        .bind(command.phase)
+        .bind(command.command_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn acknowledge_participant_command(
+    db: &SqlitePool,
+    run_id: &str,
+    agent_id: &str,
+    phase: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE run_participants SET phase=?,updated_at=? WHERE run_id=? AND agent_id=?")
+        .bind(format!("{phase}_acked"))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run_id)
+        .bind(agent_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
