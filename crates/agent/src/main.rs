@@ -15,7 +15,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -31,10 +31,12 @@ use uuid::Uuid;
 mod artifact;
 mod network;
 mod payload;
+mod telemetry;
 mod tls;
 use artifact::accept_chunk as accept_artifact_chunk;
 use network::{NetworkManager, NetworkPlan};
 use payload::{CompletedArtifact, PreparedPayloads};
+use telemetry::Counters;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -72,176 +74,6 @@ impl Role {
             2 => Some(Self::Server),
             _ => None,
         }
-    }
-}
-
-struct Counters {
-    load_stage_index: AtomicU32,
-    desired_virtual_clients: AtomicU32,
-    included_in_results: AtomicBool,
-    attempted: AtomicU64,
-    established: AtomicU64,
-    failed: AtomicU64,
-    active: StdMutex<ActiveWindow>,
-    transactions: AtomicU64,
-    transaction_errors: AtomicU64,
-    timeout_errors: AtomicU64,
-    reset_errors: AtomicU64,
-    tls_handshake_errors: AtomicU64,
-    proxy_connect_errors: AtomicU64,
-    http_error_responses: AtomicU64,
-    tx: AtomicU64,
-    rx: AtomicU64,
-    packets_tx: AtomicU64,
-    packets_rx: AtomicU64,
-    wire_tx_bytes: AtomicU64,
-    wire_rx_bytes: AtomicU64,
-    tcp_retransmissions: AtomicU64,
-    tcp_connect_latencies_us: Mutex<Vec<u64>>,
-    http_latencies_us: Mutex<Vec<u64>>,
-}
-
-struct ActiveWindow {
-    current: u64,
-    min: u64,
-    max: u64,
-    weighted_nanos: u128,
-    window_started: Instant,
-    last_change: Instant,
-}
-
-impl Default for ActiveWindow {
-    fn default() -> Self {
-        let now = Instant::now();
-        Self {
-            current: 0,
-            min: 0,
-            max: 0,
-            weighted_nanos: 0,
-            window_started: now,
-            last_change: now,
-        }
-    }
-}
-
-impl ActiveWindow {
-    fn account_until(&mut self, now: Instant) {
-        self.weighted_nanos +=
-            now.saturating_duration_since(self.last_change).as_nanos() * self.current as u128;
-        self.last_change = now;
-    }
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for Counters {
-    fn default() -> Self {
-        Self {
-            load_stage_index: Default::default(),
-            desired_virtual_clients: Default::default(),
-            included_in_results: Default::default(),
-            attempted: Default::default(),
-            established: Default::default(),
-            failed: Default::default(),
-            active: Default::default(),
-            transactions: Default::default(),
-            transaction_errors: Default::default(),
-            timeout_errors: Default::default(),
-            reset_errors: Default::default(),
-            tls_handshake_errors: Default::default(),
-            proxy_connect_errors: Default::default(),
-            http_error_responses: Default::default(),
-            tx: Default::default(),
-            rx: Default::default(),
-            packets_tx: Default::default(),
-            packets_rx: Default::default(),
-            wire_tx_bytes: Default::default(),
-            wire_rx_bytes: Default::default(),
-            tcp_retransmissions: Default::default(),
-            tcp_connect_latencies_us: Default::default(),
-            http_latencies_us: Default::default(),
-        }
-    }
-}
-
-struct ActiveConnection<'a>(&'a Counters);
-
-impl Counters {
-    fn connection_established(&self) {
-        self.established.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn transaction_completed(&self) {
-        self.transactions.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_failure(&self, error: &anyhow::Error) {
-        let message = format!("{error:#}").to_ascii_lowercase();
-        if message.contains("deadline has elapsed") || message.contains("timed out") {
-            self.timeout_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if message.contains("connection reset") || message.contains("forcibly closed") {
-            self.reset_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if message.contains("tls handshake failed") {
-            self.tls_handshake_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if message.contains("http connect failed") {
-            self.proxy_connect_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if message.contains("http error response") {
-            self.http_error_responses.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn connection_opened(&self) -> ActiveConnection<'_> {
-        let now = Instant::now();
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.account_until(now);
-        active.current += 1;
-        active.min = active.min.min(active.current);
-        active.max = active.max.max(active.current);
-        ActiveConnection(self)
-    }
-
-    fn active_snapshot(&self) -> (u64, f64, u64, u64) {
-        let now = Instant::now();
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.account_until(now);
-        let elapsed = now
-            .saturating_duration_since(active.window_started)
-            .as_nanos()
-            .max(1);
-        let result = (
-            active.current,
-            active.weighted_nanos as f64 / elapsed as f64,
-            active.min,
-            active.max,
-        );
-        active.weighted_nanos = 0;
-        active.window_started = now;
-        active.min = active.current;
-        active.max = active.current;
-        result
-    }
-}
-
-impl Drop for ActiveConnection<'_> {
-    fn drop(&mut self) {
-        let now = Instant::now();
-        let mut active = self
-            .0
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.account_until(now);
-        active.current = active.current.saturating_sub(1);
-        active.min = active.min.min(active.current);
     }
 }
 
