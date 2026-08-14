@@ -2,8 +2,7 @@ use anyhow::{Context, bail};
 use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
-use proxy_tester_capture::ReplayTurn;
-use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Protocol, Scenario};
+use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Scenario};
 use proxy_tester_proto::network_draft_from_wire;
 use proxy_tester_proto::v1::{
     AgentEvent, AgentHello, AgentMessage, AgentRole, AgentStatus, CommandAck, Heartbeat, Telemetry,
@@ -12,17 +11,13 @@ use proxy_tester_proto::v1::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    net::TcpListener,
-    sync::{Mutex, mpsc},
-};
+use tokio::sync::{Mutex, mpsc};
 use tonic::Request;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -31,17 +26,15 @@ mod connector;
 mod network;
 mod payload;
 mod replay;
+mod runner;
 mod telemetry;
 mod tls;
 mod workload;
 use artifact::accept_chunk as accept_artifact_chunk;
-use connector::IoStream;
 use network::{NetworkManager, NetworkPlan};
 use payload::{CompletedArtifact, PreparedPayloads};
 use replay::{ReplayPlan, ReplayRole};
 use telemetry::Counters;
-use workload::WorkerGate;
-use workload::tcp::{replay_client, replay_server_detect};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -492,7 +485,7 @@ async fn run_job(
     ));
     let result = match role {
         Role::Client => {
-            run_client(
+            runner::run_client(
                 &job.scenario,
                 job.payloads.clone(),
                 job.replay.clone(),
@@ -503,7 +496,7 @@ async fn run_job(
             .await
         }
         Role::Server => {
-            run_server(
+            runner::run_server(
                 &job.scenario,
                 job.payloads.clone(),
                 job.replay.clone(),
@@ -730,244 +723,14 @@ fn percentile_ms(samples: &[u64], percentile: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * percentile) as usize] as f64 / 1000.0
 }
 
-async fn run_client(
-    sc: &Scenario,
-    payloads: Arc<PreparedPayloads>,
-    replay: Option<Arc<ReplayPlan>>,
-    c: Arc<Counters>,
-    running: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    run_client_concurrency(sc, payloads, replay, c, running, paused).await
-}
-
-async fn run_client_concurrency(
-    sc: &Scenario,
-    payloads: Arc<PreparedPayloads>,
-    replay: Option<Arc<ReplayPlan>>,
-    c: Arc<Counters>,
-    running: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let generating = Arc::new(AtomicBool::new(true));
-    let desired_clients = Arc::new(AtomicU32::new(0));
-    let next_flow = Arc::new(AtomicU64::new(0));
-    let sc = Arc::new(sc.clone());
-    let worker_count = sc.maximum_virtual_clients();
-    let mut workers = Vec::with_capacity(worker_count as usize);
-    for worker_index in 0..worker_count {
-        let sc = sc.clone();
-        let c = c.clone();
-        let running = running.clone();
-        let paused = paused.clone();
-        let generating = generating.clone();
-        let desired_clients = desired_clients.clone();
-        let payloads = payloads.clone();
-        let replay = replay.clone();
-        let next_flow = next_flow.clone();
-        workers.push(tokio::spawn(async move {
-            while running.load(Ordering::Relaxed) && generating.load(Ordering::Relaxed) {
-                if paused.load(Ordering::Relaxed)
-                    || worker_index >= desired_clients.load(Ordering::Relaxed)
-                {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-                execute_connection(
-                    &sc,
-                    &payloads,
-                    replay.as_deref(),
-                    &next_flow,
-                    &c,
-                    &running,
-                    &paused,
-                    &generating,
-                    &desired_clients,
-                    worker_index,
-                )
-                .await;
-            }
-        }));
-    }
-    let duration = Duration::from_secs(sc.effective_duration_secs());
-    let mut active_elapsed = Duration::ZERO;
-    let mut last_tick = Instant::now();
-    while active_elapsed < duration && running.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let now = Instant::now();
-        if paused.load(Ordering::Relaxed) {
-            last_tick = now;
-        } else {
-            active_elapsed += now.saturating_duration_since(last_tick);
-            last_tick = now;
-            let (_, desired, _) = sc.load_at(active_elapsed.as_millis() as u64);
-            desired_clients.store(desired, Ordering::Relaxed);
-            let (stage_index, _, included) = sc.load_at(active_elapsed.as_millis() as u64);
-            c.load_stage_index
-                .store(stage_index as u32, Ordering::Relaxed);
-            c.desired_virtual_clients.store(desired, Ordering::Relaxed);
-            c.included_in_results.store(included, Ordering::Relaxed);
-        }
-    }
-    generating.store(false, Ordering::SeqCst);
-    for worker in workers {
-        let _ = worker.await;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_connection(
-    sc: &Scenario,
-    payloads: &PreparedPayloads,
-    replay: Option<&ReplayPlan>,
-    next_flow: &AtomicU64,
-    c: &Counters,
-    running: &AtomicBool,
-    paused: &AtomicBool,
-    generating: &AtomicBool,
-    desired_clients: &AtomicU32,
-    worker_index: u32,
-) {
-    let connection_index = c.attempted.fetch_add(1, Ordering::Relaxed);
-    let gate = WorkerGate {
-        running,
-        paused,
-        generating,
-        desired_clients,
-        worker_index,
-    };
-    let flow = replay.map(|plan| {
-        let index = next_flow.fetch_add(1, Ordering::Relaxed) as usize % plan.flows.len();
-        plan.flows[index].clone()
-    });
-    match transact(sc, payloads, flow.as_deref(), c, &gate, connection_index).await {
-        Ok(()) => {}
-        Err(error) => {
-            c.failed.fetch_add(1, Ordering::Relaxed);
-            c.transaction_errors.fetch_add(1, Ordering::Relaxed);
-            c.record_failure(&error);
-        }
-    }
-}
-
-async fn transact(
-    sc: &Scenario,
-    payloads: &PreparedPayloads,
-    replay_turns: Option<&[ReplayTurn]>,
-    c: &Counters,
-    gate: &WorkerGate<'_>,
-    connection_index: u64,
-) -> anyhow::Result<()> {
-    let tcp_stream = connector::connect_tcp(sc, connection_index, c).await?;
-    let _active_connection = c.connection_opened();
-    let mut stream = connector::upgrade(tcp_stream, sc, c).await?;
-    let result = if sc.protocol == Protocol::Http2 {
-        workload::http2::transactions(stream, sc, payloads, replay_turns, c, gate).await
-    } else if let Some(turns) = replay_turns {
-        replay_client(&mut *stream, turns, sc, c).await
-    } else {
-        match sc.protocol {
-            Protocol::Http1 => {
-                let absolute = sc.is_explicit_proxy() && !sc.tls.enabled;
-                workload::http1::transactions(&mut *stream, sc, payloads, absolute, c, gate).await
-            }
-            _ => workload::tcp::transaction(&mut *stream, sc, payloads, c).await,
-        }
-    };
-    if result.is_ok() && !matches!(sc.protocol, Protocol::Http1 | Protocol::Http2) {
-        c.transaction_completed();
-    }
-    result
-}
-
-fn build_tls_acceptor(sc: &Scenario) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
-    tls::acceptor(sc)
-}
-
-async fn run_server(
-    sc: &Scenario,
-    payloads: Arc<PreparedPayloads>,
-    replay: Option<Arc<ReplayPlan>>,
-    c: Arc<Counters>,
-    running: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let port = sc.server_port();
-    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-    let tls_acceptor = sc.tls.enabled.then(|| build_tls_acceptor(sc)).transpose()?;
-    info!(port, "responder listening");
-    let duration = Duration::from_millis(sc.effective_duration_secs() * 1000 + 700);
-    let mut active_elapsed = Duration::ZERO;
-    let mut last_tick = Instant::now();
-    while active_elapsed < duration && running.load(Ordering::Relaxed) {
-        if paused.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            last_tick = Instant::now();
-            continue;
-        }
-        let now = Instant::now();
-        active_elapsed += now.saturating_duration_since(last_tick);
-        last_tick = now;
-        let (stage_index, desired, included) = sc.load_at(active_elapsed.as_millis() as u64);
-        c.load_stage_index
-            .store(stage_index as u32, Ordering::Relaxed);
-        c.desired_virtual_clients.store(desired, Ordering::Relaxed);
-        c.included_in_results.store(included, Ordering::Relaxed);
-        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
-        let Ok(Ok((stream, _))) = accepted else {
-            continue;
-        };
-        c.connection_established();
-        let sc = sc.clone();
-        let c2 = c.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let payloads = payloads.clone();
-        let replay = replay.clone();
-        tokio::spawn(async move {
-            let _active_connection = c2.connection_opened();
-            let mut stream: Box<dyn IoStream> = match tls_acceptor {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => Box::new(stream),
-                    Err(_) => {
-                        c2.transaction_errors.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                },
-                None => Box::new(stream),
-            };
-            let r = if sc.protocol == Protocol::Http2 {
-                let replay_response = replay
-                    .as_ref()
-                    .and_then(|plan| plan.flows.first())
-                    .and_then(|flow| flow.get(1))
-                    .map(|turn| turn.payload.clone());
-                workload::http2::serve(stream, payloads, replay_response, c2.clone()).await
-            } else if let Some(plan) = replay {
-                replay_server_detect(&mut *stream, &plan.flows, &sc, &c2).await
-            } else if sc.protocol == Protocol::Http1 {
-                workload::http1::serve(&mut *stream, &payloads, &c2).await
-            } else {
-                workload::tcp::serve(&mut *stream, &payloads, &c2).await
-            };
-            if r.is_ok() {
-                if !matches!(sc.protocol, Protocol::Http1 | Protocol::Http2) {
-                    c2.transaction_completed();
-                }
-            } else {
-                c2.transaction_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-    }
-    Ok(())
-}
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default, clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use proxy_tester_capture::Direction;
+    use proxy_tester_capture::{Direction, ReplayTurn};
+    use proxy_tester_domain::Protocol;
     use proxy_tester_proto::v1::ArtifactChunk;
+    use workload::tcp::{replay_client, replay_server_detect};
 
     #[test]
     fn command_deduplication_is_bounded_and_idempotent() {
