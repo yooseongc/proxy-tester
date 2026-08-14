@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
-use proxy_tester_capture::{Direction, HttpTransaction, ReplayTurn, analyze_capture};
+use proxy_tester_capture::ReplayTurn;
 use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Protocol, Scenario};
 use proxy_tester_proto::network_draft_from_wire;
 use proxy_tester_proto::v1::{
@@ -30,6 +30,7 @@ mod artifact;
 mod connector;
 mod network;
 mod payload;
+mod replay;
 mod telemetry;
 mod tls;
 mod workload;
@@ -37,6 +38,7 @@ use artifact::accept_chunk as accept_artifact_chunk;
 use connector::IoStream;
 use network::{NetworkManager, NetworkPlan};
 use payload::{CompletedArtifact, PreparedPayloads};
+use replay::{ReplayPlan, ReplayRole};
 use telemetry::Counters;
 use workload::WorkerGate;
 use workload::tcp::{replay_client, replay_server_detect};
@@ -78,6 +80,12 @@ impl Role {
             _ => None,
         }
     }
+    fn replay(self) -> ReplayRole {
+        match self {
+            Self::Client => ReplayRole::Client,
+            Self::Server => ReplayRole::Server,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -86,164 +94,6 @@ struct Prepared {
     scenario: Scenario,
     payloads: Arc<PreparedPayloads>,
     replay: Option<Arc<ReplayPlan>>,
-}
-
-#[derive(Clone)]
-struct ReplayPlan {
-    flows: Arc<[Arc<[ReplayTurn]>]>,
-}
-
-impl ReplayPlan {
-    fn from_capture(bytes: &[u8], scenario: &Scenario, role: Role) -> anyhow::Result<Self> {
-        let (_, analysis) = analyze_capture(bytes)?;
-        if analysis.flows.is_empty() {
-            bail!("capture contains no supported flows");
-        }
-        let flows: Arc<[Arc<[ReplayTurn]>]> = analysis
-            .flows
-            .into_iter()
-            .filter_map(|flow| {
-                let turns = if scenario.protocol == Protocol::Http1 {
-                    (!flow.http_transactions.is_empty()).then(|| {
-                        flow.http_transactions
-                            .into_iter()
-                            .flat_map(|transaction| http_replay_turns(transaction, scenario, role))
-                            .collect()
-                    })
-                } else if scenario.protocol == Protocol::Http2 {
-                    (!flow.http2_transactions.is_empty()).then(|| {
-                        flow.http2_transactions
-                            .into_iter()
-                            .flat_map(|transaction| {
-                                [
-                                    ReplayTurn {
-                                        direction: Direction::ClientToServer,
-                                        payload: transaction.request_body,
-                                    },
-                                    ReplayTurn {
-                                        direction: Direction::ServerToClient,
-                                        payload: transaction.response_body,
-                                    },
-                                ]
-                            })
-                            .collect()
-                    })
-                } else {
-                    Some(flow.turns)
-                }?;
-                Some(Arc::<[ReplayTurn]>::from(turns))
-            })
-            .collect::<Vec<_>>()
-            .into();
-        if flows.is_empty() {
-            bail!("capture contains no supported HTTP/1.1 transactions");
-        }
-        for (index, flow) in flows.iter().enumerate() {
-            let Some(first) = flow.first() else {
-                bail!("flow {index} has no replay turns");
-            };
-            if first.direction != Direction::ClientToServer || first.payload.is_empty() {
-                bail!("flow {index} must start with a non-empty client turn");
-            }
-            for (other_index, other) in flows.iter().enumerate() {
-                if index != other_index
-                    && other.first().is_some_and(|turn| {
-                        turn.payload.starts_with(&first.payload)
-                            || first.payload.starts_with(&turn.payload)
-                    })
-                {
-                    bail!("flows {index} and {other_index} have ambiguous first client turns");
-                }
-            }
-        }
-        Ok(Self { flows })
-    }
-}
-
-fn http_replay_turns(
-    transaction: HttpTransaction,
-    scenario: &Scenario,
-    role: Role,
-) -> [ReplayTurn; 2] {
-    [
-        ReplayTurn {
-            direction: Direction::ClientToServer,
-            payload: rewrite_http_request(&transaction.request, scenario, role),
-        },
-        ReplayTurn {
-            direction: Direction::ServerToClient,
-            payload: transaction.response,
-        },
-    ]
-}
-
-fn rewrite_http_request(request: &[u8], scenario: &Scenario, role: Role) -> Vec<u8> {
-    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
-        return request.to_vec();
-    };
-    let header_end = header_end + 4;
-    let headers = &request[..header_end];
-    let Some(line_end) = headers.windows(2).position(|part| part == b"\r\n") else {
-        return request.to_vec();
-    };
-    let mut fields = headers[..line_end].splitn(3, |byte| *byte == b' ');
-    let (Some(method), Some(target), Some(version)) = (fields.next(), fields.next(), fields.next())
-    else {
-        return request.to_vec();
-    };
-    let path = if target.starts_with(b"http://") {
-        target
-            .windows(1)
-            .enumerate()
-            .skip(7)
-            .find(|(_, byte)| *byte == b"/")
-            .map(|(index, _)| &target[index..])
-            .unwrap_or(b"/")
-    } else {
-        target
-    };
-    let absolute = role == Role::Client && scenario.is_explicit_proxy() && !scenario.tls.enabled;
-    let target = if absolute {
-        format!(
-            "http://{}{}",
-            scenario.target_addr(),
-            String::from_utf8_lossy(path)
-        )
-        .into_bytes()
-    } else {
-        path.to_vec()
-    };
-    let mut output = Vec::with_capacity(request.len() + target.len());
-    output.extend_from_slice(method);
-    output.push(b' ');
-    output.extend_from_slice(&target);
-    output.push(b' ');
-    output.extend_from_slice(version);
-    output.extend_from_slice(b"\r\n");
-    let mut replaced_host = false;
-    for line in headers[line_end + 2..header_end - 2].split(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
-        if line
-            .split(|byte| *byte == b':')
-            .next()
-            .is_some_and(|name| name.eq_ignore_ascii_case(b"host"))
-        {
-            output.extend_from_slice(format!("Host: {}\r\n", scenario.request.host).as_bytes());
-            replaced_host = true;
-        } else {
-            output.extend_from_slice(line);
-            output.extend_from_slice(b"\r\n");
-        }
-    }
-    if !replaced_host {
-        output.extend_from_slice(format!("Host: {}\r\n", scenario.request.host).as_bytes());
-    }
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(&request[header_end..]);
-    output
 }
 
 #[tokio::main]
@@ -365,7 +215,8 @@ async fn run_connection(
                         })
                         .with_context(|| format!("capture artifact {id} was not transferred"))?;
                     let bytes = tokio::fs::read(path).await?;
-                    let replay = ReplayPlan::from_capture(&bytes, &scenario, endpoint_role)?;
+                    let replay =
+                        ReplayPlan::from_capture(&bytes, &scenario, endpoint_role.replay())?;
                     Some(Arc::new(replay))
                 } else {
                     None
@@ -1115,6 +966,7 @@ async fn run_server(
 #[allow(clippy::field_reassign_with_default, clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use proxy_tester_capture::Direction;
     use proxy_tester_proto::v1::ArtifactChunk;
 
     #[test]
@@ -1263,7 +1115,8 @@ mod tests {
     #[test]
     fn replay_plan_is_built_from_scapy_fixture() {
         let capture = include_bytes!("../../../tests/pcap/fixtures/plaintext_flows.pcap");
-        let plan = ReplayPlan::from_capture(capture, &Scenario::default(), Role::Client).unwrap();
+        let plan =
+            ReplayPlan::from_capture(capture, &Scenario::default(), ReplayRole::Client).unwrap();
         assert_eq!(plan.flows.len(), 2);
         assert_eq!(plan.flows[0].len(), 2);
         assert_eq!(plan.flows[1].len(), 2);
@@ -1283,7 +1136,7 @@ mod tests {
             proxy_addr: "proxy.test:3128".into(),
         };
         scenario.request.host = "origin.test".into();
-        let plan = ReplayPlan::from_capture(capture, &scenario, Role::Client).unwrap();
+        let plan = ReplayPlan::from_capture(capture, &scenario, ReplayRole::Client).unwrap();
         assert_eq!(plan.flows.len(), 1);
         assert_eq!(plan.flows[0].len(), 2);
         assert!(
@@ -1302,7 +1155,7 @@ mod tests {
             plan.flows[0][1].payload,
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
         );
-        let server_plan = ReplayPlan::from_capture(capture, &scenario, Role::Server).unwrap();
+        let server_plan = ReplayPlan::from_capture(capture, &scenario, ReplayRole::Server).unwrap();
         assert!(
             server_plan.flows[0][0]
                 .payload
