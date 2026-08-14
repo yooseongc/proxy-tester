@@ -25,7 +25,7 @@ Rust workspace는 다음 책임 경계를 따른다.
 
 Control의 `main`은 bootstrap과 서버 lifecycle을 담당하고, Router/middleware는 `routes`, 공유 상태와 pending command registry는 `state`, SQLite schema lifecycle은 `database`에 둔다. Scenario, Artifact, Run과 metric sample의 영속성 SQL은 `repository` 아래의 리소스별 모듈에 두며 handler는 저장 형식이나 `sqlx::Row`를 알지 못해야 한다. API 오류는 `error::ApiError`를 통해서만 HTTP 응답으로 변환한다.
 
-Agent의 `main`은 control stream과 workload orchestration을 담당한다. artifact chunk 수신과 무결성 검증은 `artifact`, Run별 payload 준비는 `payload`, 누적 카운터·오류 분류·활성 연결 시간가중 집계는 `telemetry`에 둔다. Linux namespace 변경은 `network`, 인증서 검증·cipher·TLS version·ALPN 정책은 `tls` 모듈에 둔다. client와 responder는 같은 TLS helper를 사용해야 한다.
+Agent의 `main`은 control stream과 workload orchestration을 담당한다. artifact chunk 수신과 무결성 검증은 `artifact`, Run별 payload 준비는 `payload`, 누적 카운터·오류 분류·활성 연결 시간가중 집계는 `telemetry`에 둔다. DNS와 source IP bind를 포함한 TCP 연결, HTTP CONNECT, client TLS upgrade는 `connector`가 담당한다. Linux namespace 변경은 `network`, 인증서 검증·cipher·TLS version·ALPN 정책은 `tls` 모듈에 둔다. client와 responder는 같은 TLS helper를 사용해야 한다.
 
 ## 변경 규칙
 
