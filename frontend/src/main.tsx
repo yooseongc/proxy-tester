@@ -26,6 +26,8 @@ import {
   Wifi,
 } from "lucide-react";
 import { api } from "./api";
+import { uploadArtifactFile } from "./artifacts";
+import { formatBytes } from "./traffic";
 const TelemetryCharts = lazy(() =>
   import("./TelemetryCharts").then((module) => ({ default: module.TelemetryCharts })),
 );
@@ -204,12 +206,7 @@ function App() {
     setUploading(true);
     setError("");
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const artifact = await api<Artifact>("/api/artifacts?kind=payload", {
-        method: "POST",
-        body: form,
-      });
+      const artifact = await uploadArtifactFile(file, "payload");
       await refreshArtifacts();
       return artifact;
     } catch (cause) {
@@ -223,12 +220,7 @@ function App() {
     setUploading(true);
     setError("");
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const artifact = await api<Artifact>("/api/artifacts?kind=pcap", {
-        method: "POST",
-        body: form,
-      });
+      const artifact = await uploadArtifactFile(file, "pcap");
       await refreshArtifacts();
       return artifact;
     } catch (cause) {
@@ -1187,13 +1179,6 @@ function ConfigSection({
       <div className="min-w-0 space-y-3">{children}</div>
     </section>
   );
-}
-
-function formatBytes(bytes: number) {
-  if (bytes >= 1024 * 1024)
-    return `${(bytes / 1024 / 1024).toFixed(bytes % (1024 * 1024) ? 1 : 0)}MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(bytes % 1024 ? 1 : 0)}KB`;
-  return `${bytes}B`;
 }
 
 function PayloadEditor({
