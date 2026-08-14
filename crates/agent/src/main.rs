@@ -4,15 +4,12 @@ use chrono::Utc;
 use clap::Parser;
 use futures::{StreamExt, stream::FuturesUnordered};
 use proxy_tester_capture::{Direction, HttpTransaction, ReplayTurn, analyze_capture};
-use proxy_tester_domain::{
-    MetricsSnapshot, PayloadKind, PayloadMode, PayloadProfile, Protocol, RandomFormat, Scenario,
-};
+use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Protocol, Scenario};
 use proxy_tester_proto::network_draft_from_wire;
 use proxy_tester_proto::v1::{
     AgentEvent, AgentHello, AgentMessage, AgentRole, AgentStatus, CommandAck, Heartbeat, Telemetry,
     agent_control_client::AgentControlClient, agent_message, control_message,
 };
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -32,8 +29,10 @@ use tonic::Request;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 mod network;
+mod payload;
 mod tls;
 use network::{NetworkManager, NetworkPlan};
+use payload::{CompletedArtifact, PreparedPayloads};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -410,52 +409,6 @@ fn rewrite_http_request(request: &[u8], scenario: &Scenario, role: Role) -> Vec<
     output
 }
 
-#[derive(Clone)]
-struct PreparedPayloads {
-    request: Arc<[u8]>,
-    response: Arc<[u8]>,
-}
-impl PreparedPayloads {
-    fn new(sc: &Scenario, artifacts: &HashMap<Uuid, CompletedArtifact>) -> anyhow::Result<Self> {
-        Ok(Self {
-            request: materialize(&sc.request_payload, artifacts)?,
-            response: materialize(&sc.response_payload, artifacts)?,
-        })
-    }
-}
-fn materialize(
-    profile: &PayloadProfile,
-    artifacts: &HashMap<Uuid, CompletedArtifact>,
-) -> anyhow::Result<Arc<[u8]>> {
-    let bytes = match profile.kind {
-        PayloadKind::Empty => Vec::new(),
-        PayloadKind::Fixed => vec![0; profile.size_bytes],
-        PayloadKind::Text => profile.text.as_bytes().to_vec(),
-        PayloadKind::Random => {
-            let mut data = vec![0; profile.size_bytes];
-            rand::rng().fill_bytes(&mut data);
-            if profile.random_format == RandomFormat::PrintableAscii {
-                for byte in &mut data {
-                    *byte = 0x20 + (*byte % 95);
-                }
-            }
-            data
-        }
-        PayloadKind::File => {
-            let id = profile.artifact_id.context("file payload artifact ID")?;
-            return artifacts
-                .get(&id)
-                .and_then(|artifact| match artifact {
-                    CompletedArtifact::Payload(bytes) => Some(bytes.clone()),
-                    _ => None,
-                })
-                .with_context(|| format!("artifact {id} was not transferred"));
-        }
-    };
-    info!(kind=?profile.kind, bytes=bytes.len(), sha256=%format!("{:x}", Sha256::digest(&bytes)), "payload prepared");
-    Ok(bytes.into())
-}
-
 struct IncomingArtifact {
     path: std::path::PathBuf,
     file: tokio::fs::File,
@@ -464,11 +417,6 @@ struct IncomingArtifact {
     total_size: u64,
     sha256: String,
     kind: String,
-}
-
-enum CompletedArtifact {
-    Payload(Arc<[u8]>),
-    Capture(std::path::PathBuf),
 }
 
 #[allow(clippy::map_entry)]
