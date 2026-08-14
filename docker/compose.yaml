@@ -1,26 +1,28 @@
+name: proxy-tester
+
 services:
   control:
-    build: {context: ., target: control}
+    build: {context: .., dockerfile: docker/Dockerfile, target: control}
     environment:
       DATABASE_URL: sqlite:///data/proxy-tester.db?mode=rwc
       PROXY_TESTER_STATIC_DIR: /frontend/dist
     ports: ["${PROXY_TESTER_PORT:-18080}:8080"]
     volumes: [proxy-data:/data]
   client:
-    build: {context: ., target: client}
+    build: {context: .., dockerfile: docker/Dockerfile, target: client}
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
       PROXY_TESTER_NODE_ID: client-1
     cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     depends_on: [control]
   server:
-    build: {context: ., target: server}
+    build: {context: .., dockerfile: docker/Dockerfile, target: server}
     environment:
       PROXY_TESTER_CONTROL: http://control:50051
       PROXY_TESTER_NODE_ID: server-1
     cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     depends_on: [control]
   proxy:
-    build: {context: tests/fixture-proxy}
+    build: {context: ../tests/fixture-proxy}
     depends_on: [server]
 volumes: {proxy-data: {}}

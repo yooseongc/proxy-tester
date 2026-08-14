@@ -4,5 +4,6 @@
 /frontend/test-results/
 /frontend/tsconfig.tsbuildinfo
 /data/
+/dist/
 *.db
 *.log

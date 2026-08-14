@@ -48,7 +48,13 @@ use database::{apply_retention, cleanup_orphan_artifacts, migrate, open_database
 use error::ApiError;
 use state::{AgentSession, AppState, CommandAckResult};
 
+const BUILD_COMMIT: &str = env!("PROXY_TESTER_BUILD_COMMIT");
+
 #[derive(Parser, Debug)]
+#[command(
+    version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PROXY_TESTER_BUILD_COMMIT"), ")")
+)]
 struct Args {
     #[arg(long, env = "PROXY_TESTER_HTTP_ADDR", default_value = "0.0.0.0:8080")]
     http_addr: String,
@@ -439,7 +445,7 @@ struct AgentView {
 }
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION"),"schema_version":4,"database_url":s.database_url.as_str(),"database_fallback":s.database_fallback}),
+        serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION"),"build_commit":BUILD_COMMIT,"schema_version":4,"database_url":s.database_url.as_str(),"database_fallback":s.database_fallback}),
     )
 }
 async fn agents(State(s): State<AppState>) -> Json<Vec<AgentView>> {

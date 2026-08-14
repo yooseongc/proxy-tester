@@ -8,11 +8,12 @@ Type=simple
 User=proxy-tester
 Group=proxy-tester
 EnvironmentFile=/etc/proxy-tester/control.env
-ExecStart=/usr/local/bin/proxy-control
+ExecStart=/usr/bin/proxy-control
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
 LimitNOFILE=1048576
+StateDirectory=proxy-tester
 
 [Install]
 WantedBy=multi-user.target

@@ -35,12 +35,16 @@ try {
         }
     } finally { Pop-Location }
     if ($Mode -eq 'Full') {
-        cargo build --workspace --release --target x86_64-unknown-linux-musl
-        Assert-NativeSuccess 'musl release build'
-        docker compose config | Out-Null
+        $buildCommit = (git rev-parse --short=12 HEAD).Trim()
+        Assert-NativeSuccess 'release commit lookup'
+        docker build --file docker/Dockerfile --target release-files `
+            --build-arg "PROXY_TESTER_BUILD_COMMIT=$buildCommit" `
+            --tag proxy-tester-release-verify:local .
+        Assert-NativeSuccess 'Docker musl release build'
+        docker compose -f docker/compose.yaml config | Out-Null
         Assert-NativeSuccess 'development compose validation'
-        docker compose -f compose.production.yaml config | Out-Null
-        Assert-NativeSuccess 'production compose validation'
+        docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml config | Out-Null
+        Assert-NativeSuccess 'managed-direct compose validation'
         Push-Location frontend
         try {
             npm run test:e2e

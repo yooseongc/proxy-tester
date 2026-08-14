@@ -34,7 +34,7 @@ function Wait-Terminal([string]$id, [int]$attempts = 40) {
 
 $run = Start-Scenario (New-Scenario 'agent-reconnect-no-resume' 30)
 Start-Sleep -Seconds 2
-docker compose -f compose.yaml -f compose.managed-direct.yaml restart client | Out-Null
+docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml restart client | Out-Null
 $sawDegraded = $false
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
     $detail = Invoke-RestMethod "$BaseUrl/api/runs/$($run.id)"

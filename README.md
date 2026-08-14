@@ -12,20 +12,13 @@ Control은 역할이 고정된 agent를 가정하지 않습니다. Scenario v4�
 
 ## 빠른 시작
 
-Windows 개발 환경에서는 Docker Desktop의 Linux container를 사용합니다.
+운영 환경은 GitHub Release의 통합 `tar.gz`, `deb` 또는 `rpm` 패키지로 설치합니다. Control과 Agent 설치 예시는 [설치 문서](docs/INSTALLATION.md)를 참고하세요.
+
+Docker는 Windows를 포함한 개발 및 회귀시험 환경에서만 사용합니다.
 
 ```powershell
-docker compose build
-docker compose up -d
-```
-
-브라우저에서 `http://localhost:18080`을 엽니다. 포트는 `PROXY_TESTER_PORT` 환경 변수로 변경할 수 있습니다.
-
-Docker에서 managed-direct의 namespace·veth 기능 경로를 시험하려면 전용 override를 함께 사용합니다.
-
-```powershell
-docker compose -f compose.yaml -f compose.managed-direct.yaml build
-docker compose -f compose.yaml -f compose.managed-direct.yaml up -d
+docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml build
+docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml up -d
 ```
 
 이 구성은 Control 통신용 `eth0`와 주소를 제거한 시험용 `eth1`을 분리합니다. 네트워크 프로파일에서 Client는 `172.31.0.10/24`, Server는 `172.31.0.20/24`, 주소 수는 각각 `1`, 인터페이스는 양쪽 모두 `eth1`로 설정합니다. Docker bridge의 IPAM 필터 때문에 이 기능 시험에서는 예약되지 않은 추가 source IP를 사용할 수 없습니다. 실제 다중 IP 풀과 성능 측정은 전용 Linux 시험 NIC에서 수행하세요.

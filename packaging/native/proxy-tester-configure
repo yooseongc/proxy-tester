@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    cat <<'EOF'
+Usage:
+  proxy-tester-configure control
+  proxy-tester-configure agent --control-url URL --node-id ID
+  proxy-tester-configure all --control-url URL --node-id ID
+
+Existing configuration files are preserved. Remove or edit a configuration
+explicitly when its values need to change.
+EOF
+}
+
+[ "$(id -u)" -eq 0 ] || { echo "proxy-tester-configure must run as root" >&2; exit 1; }
+[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+
+component="$1"
+shift
+control_url=""
+node_id=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --control-url) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; control_url="$2"; shift 2 ;;
+        --node-id) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; node_id="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+case "$component" in control|agent|all) ;; *) usage >&2; exit 2 ;; esac
+case "$control_url" in *[![:graph:]]*) echo "control URL must not contain whitespace" >&2; exit 2 ;; esac
+case "$node_id" in *[!A-Za-z0-9._:-]*) echo "node ID contains unsupported characters" >&2; exit 2 ;; esac
+
+config_dir=/etc/proxy-tester
+install -d -m 0750 "$config_dir"
+
+configure_control() {
+    target="$config_dir/control.env"
+    if [ -e "$target" ]; then
+        echo "preserved existing $target"
+        return
+    fi
+    install -m 0640 /usr/share/proxy-tester/examples/control.env.example "$target"
+    echo "created $target"
+}
+
+configure_agent() {
+    target="$config_dir/agent.env"
+    if [ -e "$target" ]; then
+        echo "preserved existing $target"
+        return
+    fi
+    [ -n "$control_url" ] || { echo "--control-url is required for a new agent configuration" >&2; exit 2; }
+    [ -n "$node_id" ] || { echo "--node-id is required for a new agent configuration" >&2; exit 2; }
+    {
+        printf 'PROXY_TESTER_CONTROL=%s\n' "$control_url"
+        printf 'PROXY_TESTER_NODE_ID=%s\n' "$node_id"
+        printf 'PROXY_TESTER_NETWORK_JOURNAL=/var/lib/proxy-tester/network-state.json\n'
+        printf 'RUST_LOG=proxy_agent=info\n'
+    } >"$target"
+    chmod 0640 "$target"
+    echo "created $target"
+}
+
+case "$component" in
+    control) configure_control ;;
+    agent) configure_agent ;;
+    all) configure_control; configure_agent ;;
+esac
+
+echo "configuration complete; review /etc/proxy-tester before enabling a service"

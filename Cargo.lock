@@ -1687,7 +1687,7 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "proxy-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-control"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-tester-capture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hpack",
  "thiserror",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-tester-domain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-tester-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

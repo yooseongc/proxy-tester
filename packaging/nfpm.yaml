@@ -1,0 +1,48 @@
+name: proxy-tester
+arch: amd64
+platform: linux
+version: ${PROXY_TESTER_PACKAGE_VERSION}
+release: "1"
+section: net
+priority: optional
+maintainer: proxy-tester maintainers <yooseongc@users.noreply.github.com>
+description: Distributed TCP and HTTP proxy performance measurement control and agent
+vendor: proxy-tester
+homepage: https://github.com/yooseongc/proxy-tester
+license: MIT
+contents:
+  - src: dist/package-root/usr/bin/proxy-control
+    dst: /usr/bin/proxy-control
+    file_info: {mode: 0755}
+  - src: dist/package-root/usr/bin/proxy-agent
+    dst: /usr/bin/proxy-agent
+    file_info: {mode: 0755}
+  - src: dist/package-root/usr/bin/proxy-tester-configure
+    dst: /usr/bin/proxy-tester-configure
+    file_info: {mode: 0755}
+  - src: dist/package-root/usr/share/proxy-tester/frontend/dist
+    dst: /usr/share/proxy-tester/frontend/dist
+    file_info: {mode: 0644}
+  - src: dist/package-root/usr/share/proxy-tester/examples
+    dst: /usr/share/proxy-tester/examples
+    file_info: {mode: 0644}
+  - src: packaging/systemd/proxy-tester-control.service
+    dst: /usr/lib/systemd/system/proxy-tester-control.service
+    file_info: {mode: 0644}
+  - src: packaging/systemd/proxy-tester-agent.service
+    dst: /usr/lib/systemd/system/proxy-tester-agent.service
+    file_info: {mode: 0644}
+  - src: LICENSE
+    dst: /usr/share/doc/proxy-tester/LICENSE
+    file_info: {mode: 0644}
+  - src: docs/INSTALLATION.md
+    dst: /usr/share/doc/proxy-tester/INSTALLATION.md
+    file_info: {mode: 0644}
+scripts:
+  postinstall: packaging/native/post-install.sh
+  postremove: packaging/native/post-remove.sh
+overrides:
+  deb:
+    depends: [iproute2, ethtool, iputils-arping]
+  rpm:
+    depends: [iproute, ethtool, iputils]

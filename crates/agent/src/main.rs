@@ -36,7 +36,13 @@ use payload::{CompletedArtifact, PreparedPayloads};
 use replay::{ReplayPlan, ReplayRole};
 use telemetry::Counters;
 
+const BUILD_COMMIT: &str = env!("PROXY_TESTER_BUILD_COMMIT");
+
 #[derive(Parser, Debug)]
+#[command(
+    version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PROXY_TESTER_BUILD_COMMIT"), ")")
+)]
 struct Args {
     #[arg(
         long,
@@ -129,7 +135,7 @@ async fn run_connection(
         body: Some(agent_message::Body::Hello(AgentHello {
             node_id: id.into(),
             hostname: hostname(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: format!("{} ({BUILD_COMMIT})", env!("CARGO_PKG_VERSION")),
             instance_id: instance_id.into(),
             inventory: Some(inventory.into()),
         })),
