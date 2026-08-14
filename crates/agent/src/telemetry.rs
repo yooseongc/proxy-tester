@@ -246,10 +246,29 @@ fn tcp_retransmissions_from(snmp: &str) -> Option<u64> {
 }
 
 fn read_interface_stat(interface: &str, stat: &str) -> u64 {
-    std::fs::read_to_string(format!("/sys/class/net/{interface}/statistics/{stat}"))
+    // A managed-direct worker enters its network namespace on a dedicated OS
+    // thread. /proc/net follows the thread-group leader, while thread-self
+    // resolves the network namespace of the thread collecting the counters.
+    std::fs::read_to_string("/proc/thread-self/net/dev")
         .ok()
-        .and_then(|value| value.trim().parse().ok())
+        .and_then(|contents| interface_stat_from_proc_net_dev(&contents, interface, stat))
         .unwrap_or(0)
+}
+
+fn interface_stat_from_proc_net_dev(contents: &str, interface: &str, stat: &str) -> Option<u64> {
+    let values = contents.lines().find_map(|line| {
+        let (name, values) = line.split_once(':')?;
+        (name.trim() == interface).then_some(values)
+    })?;
+    let fields = values.split_whitespace().collect::<Vec<_>>();
+    let index = match stat {
+        "rx_bytes" => 0,
+        "rx_packets" => 1,
+        "tx_bytes" => 8,
+        "tx_packets" => 9,
+        _ => return None,
+    };
+    fields.get(index)?.parse().ok()
 }
 
 #[cfg(test)]
@@ -261,5 +280,22 @@ mod tests {
         let snmp = "Tcp: RtoAlgorithm ActiveOpens RetransSegs InErrs\nTcp: 1 12 34 5\n";
         assert_eq!(tcp_retransmissions_from(snmp), Some(34));
         assert_eq!(tcp_retransmissions_from("Tcp: ActiveOpens\n"), None);
+    }
+
+    #[test]
+    fn parses_interface_counters_from_proc_net_dev() {
+        let contents = "Inter-| Receive | Transmit\n  eth1: 100 2 0 0 0 0 0 0 300 4 0 0 0 0 0 0\n";
+        assert_eq!(
+            interface_stat_from_proc_net_dev(contents, "eth1", "rx_bytes"),
+            Some(100)
+        );
+        assert_eq!(
+            interface_stat_from_proc_net_dev(contents, "eth1", "tx_packets"),
+            Some(4)
+        );
+        assert_eq!(
+            interface_stat_from_proc_net_dev(contents, "eth0", "tx_bytes"),
+            None
+        );
     }
 }

@@ -33,7 +33,10 @@ pub(crate) async fn accept_chunk(
         bail!("artifact {id} exceeds the agent limit");
     }
     if completed.contains_key(&id) {
-        bail!("artifact {id} was transferred more than once");
+        // Artifact IDs are immutable in Control. A later run can reference the
+        // same artifact, so reuse the verified local copy and consume the
+        // repeated stream idempotently instead of terminating the gRPC session.
+        return Ok(());
     }
     if !incoming.contains_key(&id) && chunk.offset != 0 {
         bail!("artifact {id} first chunk offset must be zero");

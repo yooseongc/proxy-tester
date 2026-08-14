@@ -552,6 +552,21 @@ function App() {
                             }
                           />
                         </Field>
+                        <Field label="Wire 계측 인터페이스">
+                          <input
+                            aria-label="Wire 계측 인터페이스"
+                            placeholder="eth0, eth1"
+                            value={scenario.observation_interfaces.join(", ")}
+                            onChange={(e) =>
+                              patch({
+                                observation_interfaces: e.target.value
+                                  .split(",")
+                                  .map((value) => value.trim())
+                                  .filter(Boolean),
+                              })
+                            }
+                          />
+                        </Field>
                         <div className="grid gap-2 sm:grid-cols-3">
                           <Field label="Connect timeout (ms)">
                             <input

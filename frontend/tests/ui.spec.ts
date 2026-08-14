@@ -206,6 +206,8 @@ test("traffic-first payload, summary, capture analysis and advanced fields react
   await expect(page.getByLabel("현재 트래픽 요약")).toContainText("응답: Random ASCII 10MB");
   await page.getByText("연결 고급 설정").click();
   await expect(page.getByLabel("Connect timeout (ms)")).toBeVisible();
+  await expect(page.getByLabel("Wire 계측 인터페이스")).toHaveValue("eth0");
+  await page.getByLabel("Wire 계측 인터페이스").fill("eth0, ens5");
   await page.getByLabel("연결 경로").selectOption("explicit_proxy");
   await expect(page.getByLabel("HTTP Proxy 주소")).toBeVisible();
   await expect(page.getByLabel("현재 트래픽 요약")).toContainText("명시적 Proxy");

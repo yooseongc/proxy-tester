@@ -467,9 +467,15 @@ async fn run_job(
 ) -> anyhow::Result<()> {
     let counters = Arc::new(Counters::default());
     let started = Instant::now();
-    let interface_task = job.scenario.runtime_interface.clone().map(|interface| {
+    let observation_interfaces = job
+        .scenario
+        .runtime_interface
+        .clone()
+        .map(|interface| vec![interface])
+        .unwrap_or_else(|| job.scenario.observation_interfaces.clone());
+    let interface_task = (!observation_interfaces.is_empty()).then(|| {
         tokio::spawn(telemetry::monitor_interfaces(
-            vec![interface],
+            observation_interfaces,
             counters.clone(),
             running.clone(),
         ))
@@ -788,10 +794,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let CompletedArtifact::Payload(completed) = &completed[&id] else {
+        let CompletedArtifact::Payload(payload) = &completed[&id] else {
             panic!("payload expected")
         };
-        assert_eq!(completed.as_ref(), bytes);
+        assert_eq!(payload.as_ref(), bytes);
+        accept_artifact_chunk(
+            &mut incoming,
+            &mut completed,
+            chunk(id, 0, bytes, bytes.len() as u64, &sha, true),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

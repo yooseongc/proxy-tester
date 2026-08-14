@@ -247,6 +247,7 @@ export type Scenario = {
     server_key_pem: string | null;
   };
   timeouts: { connect_ms: number; proxy_connect_ms: number; response_ms: number };
+  observation_interfaces: string[];
 };
 export type ScenarioPath =
   | { kind: "managed_direct"; profile_revision_id: string; server_port: number }
@@ -349,4 +350,5 @@ export const initialScenario = (): Scenario => ({
     server_key_pem: null,
   },
   timeouts: { connect_ms: 3000, proxy_connect_ms: 3000, response_ms: 5000 },
+  observation_interfaces: ["eth0"],
 });

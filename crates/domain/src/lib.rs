@@ -111,6 +111,8 @@ pub struct Scenario {
     pub capture_artifact_id: Option<Uuid>,
     pub tls: TlsProfile,
     pub timeouts: TimeoutProfile,
+    #[serde(default)]
+    pub observation_interfaces: Vec<String>,
     #[serde(skip)]
     pub runtime_target_addr: Option<String>,
     #[serde(skip)]
@@ -141,6 +143,7 @@ impl Default for Scenario {
             capture_artifact_id: None,
             tls: TlsProfile::default(),
             timeouts: TimeoutProfile::default(),
+            observation_interfaces: Vec::new(),
             runtime_target_addr: None,
             runtime_interface: None,
             runtime_namespace: None,
@@ -507,6 +510,15 @@ impl Scenario {
         if self.name.trim().is_empty() {
             return Err(ValidationError::Invalid(
                 "name은 비어 있을 수 없습니다".into(),
+            ));
+        }
+        if self
+            .observation_interfaces
+            .iter()
+            .any(|interface| interface.trim().is_empty())
+        {
+            return Err(ValidationError::Invalid(
+                "observation interface 이름은 비어 있을 수 없습니다".into(),
             ));
         }
         if self.load_stages.is_empty() && self.duration_secs == 0 {
