@@ -22,18 +22,20 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{Mutex, mpsc},
 };
 use tonic::Request;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 mod artifact;
+mod connector;
 mod network;
 mod payload;
 mod telemetry;
 mod tls;
 use artifact::accept_chunk as accept_artifact_chunk;
+use connector::IoStream;
 use network::{NetworkManager, NetworkPlan};
 use payload::{CompletedArtifact, PreparedPayloads};
 use telemetry::Counters;
@@ -242,9 +244,6 @@ fn rewrite_http_request(request: &[u8], scenario: &Scenario, role: Role) -> Vec<
     output.extend_from_slice(&request[header_end..]);
     output
 }
-
-trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 struct WorkerGate<'a> {
     running: &'a AtomicBool,
@@ -1113,59 +1112,9 @@ async fn transact(
     gate: &WorkerGate<'_>,
     connection_index: u64,
 ) -> anyhow::Result<()> {
-    let target_addr = sc.target_addr();
-    let connect_addr = sc.proxy_addr().unwrap_or(&target_addr);
-    let connect_started = Instant::now();
-    let connect_future = async {
-        let remote = tokio::net::lookup_host(connect_addr)
-            .await?
-            .next()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "target address did not resolve",
-                )
-            })?;
-        let socket = if remote.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-        if let Some(ip) = sc
-            .runtime_source_ips
-            .get(connection_index as usize % sc.runtime_source_ips.len().max(1))
-        {
-            socket.bind(SocketAddr::new(*ip, 0))?;
-        }
-        socket.connect(remote).await
-    };
-    let mut tcp_stream = tokio::time::timeout(
-        Duration::from_millis(sc.timeouts.connect_ms),
-        connect_future,
-    )
-    .await?
-    .context("TCP connect failed")?;
-    c.tcp_connect_latencies_us
-        .lock()
-        .await
-        .push(connect_started.elapsed().as_micros() as u64);
-    c.connection_established();
+    let tcp_stream = connector::connect_tcp(sc, connection_index, c).await?;
     let _active_connection = c.connection_opened();
-    let needs_tunnel = sc.is_explicit_proxy() && (sc.tls.enabled || sc.protocol != Protocol::Http1);
-    if needs_tunnel {
-        connect_tunnel(&mut tcp_stream, sc, c)
-            .await
-            .context("HTTP CONNECT failed")?;
-    }
-    let mut stream: Box<dyn IoStream> = if sc.tls.enabled {
-        Box::new(
-            connect_tls(tcp_stream, sc)
-                .await
-                .context("TLS handshake failed")?,
-        )
-    } else {
-        Box::new(tcp_stream)
-    };
+    let mut stream = connector::upgrade(tcp_stream, sc, c).await?;
     let result = if sc.protocol == Protocol::Http2 {
         http2_transactions(stream, sc, payloads, replay_turns, c, gate).await
     } else if let Some(turns) = replay_turns {
@@ -1185,28 +1134,6 @@ async fn transact(
     result
 }
 
-async fn connect_tunnel(stream: &mut TcpStream, sc: &Scenario, c: &Counters) -> anyhow::Result<()> {
-    let req = format!(
-        "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\n\r\n",
-        sc.target_addr(),
-        sc.target_addr()
-    );
-    stream.write_all(req.as_bytes()).await?;
-    c.tx.fetch_add(req.len() as u64, Ordering::Relaxed);
-    let head = tokio::time::timeout(
-        Duration::from_millis(sc.timeouts.proxy_connect_ms),
-        read_headers(stream, 16 * 1024),
-    )
-    .await??;
-    c.rx.fetch_add(head.len() as u64, Ordering::Relaxed);
-    if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
-        bail!(
-            "CONNECT rejected with response {}",
-            String::from_utf8_lossy(&head[..head.len().min(128)])
-        )
-    };
-    Ok(())
-}
 async fn tcp_transaction(
     stream: &mut (impl IoStream + ?Sized),
     sc: &Scenario,
@@ -1512,13 +1439,6 @@ async fn http2_transactions(
     Ok(())
 }
 
-async fn connect_tls(
-    stream: TcpStream,
-    sc: &Scenario,
-) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    tls::connect(stream, sc).await
-}
-
 fn build_tls_acceptor(sc: &Scenario) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     tls::acceptor(sc)
 }
@@ -1735,26 +1655,6 @@ async fn read_http_message(
     Ok((headers, body_len))
 }
 
-async fn read_headers(
-    stream: &mut (impl AsyncRead + Unpin + ?Sized),
-    max: usize,
-) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(1024);
-    let mut b = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut b).await?;
-        if n == 0 {
-            bail!("connection closed before headers")
-        };
-        out.extend_from_slice(&b[..n]);
-        if out.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(out);
-        }
-        if out.len() > max {
-            bail!("headers too large")
-        }
-    }
-}
 fn parse_header(raw: &[u8], name: &str) -> Option<usize> {
     let text = String::from_utf8_lossy(raw);
     text.lines()
