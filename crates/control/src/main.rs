@@ -248,17 +248,16 @@ struct ProfileListQuery {
 async fn list_network_profiles(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let rows=sqlx::query("SELECT id,name,draft_json,status,archived,created_at,updated_at FROM network_profiles ORDER BY updated_at DESC").fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r|serde_json::json!({"id":r.get::<String,_>("id"),"name":r.get::<String,_>("name"),"draft":serde_json::from_str::<serde_json::Value>(r.get("draft_json")).unwrap_or_default(),"status":r.get::<String,_>("status"),"archived":r.get::<i64,_>("archived")!=0,"created_at":r.get::<String,_>("created_at"),"updated_at":r.get::<String,_>("updated_at")})).collect()))
+    Ok(Json(
+        repository::network_profiles::list_profiles(&s.db).await?,
+    ))
 }
 async fn save_network_profile(
     State(s): State<AppState>,
     Json(draft): Json<NetworkProfileDraft>,
 ) -> Result<Json<NetworkProfileDraft>, ApiError> {
     draft.validate().map_err(|e| ApiError::bad(e.to_string()))?;
-    let now = Utc::now().to_rfc3339();
-    let body = serde_json::to_string(&draft)?;
-    sqlx::query("INSERT INTO network_profiles(id,name,draft_json,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,draft_json=excluded.draft_json,status=CASE WHEN network_profiles.status='prepared' THEN 'prepared' ELSE 'draft' END,updated_at=excluded.updated_at").bind(draft.id.to_string()).bind(&draft.name).bind(body).bind(&now).bind(&now).execute(&s.db).await?;
+    repository::network_profiles::upsert(&s.db, &draft).await?;
     Ok(Json(draft))
 }
 
@@ -271,26 +270,16 @@ async fn archive_network_profile(
             "profiles cannot be archived during a run",
         ));
     }
-    let prepared: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM network_profile_revisions WHERE profile_id=? AND status='prepared'",
-    )
-    .bind(id.to_string())
-    .fetch_one(&s.db)
-    .await?;
-    if prepared > 0 {
-        return Err(ApiError::conflict(
-            "teardown the prepared revision before archiving the profile",
-        ));
-    }
-    let result = sqlx::query(
-        "UPDATE network_profiles SET archived=1,status='archived',updated_at=? WHERE id=?",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(id.to_string())
-    .execute(&s.db)
-    .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("network profile not found"));
+    match repository::network_profiles::archive(&s.db, id).await? {
+        repository::network_profiles::ArchiveResult::Archived => {}
+        repository::network_profiles::ArchiveResult::PreparedRevision => {
+            return Err(ApiError::conflict(
+                "teardown the prepared revision before archiving the profile",
+            ));
+        }
+        repository::network_profiles::ArchiveResult::NotFound => {
+            return Err(ApiError::not_found("network profile not found"));
+        }
     }
     Ok(Json(serde_json::json!({"id":id,"status":"archived"})))
 }
@@ -298,24 +287,8 @@ async fn list_network_revisions(
     State(s): State<AppState>,
     Query(q): Query<ProfileListQuery>,
 ) -> Result<Json<Vec<NetworkProfileRevision>>, ApiError> {
-    let rows = if let Some(id) = q.profile_id {
-        sqlx::query("SELECT id,profile_id,revision,sha256,body_json FROM network_profile_revisions WHERE profile_id=? ORDER BY revision DESC").bind(id.to_string()).fetch_all(&s.db).await?
-    } else {
-        sqlx::query("SELECT id,profile_id,revision,sha256,body_json FROM network_profile_revisions ORDER BY created_at DESC").fetch_all(&s.db).await?
-    };
     Ok(Json(
-        rows.into_iter()
-            .filter_map(|r| {
-                let body = serde_json::from_str::<NetworkProfileDraft>(r.get("body_json")).ok()?;
-                Some(NetworkProfileRevision {
-                    id: Uuid::parse_str(r.get::<String, _>("id").as_str()).ok()?,
-                    profile_id: Uuid::parse_str(r.get::<String, _>("profile_id").as_str()).ok()?,
-                    revision: r.get::<i64, _>("revision") as u32,
-                    sha256: r.get("sha256"),
-                    body,
-                })
-            })
-            .collect(),
+        repository::network_profiles::list_revisions(&s.db, q.profile_id).await?,
     ))
 }
 async fn plan_network_profile(
@@ -457,25 +430,9 @@ async fn revision_nodes(
     db: &SqlitePool,
     revision_id: Uuid,
 ) -> Result<(NetworkProfileDraft, Vec<String>, Uuid), ApiError> {
-    let row = sqlx::query("SELECT profile_id,body_json FROM network_profile_revisions WHERE id=?")
-        .bind(revision_id.to_string())
-        .fetch_optional(db)
+    repository::network_profiles::revision_context(db, revision_id)
         .await?
-        .ok_or_else(|| ApiError::not_found("network profile revision not found"))?;
-    let draft: NetworkProfileDraft =
-        serde_json::from_str(row.get::<String, _>("body_json").as_str())?;
-    let mut nodes = vec![
-        draft.client_endpoint.node_id.clone(),
-        draft.server_endpoint.node_id.clone(),
-    ];
-    nodes.sort();
-    nodes.dedup();
-    Ok((
-        draft,
-        nodes,
-        Uuid::parse_str(row.get::<String, _>("profile_id").as_str())
-            .map_err(|e| ApiError::internal(e.to_string()))?,
-    ))
+        .ok_or_else(|| ApiError::not_found("network profile revision not found"))
 }
 
 async fn apply_network_profile(
