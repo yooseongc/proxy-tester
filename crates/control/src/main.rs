@@ -17,7 +17,7 @@ use proxy_tester_domain::{
     Scenario,
 };
 use proxy_tester_proto::v1::{
-    AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, StopRun,
+    AgentMessage, ControlMessage, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -28,13 +28,14 @@ use sqlx::{Row, SqlitePool};
 use std::{pin::Pin, sync::Arc};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{broadcast, mpsc, oneshot, watch},
+    sync::{broadcast, mpsc, watch},
 };
 use tonic::{Request, Response as GrpcResponse, Status};
 use tracing::{info, warn};
 use uuid::Uuid;
 mod database;
 mod error;
+mod network_orchestration;
 mod orchestration;
 mod repository;
 mod routes;
@@ -337,7 +338,7 @@ async fn plan_network_profile(
     sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,plan_token_hash,expires_at,detail_json,created_at,updated_at) VALUES(?,?,'plan','planned',?,?,?,?,?)").bind(operation_id.to_string()).bind(&revision_id).bind(format!("{:x}",Sha256::digest(token.as_bytes()))).bind(expires.to_rfc3339()).bind(detail.to_string()).bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&s.db).await?;
     let mut plans = serde_json::Map::new();
     for node in &nodes {
-        let progress = network_command(
+        let progress = network_orchestration::command(
             &s,
             node,
             operation_id,
@@ -373,59 +374,6 @@ async fn plan_network_profile(
 struct ApplyNetworkRequest {
     plan_token: String,
 }
-async fn network_command(
-    s: &AppState,
-    node_id: &str,
-    operation_id: Uuid,
-    action: &str,
-    payload: serde_json::Value,
-    lease_ms: i64,
-) -> Result<NetworkProgress, ApiError> {
-    let agent = s
-        .agents
-        .read()
-        .await
-        .get(node_id)
-        .cloned()
-        .ok_or_else(|| ApiError::bad(format!("node {node_id} is offline")))?;
-    let command_id = Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel();
-    s.pending_network
-        .lock()
-        .await
-        .insert(command_id.clone(), tx);
-    agent
-        .tx
-        .send(Ok(ControlMessage {
-            body: Some(control_message::Body::Network(NetworkCommand {
-                command_id: command_id.clone(),
-                operation_id: operation_id.to_string(),
-                lease_expires_unix_ms: lease_ms,
-                action: Some(wire::network_action(action, payload)?),
-            })),
-        }))
-        .await
-        .map_err(|_| ApiError::internal("node command channel closed"))?;
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(s.command_timeout_secs.max(180)),
-        rx,
-    )
-    .await
-    {
-        Ok(Ok(progress)) if progress.ok => Ok(progress),
-        Ok(Ok(progress)) => Err(ApiError::internal(format!(
-            "node {node_id} {action} failed: {}",
-            progress.error
-        ))),
-        _ => {
-            s.pending_network.lock().await.remove(&command_id);
-            Err(ApiError::internal(format!(
-                "node {node_id} {action} timed out"
-            )))
-        }
-    }
-}
-
 async fn revision_nodes(
     db: &SqlitePool,
     revision_id: Uuid,
@@ -481,9 +429,11 @@ async fn apply_network_profile(
             .get(node)
             .cloned()
             .ok_or_else(|| ApiError::internal(format!("network plan missing node {node}")))?;
-        if let Err(error) = network_command(&s, node, operation_id, "stage", plan, lease).await {
+        if let Err(error) =
+            network_orchestration::command(&s, node, operation_id, "stage", plan, lease).await
+        {
             for applied in &staged {
-                let _ = network_command(
+                let _ = network_orchestration::command(
                     &s,
                     applied,
                     operation_id,
@@ -499,7 +449,7 @@ async fn apply_network_profile(
         staged.push(node.clone());
     }
     for node in &nodes {
-        if let Err(error) = network_command(
+        if let Err(error) = network_orchestration::command(
             &s,
             node,
             operation_id,
@@ -510,7 +460,7 @@ async fn apply_network_profile(
         .await
         {
             for applied in &staged {
-                let _ = network_command(
+                let _ = network_orchestration::command(
                     &s,
                     applied,
                     operation_id,
@@ -550,7 +500,7 @@ async fn teardown_network_profile(
     let now = Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO network_operations(id,profile_revision_id,kind,status,detail_json,created_at,updated_at) VALUES(?,?,'teardown','tearing_down','{}',?,?)").bind(operation.to_string()).bind(revision_id.to_string()).bind(&now).bind(&now).execute(&s.db).await?;
     for node in &nodes {
-        if let Err(error) = network_command(
+        if let Err(error) = network_orchestration::command(
             &s,
             node,
             operation,
@@ -638,7 +588,7 @@ async fn reconcile_node(
     Path(node_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let operation = Uuid::new_v4();
-    network_command(
+    network_orchestration::command(
         &s,
         &node_id,
         operation,
