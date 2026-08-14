@@ -1599,8 +1599,8 @@ async fn active_run(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"run_id":*s.active_run.lock().await}))
 }
 async fn list_runs(State(s): State<AppState>) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let rows=sqlx::query("SELECT id,scenario_id,run_name,status,started_at,finished_at,error,scenario_json FROM runs ORDER BY rowid DESC LIMIT 100").fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r|serde_json::json!({"id":r.get::<String,_>("id"),"scenario_id":r.get::<String,_>("scenario_id"),"run_name":r.get::<Option<String>,_>("run_name"),"status":r.get::<String,_>("status"),"started_at":r.get::<Option<String>,_>("started_at"),"finished_at":r.get::<Option<String>,_>("finished_at"),"error":r.get::<Option<String>,_>("error"),"scenario":redacted_scenario(r.get("scenario_json"))})).collect()))
+    let rows = repository::runs::list_recent(&s.db, 100).await?;
+    Ok(Json(rows.into_iter().map(run_list_json).collect()))
 }
 #[derive(Deserialize)]
 struct RunPageQuery {
@@ -1613,11 +1613,15 @@ async fn list_runs_page(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = query.limit.unwrap_or(25).clamp(1, 100) as i64;
     let cursor = query.cursor.unwrap_or(i64::MAX);
-    let rows=sqlx::query("SELECT rowid,id,scenario_id,run_name,status,started_at,finished_at,error,scenario_json FROM runs WHERE rowid < ? ORDER BY rowid DESC LIMIT ?")
-        .bind(cursor).bind(limit + 1).fetch_all(&s.db).await?;
-    let next_cursor =
-        (rows.len() as i64 > limit).then(|| rows[limit as usize - 1].get::<i64, _>("rowid"));
-    let items=rows.into_iter().take(limit as usize).map(|r|serde_json::json!({"id":r.get::<String,_>("id"),"scenario_id":r.get::<String,_>("scenario_id"),"run_name":r.get::<Option<String>,_>("run_name"),"status":r.get::<String,_>("status"),"started_at":r.get::<Option<String>,_>("started_at"),"finished_at":r.get::<Option<String>,_>("finished_at"),"error":r.get::<Option<String>,_>("error"),"scenario":redacted_scenario(r.get("scenario_json"))})).collect::<Vec<_>>();
+    let rows = repository::runs::list_page(&s.db, cursor, limit + 1).await?;
+    let next_cursor = (rows.len() as i64 > limit)
+        .then(|| rows[limit as usize - 1].rowid)
+        .flatten();
+    let items = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(run_list_json)
+        .collect::<Vec<_>>();
     Ok(Json(
         serde_json::json!({"items":items,"next_cursor":next_cursor}),
     ))
@@ -1637,10 +1641,14 @@ async fn run_samples(
     let from = query.from_unix_ms.unwrap_or(i64::MIN);
     let to = query.to_unix_ms.unwrap_or(i64::MAX);
     let maximum = query.max_points.unwrap_or(2000).clamp(10, 10_000) as usize;
-    let rows=sqlx::query("SELECT agent_id,role,unix_ms,metrics_json FROM metric_samples WHERE run_id=? AND unix_ms>=? AND unix_ms<=? ORDER BY unix_ms")
-        .bind(id.to_string()).bind(from).bind(to).fetch_all(&s.db).await?;
+    let rows = repository::runs::samples(&s.db, &id.to_string(), from, to).await?;
     let stride = (rows.len().saturating_add(maximum - 1) / maximum).max(1);
-    let samples=rows.into_iter().enumerate().filter(|(index,_)| index % stride == 0).map(|(_,r)|serde_json::json!({"agent_id":r.get::<String,_>("agent_id"),"role":r.get::<i64,_>("role"),"unix_ms":r.get::<i64,_>("unix_ms"),"metrics":serde_json::from_str::<serde_json::Value>(r.get("metrics_json")).unwrap_or_default()})).collect::<Vec<_>>();
+    let samples = rows
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| index % stride == 0)
+        .map(|(_, row)| metric_sample_json(row))
+        .collect::<Vec<_>>();
     Ok(Json(
         serde_json::json!({"samples":samples,"downsampled":stride>1,"stride":stride}),
     ))
@@ -1709,21 +1717,42 @@ fn redacted_scenario(body: &str) -> serde_json::Value {
     }
     value
 }
+fn run_list_json(run: repository::runs::RunRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": run.id,
+        "scenario_id": run.scenario_id,
+        "run_name": run.run_name,
+        "status": run.status,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "error": run.error,
+        "scenario": redacted_scenario(&run.scenario_json)
+    })
+}
+fn metric_sample_json(sample: repository::runs::MetricSampleRecord) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": sample.agent_id,
+        "role": sample.role,
+        "unix_ms": sample.unix_ms,
+        "metrics": serde_json::from_str::<serde_json::Value>(&sample.metrics_json)
+            .unwrap_or_default()
+    })
+}
 async fn run_detail(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run = sqlx::query("SELECT * FROM runs WHERE id=?")
-        .bind(id.to_string())
-        .fetch_optional(&s.db)
+    let run = repository::runs::find(&s.db, &id.to_string())
         .await?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
-    let scenario_json: String = run.get("scenario_json");
-    let samples=sqlx::query("SELECT agent_id,role,unix_ms,metrics_json FROM metric_samples WHERE run_id=? ORDER BY unix_ms").bind(id.to_string()).fetch_all(&s.db).await?;
-    let samples = samples.into_iter().map(|r|serde_json::json!({"agent_id":r.get::<String,_>("agent_id"),"role":r.get::<i64,_>("role"),"unix_ms":r.get::<i64,_>("unix_ms"),"metrics":serde_json::from_str::<serde_json::Value>(r.get("metrics_json")).unwrap_or_default()})).collect::<Vec<_>>();
-    let payload_metadata = result_payload_metadata(&scenario_json, &samples);
+    let samples = repository::runs::samples(&s.db, &id.to_string(), i64::MIN, i64::MAX)
+        .await?
+        .into_iter()
+        .map(metric_sample_json)
+        .collect::<Vec<_>>();
+    let payload_metadata = result_payload_metadata(&run.scenario_json, &samples);
     Ok(Json(
-        serde_json::json!({"id":run.get::<String,_>("id"),"run_name":run.get::<Option<String>,_>("run_name"),"started_at":run.get::<Option<String>,_>("started_at"),"finished_at":run.get::<Option<String>,_>("finished_at"),"status":run.get::<String,_>("status"),"error":run.get::<Option<String>,_>("error"),"scenario":redacted_scenario(&scenario_json),"payload_metadata":payload_metadata,"samples":samples }),
+        serde_json::json!({"id":run.id,"run_name":run.run_name,"started_at":run.started_at,"finished_at":run.finished_at,"status":run.status,"error":run.error,"scenario":redacted_scenario(&run.scenario_json),"payload_metadata":payload_metadata,"samples":samples }),
     ))
 }
 async fn run_summary_detail(
