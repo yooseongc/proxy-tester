@@ -1,8 +1,7 @@
 use anyhow::{Context, bail};
-use bytes::Bytes;
 use chrono::Utc;
 use clap::Parser;
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::StreamExt;
 use proxy_tester_capture::{Direction, HttpTransaction, ReplayTurn, analyze_capture};
 use proxy_tester_domain::{MetricsSnapshot, PayloadKind, PayloadMode, Protocol, Scenario};
 use proxy_tester_proto::network_draft_from_wire;
@@ -1102,7 +1101,7 @@ async fn transact(
     let _active_connection = c.connection_opened();
     let mut stream = connector::upgrade(tcp_stream, sc, c).await?;
     let result = if sc.protocol == Protocol::Http2 {
-        http2_transactions(stream, sc, payloads, replay_turns, c, gate).await
+        workload::http2::transactions(stream, sc, payloads, replay_turns, c, gate).await
     } else if let Some(turns) = replay_turns {
         replay_client(&mut *stream, turns, sc, c).await
     } else {
@@ -1118,120 +1117,6 @@ async fn transact(
         c.transaction_completed();
     }
     result
-}
-
-async fn send_h2_body(send: &mut h2::SendStream<Bytes>, payload: &[u8]) -> anyhow::Result<()> {
-    if payload.is_empty() {
-        send.send_data(Bytes::new(), true)?;
-        return Ok(());
-    }
-    let mut offset = 0;
-    while offset < payload.len() {
-        send.reserve_capacity((payload.len() - offset).min(16 * 1024));
-        let capacity = futures::future::poll_fn(|cx| send.poll_capacity(cx))
-            .await
-            .context("HTTP/2 stream closed while waiting for flow-control capacity")??;
-        let size = capacity.min(16 * 1024).min(payload.len() - offset);
-        if size == 0 {
-            continue;
-        }
-        offset += size;
-        send.send_data(
-            Bytes::copy_from_slice(&payload[offset - size..offset]),
-            offset == payload.len(),
-        )?;
-    }
-    Ok(())
-}
-
-async fn http2_request_parts(
-    sender: h2::client::SendRequest<Bytes>,
-    sc: &Scenario,
-    request_payload: &[u8],
-    response_len: usize,
-) -> anyhow::Result<(u64, u64, u64)> {
-    let started = Instant::now();
-    let uri = format!("https://{}{}", sc.request.host, sc.request.path);
-    let request = http::Request::builder()
-        .method(sc.request.method.as_str())
-        .uri(uri)
-        .version(http::Version::HTTP_2)
-        .header("x-response-bytes", response_len.to_string())
-        .body(())?;
-    let mut ready = sender.ready().await?;
-    let (response, mut send) = ready.send_request(request, request_payload.is_empty())?;
-    if !request_payload.is_empty() {
-        send_h2_body(&mut send, request_payload).await?;
-    }
-    let response = response.await?;
-    if !response.status().is_success() {
-        bail!("HTTP error response {}", response.status());
-    }
-    let mut body = response.into_body();
-    let mut received = 0_u64;
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk?;
-        received += chunk.len() as u64;
-        body.flow_control().release_capacity(chunk.len())?;
-    }
-    Ok((
-        started.elapsed().as_micros() as u64,
-        request_payload.len() as u64,
-        received,
-    ))
-}
-
-async fn http2_transactions(
-    stream: Box<dyn IoStream>,
-    sc: &Scenario,
-    payloads: &PreparedPayloads,
-    replay_turns: Option<&[ReplayTurn]>,
-    c: &Counters,
-    gate: &WorkerGate<'_>,
-) -> anyhow::Result<()> {
-    let mut builder = h2::client::Builder::new();
-    builder.initial_max_send_streams(sc.http2.max_concurrent_streams as usize);
-    let (sender, connection) = builder.handshake(stream).await?;
-    let driver = tokio::spawn(connection);
-    let maximum = sc.request.transactions_per_connection as u64;
-    let concurrency = sc.http2.max_concurrent_streams as usize;
-    let mut launched = 0_u64;
-    let mut pending = FuturesUnordered::new();
-    while (gate.enabled() && (maximum == 0 || launched < maximum)) || !pending.is_empty() {
-        while gate.enabled() && pending.len() < concurrency && (maximum == 0 || launched < maximum)
-        {
-            let request = replay_turns
-                .and_then(|turns| turns.get((launched as usize * 2) % turns.len()))
-                .map(|turn| turn.payload.as_slice())
-                .unwrap_or(&payloads.request);
-            let response_len = replay_turns
-                .and_then(|turns| turns.get((launched as usize * 2 + 1) % turns.len()))
-                .map(|turn| turn.payload.len())
-                .unwrap_or(payloads.response.len());
-            pending.push(http2_request_parts(
-                sender.clone(),
-                sc,
-                request,
-                response_len,
-            ));
-            launched += 1;
-        }
-        let Some(result) = pending.next().await else {
-            break;
-        };
-        let (latency, sent, received) = result?;
-        c.tx.fetch_add(sent, Ordering::Relaxed);
-        c.rx.fetch_add(received, Ordering::Relaxed);
-        c.transaction_completed();
-        c.http_latencies_us.lock().await.push(latency);
-        if sc.request.think_time_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(sc.request.think_time_ms)).await;
-        }
-    }
-    drop(sender);
-    driver.abort();
-    let _ = driver.await;
-    Ok(())
 }
 
 fn build_tls_acceptor(sc: &Scenario) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
@@ -1290,7 +1175,12 @@ async fn run_server(
                 None => Box::new(stream),
             };
             let r = if sc.protocol == Protocol::Http2 {
-                serve_http2_connection(stream, payloads, replay, c2.clone()).await
+                let replay_response = replay
+                    .as_ref()
+                    .and_then(|plan| plan.flows.first())
+                    .and_then(|flow| flow.get(1))
+                    .map(|turn| turn.payload.clone());
+                workload::http2::serve(stream, payloads, replay_response, c2.clone()).await
             } else if let Some(plan) = replay {
                 replay_server_detect(&mut *stream, &plan.flows, &sc, &c2).await
             } else if sc.protocol == Protocol::Http1 {
@@ -1306,72 +1196,6 @@ async fn run_server(
                 c2.transaction_errors.fetch_add(1, Ordering::Relaxed);
             }
         });
-    }
-    Ok(())
-}
-async fn serve_http2_connection(
-    stream: Box<dyn IoStream>,
-    payloads: Arc<PreparedPayloads>,
-    replay: Option<Arc<ReplayPlan>>,
-    c: Arc<Counters>,
-) -> anyhow::Result<()> {
-    let mut connection = h2::server::handshake(stream).await?;
-    let mut tasks = tokio::task::JoinSet::new();
-    while let Some(result) = connection.accept().await {
-        let (request, mut respond) = result?;
-        let payloads = payloads.clone();
-        let c = c.clone();
-        let replay_response = replay
-            .as_ref()
-            .and_then(|plan| plan.flows.first())
-            .and_then(|flow| flow.get(1))
-            .map(|turn| turn.payload.clone());
-        tasks.spawn(async move {
-            let outcome: anyhow::Result<()> = async {
-                let response_len = request
-                    .headers()
-                    .get("x-response-bytes")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(payloads.response.len());
-                let mut request_body = request.into_body();
-                let mut received = 0_u64;
-                while let Some(chunk) = request_body.data().await {
-                    let chunk = chunk?;
-                    received += chunk.len() as u64;
-                    request_body.flow_control().release_capacity(chunk.len())?;
-                }
-                c.rx.fetch_add(received, Ordering::Relaxed);
-                let response = http::Response::builder()
-                    .status(200)
-                    .version(http::Version::HTTP_2)
-                    .header("content-length", response_len.to_string())
-                    .body(())?;
-                let mut send = respond.send_response(response, response_len == 0)?;
-                if response_len > 0 {
-                    if let Some(body) = replay_response
-                        .as_ref()
-                        .filter(|body| body.len() == response_len)
-                    {
-                        send_h2_body(&mut send, body).await?;
-                    } else if response_len == payloads.response.len() {
-                        send_h2_body(&mut send, &payloads.response).await?;
-                    } else {
-                        send_h2_body(&mut send, &vec![0; response_len]).await?;
-                    }
-                }
-                c.tx.fetch_add(response_len as u64, Ordering::Relaxed);
-                c.transaction_completed();
-                Ok(())
-            }
-            .await;
-            if outcome.is_err() {
-                c.transaction_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result?;
     }
     Ok(())
 }

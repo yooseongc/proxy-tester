@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub(crate) mod http1;
+pub(crate) mod http2;
 pub(crate) mod tcp;
 
 pub(crate) struct WorkerGate<'a> {
