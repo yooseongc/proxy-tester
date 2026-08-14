@@ -16,8 +16,6 @@ use proxy_tester_domain::{
     MetricsSnapshot, NetworkProfileDraft, NetworkProfileRevision, PayloadKind, PayloadMode,
     Protocol, Scenario, ScenarioPath,
 };
-use proxy_tester_proto::network_draft_to_wire;
-use proxy_tester_proto::v1::network_command::Action as NetworkAction;
 use proxy_tester_proto::v1::{
     AgentMessage, ArtifactChunk, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun,
     SetPaused, StartRun, StopRun,
@@ -40,6 +38,7 @@ mod database;
 mod error;
 mod routes;
 mod state;
+mod wire;
 
 #[cfg(test)]
 use database::schema_fallback_url;
@@ -375,7 +374,7 @@ async fn plan_network_profile(
         .await?;
         plans.insert(
             node.clone(),
-            wire_plan_to_json(
+            wire::plan_to_json(
                 progress
                     .plan
                     .ok_or_else(|| ApiError::internal("agent plan response is missing plan"))?,
@@ -428,7 +427,7 @@ async fn network_command(
                 command_id: command_id.clone(),
                 operation_id: operation_id.to_string(),
                 lease_expires_unix_ms: lease_ms,
-                action: Some(wire_network_action(action, payload)?),
+                action: Some(wire::network_action(action, payload)?),
             })),
         }))
         .await
@@ -476,103 +475,6 @@ async fn revision_nodes(
         Uuid::parse_str(row.get::<String, _>("profile_id").as_str())
             .map_err(|e| ApiError::internal(e.to_string()))?,
     ))
-}
-
-fn wire_network_action(
-    action: &str,
-    payload: serde_json::Value,
-) -> Result<NetworkAction, ApiError> {
-    use proxy_tester_proto::v1::{EmptyNetworkAction, PlanNetwork, StageNetwork};
-    Ok(match action {
-        "plan" => NetworkAction::Plan(PlanNetwork {
-            profile_revision_id: payload["profile_revision_id"]
-                .as_str()
-                .ok_or_else(|| ApiError::internal("plan revision is missing"))?
-                .into(),
-            draft: Some(network_draft_to_wire(serde_json::from_value(
-                payload["draft"].clone(),
-            )?)),
-        }),
-        "stage" => NetworkAction::Stage(StageNetwork {
-            plan: Some(json_to_wire_plan(payload)?),
-        }),
-        "commit" => NetworkAction::Commit(EmptyNetworkAction {}),
-        "rollback" => NetworkAction::Rollback(EmptyNetworkAction {}),
-        "teardown" => NetworkAction::Teardown(EmptyNetworkAction {}),
-        "reconcile" => NetworkAction::Reconcile(EmptyNetworkAction {}),
-        _ => {
-            return Err(ApiError::internal(format!(
-                "unknown network action {action}"
-            )));
-        }
-    })
-}
-fn json_to_wire_plan(
-    value: serde_json::Value,
-) -> Result<proxy_tester_proto::v1::NetworkPlan, ApiError> {
-    let commands = |name: &str| -> Result<Vec<proxy_tester_proto::v1::CommandSpec>, ApiError> {
-        Ok(value[name]
-            .as_array()
-            .ok_or_else(|| ApiError::internal(format!("plan {name} is missing")))?
-            .iter()
-            .map(|v| proxy_tester_proto::v1::CommandSpec {
-                program: v["program"].as_str().unwrap_or_default().into(),
-                args: v["args"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|a| a.as_str().map(str::to_owned))
-                    .collect(),
-            })
-            .collect())
-    };
-    Ok(proxy_tester_proto::v1::NetworkPlan {
-        profile_revision_id: value["profile_revision_id"]
-            .as_str()
-            .unwrap_or_default()
-            .into(),
-        node_id: value["node_id"].as_str().unwrap_or_default().into(),
-        inventory_fingerprint: value["inventory_fingerprint"]
-            .as_str()
-            .unwrap_or_default()
-            .into(),
-        endpoints: value["endpoints"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|v| proxy_tester_proto::v1::EndpointPlan {
-                role: v["role"].as_str().unwrap_or_default().into(),
-                namespace: v["namespace"].as_str().unwrap_or_default().into(),
-                interface: v["interface"].as_str().unwrap_or_default().into(),
-                addresses: v["addresses"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|a| a.as_str().map(str::to_owned))
-                    .collect(),
-            })
-            .collect(),
-        semantic_changes: value["semantic_changes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
-        commands: commands("commands")?,
-        rollback_commands: commands("rollback_commands")?,
-        warnings: value["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
-    })
-}
-fn wire_plan_to_json(value: proxy_tester_proto::v1::NetworkPlan) -> serde_json::Value {
-    serde_json::json!({"profile_revision_id":value.profile_revision_id,"node_id":value.node_id,"inventory_fingerprint":value.inventory_fingerprint,"endpoints":value.endpoints.into_iter().map(|v|serde_json::json!({"role":v.role,"namespace":v.namespace,"interface":v.interface,"addresses":v.addresses})).collect::<Vec<_>>(),"semantic_changes":value.semantic_changes,"commands":value.commands.into_iter().map(|v|serde_json::json!({"program":v.program,"args":v.args})).collect::<Vec<_>>(),"rollback_commands":value.rollback_commands.into_iter().map(|v|serde_json::json!({"program":v.program,"args":v.args})).collect::<Vec<_>>(),"warnings":value.warnings})
-}
-fn wire_inventory_to_json(value: proxy_tester_proto::v1::NodeInventory) -> serde_json::Value {
-    serde_json::json!({"interfaces":value.interfaces.into_iter().map(|v|serde_json::json!({"name":v.name,"mac":v.mac,"mtu":v.mtu,"state":v.state,"master":v.master,"addresses":v.addresses,"link_up":v.link_up,"offloads":v.offloads})).collect::<Vec<_>>(),"capabilities":value.capabilities,"protected_interfaces":value.protected_interfaces,"fingerprint":value.fingerprint})
 }
 
 async fn apply_network_profile(
@@ -1927,7 +1829,7 @@ impl AgentControl for ControlSvc {
             .iter()
             .map(|v| v.name.clone())
             .collect();
-        let inventory_json = wire_inventory_to_json(inventory).to_string();
+        let inventory_json = wire::inventory_to_json(inventory).to_string();
         let generation = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(64);
         self.0.agents.write().await.insert(
@@ -1968,7 +1870,7 @@ impl AgentControl for ControlSvc {
                     Some(agent_message::Body::NetworkProgress(progress)) => {
                         let _=sqlx::query("INSERT INTO network_operation_events(operation_id,node_id,stage,status,detail_json,created_at) VALUES(?,?,?,?,?,?)")
                             .bind(&progress.operation_id).bind(&id).bind(&progress.stage).bind(if progress.ok {"completed"} else {"failed"})
-                            .bind(if let Some(plan)=progress.plan.clone(){wire_plan_to_json(plan).to_string()}else{serde_json::json!({"error":progress.error}).to_string()}).bind(Utc::now().to_rfc3339()).execute(&state.db).await;
+                            .bind(if let Some(plan)=progress.plan.clone(){wire::plan_to_json(plan).to_string()}else{serde_json::json!({"error":progress.error}).to_string()}).bind(Utc::now().to_rfc3339()).execute(&state.db).await;
                         if let Some(waiter) = state
                             .pending_network
                             .lock()
