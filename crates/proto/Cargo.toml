@@ -6,7 +6,10 @@ rust-version.workspace = true
 
 [dependencies]
 prost.workspace = true
+proxy-tester-domain = { path = "../domain" }
+thiserror.workspace = true
 tonic.workspace = true
+uuid.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

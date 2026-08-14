@@ -8,6 +8,7 @@ use proxy_tester_domain::{
     MetricsSnapshot, PayloadKind, PayloadMode, PayloadProfile, Protocol, RandomFormat, Scenario,
     TlsVersion,
 };
+use proxy_tester_proto::network_draft_from_wire;
 use proxy_tester_proto::v1::{
     AgentEvent, AgentHello, AgentMessage, AgentRole, AgentStatus, CommandAck, Heartbeat, Telemetry,
     agent_control_client::AgentControlClient, agent_message, control_message,
@@ -887,7 +888,8 @@ async fn run_connection(
                 let mut result_plan = None;
                 let (stage, outcome) = match command.action {
                     Some(Action::Plan(request)) => {
-                        let draft = wire_draft(request.draft.context("network draft")?)?;
+                        let draft =
+                            network_draft_from_wire(request.draft.context("network draft")?)?;
                         let inventory = network.inventory().await?;
                         let outcome = match network.plan(
                             id,
@@ -954,24 +956,6 @@ async fn run_connection(
 
 fn command_seen(completed: &HashSet<String>, command_id: &str) -> bool {
     !command_id.is_empty() && completed.contains(command_id)
-}
-
-fn wire_draft(
-    value: proxy_tester_proto::v1::NetworkProfileDraft,
-) -> anyhow::Result<proxy_tester_domain::NetworkProfileDraft> {
-    let endpoint = |value: Option<proxy_tester_proto::v1::EndpointProfile>| -> anyhow::Result<proxy_tester_domain::EndpointProfile> {
-        let value = value.context("network endpoint")?;
-        Ok(proxy_tester_domain::EndpointProfile { node_id:value.node_id, interface_name:value.interface_name, start_cidr:value.start_cidr, count:value.count })
-    };
-    Ok(proxy_tester_domain::NetworkProfileDraft {
-        id: Uuid::parse_str(&value.id)?,
-        name: value.name,
-        client_endpoint: endpoint(value.client_endpoint)?,
-        server_endpoint: endpoint(value.server_endpoint)?,
-        mtu: value.mtu,
-        diagnostic_port: u16::try_from(value.diagnostic_port).context("diagnostic port")?,
-        path_probe_enabled: value.path_probe_enabled,
-    })
 }
 
 fn remember_command(

@@ -17,6 +17,7 @@ use proxy_tester_domain::{
     MetricsSnapshot, NetworkProfileDraft, NetworkProfileRevision, PayloadKind, PayloadMode,
     Protocol, Scenario, ScenarioPath,
 };
+use proxy_tester_proto::network_draft_to_wire;
 use proxy_tester_proto::v1::network_command::Action as NetworkAction;
 use proxy_tester_proto::v1::{
     AgentMessage, ArtifactChunk, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun,
@@ -572,27 +573,6 @@ async fn revision_nodes(
     ))
 }
 
-fn wire_endpoint(
-    value: &proxy_tester_domain::EndpointProfile,
-) -> proxy_tester_proto::v1::EndpointProfile {
-    proxy_tester_proto::v1::EndpointProfile {
-        node_id: value.node_id.clone(),
-        interface_name: value.interface_name.clone(),
-        start_cidr: value.start_cidr.clone(),
-        count: value.count,
-    }
-}
-fn wire_draft(value: NetworkProfileDraft) -> proxy_tester_proto::v1::NetworkProfileDraft {
-    proxy_tester_proto::v1::NetworkProfileDraft {
-        id: value.id.to_string(),
-        name: value.name,
-        client_endpoint: Some(wire_endpoint(&value.client_endpoint)),
-        server_endpoint: Some(wire_endpoint(&value.server_endpoint)),
-        mtu: value.mtu,
-        diagnostic_port: value.diagnostic_port.into(),
-        path_probe_enabled: value.path_probe_enabled,
-    }
-}
 fn wire_network_action(
     action: &str,
     payload: serde_json::Value,
@@ -604,7 +584,7 @@ fn wire_network_action(
                 .as_str()
                 .ok_or_else(|| ApiError::internal("plan revision is missing"))?
                 .into(),
-            draft: Some(wire_draft(serde_json::from_value(
+            draft: Some(network_draft_to_wire(serde_json::from_value(
                 payload["draft"].clone(),
             )?)),
         }),
