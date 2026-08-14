@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 mod database;
 mod error;
+mod repository;
 mod routes;
 mod state;
 mod wire;
@@ -1079,18 +1080,15 @@ async fn save_scenario(
     validate_payload_artifacts(&s.db, &sc).await?;
     validate_capture_artifact(&s.db, &sc).await?;
     let body = serde_json::to_string(&sc)?;
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO scenarios(id,name,body,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,body=excluded.body,updated_at=excluded.updated_at")
-        .bind(sc.id.to_string()).bind(&sc.name).bind(body).bind(&now).bind(&now).execute(&s.db).await?;
+    repository::scenarios::upsert(&s.db, sc.id, &sc.name, &body).await?;
     Ok(Json(sc))
 }
 async fn list_scenarios(State(s): State<AppState>) -> Result<Json<Vec<Scenario>>, ApiError> {
-    let rows = sqlx::query("SELECT body FROM scenarios ORDER BY updated_at DESC")
-        .fetch_all(&s.db)
-        .await?;
     Ok(Json(
-        rows.into_iter()
-            .filter_map(|r| serde_json::from_str::<Scenario>(r.get("body")).ok())
+        repository::scenarios::list_bodies(&s.db)
+            .await?
+            .into_iter()
+            .filter_map(|body| serde_json::from_str::<Scenario>(&body).ok())
             .collect(),
     ))
 }
