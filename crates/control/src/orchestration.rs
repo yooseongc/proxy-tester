@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
-use proxy_tester_domain::{PayloadKind, PayloadMode, Protocol, Scenario};
+use proxy_tester_domain::{
+    NetworkProfileDraft, PayloadKind, PayloadMode, Protocol, Scenario, ScenarioPath,
+};
 use proxy_tester_proto::v1::{ArtifactChunk, ControlMessage, control_message};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -14,6 +16,110 @@ use crate::{
 };
 
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
+
+pub(crate) type EndpointRuntime = (String, String, String, Vec<String>);
+
+pub(crate) async fn scenario_nodes(
+    db: &SqlitePool,
+    scenario: &Scenario,
+) -> Result<(String, String, bool), ApiError> {
+    match &scenario.path {
+        ScenarioPath::ExplicitProxy {
+            client_node_id,
+            server_node_id,
+            ..
+        } => Ok((client_node_id.clone(), server_node_id.clone(), true)),
+        ScenarioPath::ManagedDirect {
+            profile_revision_id,
+            ..
+        } => {
+            let row =
+                sqlx::query("SELECT body_json,status FROM network_profile_revisions WHERE id=?")
+                    .bind(profile_revision_id.to_string())
+                    .fetch_optional(db)
+                    .await?
+                    .ok_or_else(|| ApiError::bad("network profile revision not found"))?;
+            let body: NetworkProfileDraft =
+                serde_json::from_str(row.get::<String, _>("body_json").as_str())
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+            Ok((
+                body.client_endpoint.node_id,
+                body.server_endpoint.node_id,
+                row.get::<String, _>("status") == "prepared",
+            ))
+        }
+    }
+}
+
+pub(crate) async fn scenario_runtime(
+    db: &SqlitePool,
+    scenario: &Scenario,
+) -> Result<(EndpointRuntime, EndpointRuntime), ApiError> {
+    match &scenario.path {
+        ScenarioPath::ExplicitProxy {
+            client_bind_ip,
+            server_listen_ip,
+            server_port,
+            ..
+        } => {
+            let target = format!("{server_listen_ip}:{server_port}");
+            Ok((
+                (
+                    target.clone(),
+                    String::new(),
+                    String::new(),
+                    vec![client_bind_ip.to_string()],
+                ),
+                (target, String::new(), String::new(), Vec::new()),
+            ))
+        }
+        ScenarioPath::ManagedDirect {
+            profile_revision_id,
+            server_port,
+        } => {
+            let row = sqlx::query("SELECT body_json FROM network_profile_revisions WHERE id=?")
+                .bind(profile_revision_id.to_string())
+                .fetch_one(db)
+                .await?;
+            let draft: NetworkProfileDraft =
+                serde_json::from_str(row.get::<String, _>("body_json").as_str())?;
+            let address = draft
+                .server_endpoint
+                .start_cidr
+                .split_once('/')
+                .map(|value| value.0)
+                .ok_or_else(|| ApiError::bad("invalid server pool"))?;
+            let revision = profile_revision_id.to_string();
+            let short = &revision[..8];
+            let (start, _) = draft
+                .client_endpoint
+                .start_cidr
+                .split_once('/')
+                .ok_or_else(|| ApiError::bad("invalid client pool"))?;
+            let start: u32 = start
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| ApiError::bad("invalid client pool"))?
+                .into();
+            let sources = (0..draft.client_endpoint.count)
+                .map(|offset| std::net::Ipv4Addr::from(start + offset).to_string())
+                .collect();
+            Ok((
+                (
+                    format!("{address}:{server_port}"),
+                    draft.client_endpoint.interface_name,
+                    format!("pt-{short}-client"),
+                    sources,
+                ),
+                (
+                    format!("{address}:{server_port}"),
+                    draft.server_endpoint.interface_name,
+                    format!("pt-{short}-server"),
+                    Vec::new(),
+                ),
+            ))
+        }
+    }
+}
 
 fn with_command_id(mut message: ControlMessage, command_id: &str) -> ControlMessage {
     match message.body.as_mut() {

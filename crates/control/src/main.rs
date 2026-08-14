@@ -14,7 +14,7 @@ use futures::{Stream, StreamExt};
 use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
 use proxy_tester_domain::{
     MetricsSnapshot, NetworkProfileDraft, NetworkProfileRevision, PayloadKind, PayloadMode,
-    Scenario, ScenarioPath,
+    Scenario,
 };
 use proxy_tester_proto::v1::{
     AgentMessage, ControlMessage, NetworkCommand, NetworkProgress, PrepareRun, SetPaused, StartRun,
@@ -741,7 +741,7 @@ async fn preflight(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     sc.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     orchestration::validate_artifacts(&s.db, &sc).await?;
-    let (client_id, server_id, profile_ready) = scenario_nodes(&s.db, &sc).await?;
+    let (client_id, server_id, profile_ready) = orchestration::scenario_nodes(&s.db, &sc).await?;
     let agents = s.agents.read().await;
     let client = agents.get(&client_id);
     let server = agents.get(&server_id);
@@ -754,115 +754,6 @@ async fn preflight(
     Ok(Json(
         serde_json::json!({"ok":ok,"checks":checks,"warnings":["route, MTU, offload와 물리 경로는 Linux 실장비에서 별도 확인해야 합니다"]}),
     ))
-}
-
-async fn scenario_nodes(
-    db: &SqlitePool,
-    sc: &Scenario,
-) -> Result<(String, String, bool), ApiError> {
-    match &sc.path {
-        ScenarioPath::ExplicitProxy {
-            client_node_id,
-            server_node_id,
-            ..
-        } => Ok((client_node_id.clone(), server_node_id.clone(), true)),
-        ScenarioPath::ManagedDirect {
-            profile_revision_id,
-            ..
-        } => {
-            let row =
-                sqlx::query("SELECT body_json,status FROM network_profile_revisions WHERE id=?")
-                    .bind(profile_revision_id.to_string())
-                    .fetch_optional(db)
-                    .await?
-                    .ok_or_else(|| ApiError::bad("network profile revision not found"))?;
-            let body: NetworkProfileDraft =
-                serde_json::from_str(row.get::<String, _>("body_json").as_str())
-                    .map_err(|e| ApiError::internal(e.to_string()))?;
-            Ok((
-                body.client_endpoint.node_id,
-                body.server_endpoint.node_id,
-                row.get::<String, _>("status") == "prepared",
-            ))
-        }
-    }
-}
-
-async fn scenario_runtime(
-    db: &SqlitePool,
-    sc: &Scenario,
-) -> Result<
-    (
-        (String, String, String, Vec<String>),
-        (String, String, String, Vec<String>),
-    ),
-    ApiError,
-> {
-    match &sc.path {
-        ScenarioPath::ExplicitProxy {
-            client_bind_ip,
-            server_listen_ip,
-            server_port,
-            ..
-        } => {
-            let target = format!("{server_listen_ip}:{server_port}");
-            Ok((
-                (
-                    target.clone(),
-                    String::new(),
-                    String::new(),
-                    vec![client_bind_ip.to_string()],
-                ),
-                (target, String::new(), String::new(), Vec::new()),
-            ))
-        }
-        ScenarioPath::ManagedDirect {
-            profile_revision_id,
-            server_port,
-        } => {
-            let row = sqlx::query("SELECT body_json FROM network_profile_revisions WHERE id=?")
-                .bind(profile_revision_id.to_string())
-                .fetch_one(db)
-                .await?;
-            let draft: NetworkProfileDraft =
-                serde_json::from_str(row.get::<String, _>("body_json").as_str())?;
-            let address = draft
-                .server_endpoint
-                .start_cidr
-                .split_once('/')
-                .map(|v| v.0)
-                .ok_or_else(|| ApiError::bad("invalid server pool"))?;
-            let revision = profile_revision_id.to_string();
-            let short = &revision[..8];
-            let (start, prefix) = draft
-                .client_endpoint
-                .start_cidr
-                .split_once('/')
-                .ok_or_else(|| ApiError::bad("invalid client pool"))?;
-            let start: u32 = start
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| ApiError::bad("invalid client pool"))?
-                .into();
-            let sources = (0..draft.client_endpoint.count)
-                .map(|offset| std::net::Ipv4Addr::from(start + offset).to_string())
-                .collect();
-            let _ = prefix;
-            Ok((
-                (
-                    format!("{address}:{server_port}"),
-                    draft.client_endpoint.interface_name,
-                    format!("pt-{short}-client"),
-                    sources,
-                ),
-                (
-                    format!("{address}:{server_port}"),
-                    draft.server_endpoint.interface_name,
-                    format!("pt-{short}-server"),
-                    Vec::new(),
-                ),
-            ))
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -1126,7 +1017,7 @@ async fn start_run(
     if active.is_some() {
         return Err(ApiError::conflict("이미 실행 중인 시험이 있습니다"));
     }
-    let (client_id, server_id, profile_ready) = scenario_nodes(&s.db, &sc).await?;
+    let (client_id, server_id, profile_ready) = orchestration::scenario_nodes(&s.db, &sc).await?;
     if !profile_ready {
         return Err(ApiError::conflict(
             "referenced network profile revision is not prepared",
@@ -1147,7 +1038,7 @@ async fn start_run(
     drop(sessions);
     let run_id = Uuid::new_v4();
     let json = serde_json::to_string(&sc)?;
-    let (client_runtime, server_runtime) = scenario_runtime(&s.db, &sc).await?;
+    let (client_runtime, server_runtime) = orchestration::scenario_runtime(&s.db, &sc).await?;
     let started_at = Utc::now();
     let run_name = requested_name
         .map(|name| name.trim().to_owned())
