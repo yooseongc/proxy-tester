@@ -34,11 +34,13 @@ mod network;
 mod payload;
 mod telemetry;
 mod tls;
+mod workload;
 use artifact::accept_chunk as accept_artifact_chunk;
 use connector::IoStream;
 use network::{NetworkManager, NetworkPlan};
 use payload::{CompletedArtifact, PreparedPayloads};
 use telemetry::Counters;
+use workload::tcp::{replay_client, replay_server_detect};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -1125,7 +1127,7 @@ async fn transact(
                 let absolute = sc.is_explicit_proxy() && !sc.tls.enabled;
                 http_transactions(&mut *stream, sc, payloads, absolute, c, gate).await
             }
-            _ => tcp_transaction(&mut *stream, sc, payloads, c).await,
+            _ => workload::tcp::transaction(&mut *stream, sc, payloads, c).await,
         }
     };
     if result.is_ok() && !matches!(sc.protocol, Protocol::Http1 | Protocol::Http2) {
@@ -1134,118 +1136,6 @@ async fn transact(
     result
 }
 
-async fn tcp_transaction(
-    stream: &mut (impl IoStream + ?Sized),
-    sc: &Scenario,
-    payloads: &PreparedPayloads,
-    c: &Counters,
-) -> anyhow::Result<()> {
-    stream.write_all(&payloads.request).await?;
-    c.tx.fetch_add(payloads.request.len() as u64, Ordering::Relaxed);
-    tokio::time::timeout(
-        Duration::from_millis(sc.timeouts.response_ms),
-        read_exact_count(stream, payloads.response.len()),
-    )
-    .await??;
-    c.rx.fetch_add(payloads.response.len() as u64, Ordering::Relaxed);
-    Ok(())
-}
-
-async fn replay_client(
-    stream: &mut (impl IoStream + ?Sized),
-    turns: &[ReplayTurn],
-    sc: &Scenario,
-    c: &Counters,
-) -> anyhow::Result<()> {
-    let mut transaction_started = None;
-    for turn in turns {
-        match turn.direction {
-            Direction::ClientToServer => {
-                if sc.protocol == Protocol::Http1 {
-                    transaction_started = Some(Instant::now());
-                }
-                stream.write_all(&turn.payload).await?;
-                c.tx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
-            }
-            Direction::ServerToClient => {
-                tokio::time::timeout(
-                    Duration::from_millis(sc.timeouts.response_ms),
-                    read_exact_count(stream, turn.payload.len()),
-                )
-                .await??;
-                c.rx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
-                if sc.protocol == Protocol::Http1 {
-                    c.transaction_completed();
-                    if let Some(started) = transaction_started.take() {
-                        c.http_latencies_us
-                            .lock()
-                            .await
-                            .push(started.elapsed().as_micros() as u64);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn replay_server(
-    stream: &mut (impl IoStream + ?Sized),
-    turns: &[ReplayTurn],
-    sc: &Scenario,
-    c: &Counters,
-) -> anyhow::Result<()> {
-    for turn in turns {
-        match turn.direction {
-            Direction::ClientToServer => {
-                tokio::time::timeout(
-                    Duration::from_millis(sc.timeouts.response_ms),
-                    read_exact_count(stream, turn.payload.len()),
-                )
-                .await??;
-                c.rx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
-            }
-            Direction::ServerToClient => {
-                stream.write_all(&turn.payload).await?;
-                c.tx.fetch_add(turn.payload.len() as u64, Ordering::Relaxed);
-                if sc.protocol == Protocol::Http1 {
-                    c.transaction_completed();
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn replay_server_detect(
-    stream: &mut (impl IoStream + ?Sized),
-    plan: &ReplayPlan,
-    sc: &Scenario,
-    c: &Counters,
-) -> anyhow::Result<()> {
-    let mut received = Vec::new();
-    let mut candidates: Vec<usize> = (0..plan.flows.len()).collect();
-    loop {
-        let mut byte = [0_u8; 1];
-        tokio::time::timeout(
-            Duration::from_millis(sc.timeouts.response_ms),
-            stream.read_exact(&mut byte),
-        )
-        .await??;
-        received.push(byte[0]);
-        candidates.retain(|index| plan.flows[*index][0].payload.starts_with(&received));
-        if candidates.is_empty() {
-            bail!("first client turn does not match any capture flow");
-        }
-        if candidates.len() == 1 {
-            let flow = &plan.flows[candidates[0]];
-            if flow[0].payload.len() == received.len() {
-                c.rx.fetch_add(received.len() as u64, Ordering::Relaxed);
-                return replay_server(stream, &flow[1..], sc, c).await;
-            }
-        }
-    }
-}
 async fn http_transactions(
     stream: &mut (impl IoStream + ?Sized),
     sc: &Scenario,
@@ -1497,11 +1387,11 @@ async fn run_server(
             let r = if sc.protocol == Protocol::Http2 {
                 serve_http2_connection(stream, payloads, replay, c2.clone()).await
             } else if let Some(plan) = replay {
-                replay_server_detect(&mut *stream, &plan, &sc, &c2).await
+                replay_server_detect(&mut *stream, &plan.flows, &sc, &c2).await
             } else if sc.protocol == Protocol::Http1 {
                 serve_http_connection(&mut *stream, &payloads, &c2).await
             } else {
-                serve_tcp(&mut *stream, &payloads, &c2).await
+                workload::tcp::serve(&mut *stream, &payloads, &c2).await
             };
             if r.is_ok() {
                 if !matches!(sc.protocol, Protocol::Http1 | Protocol::Http2) {
@@ -1578,17 +1468,6 @@ async fn serve_http2_connection(
     while let Some(result) = tasks.join_next().await {
         result?;
     }
-    Ok(())
-}
-async fn serve_tcp(
-    stream: &mut (impl IoStream + ?Sized),
-    payloads: &PreparedPayloads,
-    c: &Counters,
-) -> anyhow::Result<()> {
-    read_exact_count(stream, payloads.request.len()).await?;
-    c.rx.fetch_add(payloads.request.len() as u64, Ordering::Relaxed);
-    stream.write_all(&payloads.response).await?;
-    c.tx.fetch_add(payloads.response.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 async fn serve_http_connection(
@@ -1682,19 +1561,6 @@ async fn write_zeroes(
     }
     Ok(())
 }
-async fn read_exact_count(
-    stream: &mut (impl AsyncRead + Unpin + ?Sized),
-    mut n: usize,
-) -> anyhow::Result<()> {
-    let mut buf = [0u8; 65536];
-    while n > 0 {
-        let size = n.min(buf.len());
-        stream.read_exact(&mut buf[..size]).await?;
-        n -= size;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default, clippy::items_after_test_module)]
 mod tests {
@@ -1834,7 +1700,7 @@ mod tests {
         let server_counters = Counters::default();
         let (client, server) = tokio::join!(
             replay_client(&mut client_stream, &turns, &scenario, &client_counters),
-            replay_server(&mut server_stream, &turns, &scenario, &server_counters),
+            workload::tcp::replay_server(&mut server_stream, &turns, &scenario, &server_counters,),
         );
         client.unwrap();
         server.unwrap();
@@ -1927,7 +1793,7 @@ mod tests {
         let server_counters = Counters::default();
         let (client, server) = tokio::join!(
             replay_client(&mut client_stream, &second, &scenario, &client_counters),
-            replay_server_detect(&mut server_stream, &plan, &scenario, &server_counters),
+            replay_server_detect(&mut server_stream, &plan.flows, &scenario, &server_counters,),
         );
         client.unwrap();
         server.unwrap();
