@@ -1,134 +1,173 @@
 # Proxy Tester
 
-## 설치 안내
+Proxy Tester는 인라인 투명 프록시, passive mirror, 명시적 HTTP Proxy/CONNECT 환경에서 트래픽을 생성하고 성능을 측정하는 도구입니다. TCP CPS·대역폭·PPS와 HTTP TPS를 웹 UI에서 구성하고 확인할 수 있습니다.
 
-운영 환경은 GitHub Release의 네이티브 패키지로 설치합니다.
+Control 서버가 UI, API, SQLite 저장소를 제공하고 여러 Agent가 TCP client 또는 server 역할을 수행합니다. 실제 측정에는 Control 한 대와 측정 경로 양쪽의 Agent가 필요합니다.
 
-- [최신 릴리스 다운로드](https://github.com/yooseongc/proxy-tester/releases/latest)
-- [전체 설치·업그레이드·제거 가이드](docs/INSTALLATION.md)
+![Proxy Tester 시험 구성 화면](docs/images/proxy-tester-overview.png)
 
-### tar.gz 빠른 설치
+## 설치하기
+
+운영 환경에서는 [최신 GitHub Release](https://github.com/yooseongc/proxy-tester/releases/latest)의 네이티브 패키지를 사용하세요. 지원 대상은 x86_64 systemd 기반 Debian 12, Ubuntu 22.04 이상, RHEL/Rocky Linux 9입니다.
+
+배포 파일의 무결성을 먼저 확인합니다.
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+### Debian·Ubuntu
+
+Control과 Agent 실행 파일이 함께 설치됩니다. 설치 후 이 장비에서 사용할 구성만 생성합니다.
+
+```bash
+sudo apt install ./proxy-tester_0.1.1_amd64.deb
+
+# Control 서버인 경우
+sudo proxy-tester-configure control
+
+# Agent 장비인 경우
+sudo proxy-tester-configure agent \
+  --control-url http://CONTROL_HOST:50051 \
+  --node-id node-site-a
+```
+
+### RHEL·Rocky Linux
+
+```bash
+sudo dnf install ./proxy-tester-0.1.1-1.x86_64.rpm
+
+# Control 서버인 경우
+sudo proxy-tester-configure control
+
+# Agent 장비인 경우
+sudo proxy-tester-configure agent \
+  --control-url http://CONTROL_HOST:50051 \
+  --node-id node-site-a
+```
+
+### 범용 tar.gz
 
 ```bash
 tar -xzf proxy-tester-0.1.1-x86_64-linux-musl.tar.gz
 cd proxy-tester-0.1.1
 
-# Control 서버
+# Control 서버인 경우
 sudo ./install.sh --component control
 
-# 또는 Agent 노드
+# Agent 장비인 경우
 sudo ./install.sh --component agent \
   --control-url http://CONTROL_HOST:50051 \
   --node-id node-site-a
 ```
 
-필요한 OS 의존성까지 설치하려면 `--install-deps`를 추가합니다. 설치기는 서비스를 자동으로 시작하지 않으므로 설정을 검토한 후 필요한 서비스만 활성화하세요.
+Agent에 필요한 네트워크 도구까지 apt 또는 dnf로 설치하려면 `--install-deps`를 추가합니다. 한 장비에 두 구성요소가 모두 필요하면 `--component all`을 사용할 수 있습니다.
+
+## 설정하고 시작하기
+
+설치와 업그레이드는 서비스를 자동으로 시작하거나 재시작하지 않습니다. 환경에 맞게 설정 파일을 검토하세요.
+
+- Control: `/etc/proxy-tester/control.env`
+- Agent: `/etc/proxy-tester/agent.env`
+- Control UI/API 기본 포트: `8080/tcp`
+- Agent 연결용 gRPC 기본 포트: `50051/tcp`
+
+필요한 서비스만 시작합니다.
 
 ```bash
+# Control 서버
 sudo systemctl enable --now proxy-tester-control
-# 또는
+
+# Agent 장비
 sudo systemctl enable --now proxy-tester-agent
 ```
 
-Debian/Ubuntu는 `sudo apt install ./proxy-tester_0.1.1_amd64.deb`, RHEL/Rocky는 `sudo dnf install ./proxy-tester-0.1.1-1.x86_64.rpm`으로 설치할 수 있습니다.
+브라우저에서 `http://CONTROL_HOST:8080`에 접속합니다. Control의 50051 포트는 Agent가 있는 신뢰된 측정망 또는 VPN에서만 접근하도록 제한하세요.
 
-Proxy Tester는 분산 TCP client/server agent와 웹 기반 control plane으로 프록시 성능을 측정하는 도구입니다. 직접 연결(인라인 투명 프록시·passive mirror)과 명시적 HTTP Proxy/CONNECT 경로에서 TCP CPS·대역폭·PPS 및 HTTP TPS를 계측합니다.
+상태와 로그는 다음 명령으로 확인할 수 있습니다.
 
-## 구성 요소
-
-- `proxy-agent`: client와 responder 역할을 실행하고 Linux network namespace를 준비합니다.
-- `proxy-control`: REST/WebSocket UI, agent gRPC 제어, SQLite 저장소를 제공합니다.
-- `frontend`: CSR 기반 React UI입니다.
-
-Control은 역할이 고정된 agent를 가정하지 않습니다. Scenario v4가 선택한 network profile revision을 기준으로 각 노드의 client/server endpoint를 결정합니다. 인라인 장비와 passive mirror는 도구 관점에서 동일한 직접 Client→Server 트래픽이며, 실제 브리지·TAP/SPAN 배치는 외부 환경에서 구성합니다.
-
-## 빠른 시작
-
-운영 환경은 GitHub Release의 통합 `tar.gz`, `deb` 또는 `rpm` 패키지로 설치합니다. Control과 Agent 설치 예시는 [설치 문서](docs/INSTALLATION.md)를 참고하세요.
-
-Docker는 Windows를 포함한 개발 및 회귀시험 환경에서만 사용합니다.
-
-```powershell
-docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml build
-docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml up -d
+```bash
+systemctl status proxy-tester-control
+systemctl status proxy-tester-agent
+journalctl -u proxy-tester-control -f
+journalctl -u proxy-tester-agent -f
 ```
 
-이 구성은 Control 통신용 `eth0`와 주소를 제거한 시험용 `eth1`을 분리합니다. 네트워크 프로파일에서 Client는 `172.31.0.10/24`, Server는 `172.31.0.20/24`, 주소 수는 각각 `1`, 인터페이스는 양쪽 모두 `eth1`로 설정합니다. Docker bridge의 IPAM 필터 때문에 이 기능 시험에서는 예약되지 않은 추가 source IP를 사용할 수 없습니다. 실제 다중 IP 풀과 성능 측정은 전용 Linux 시험 NIC에서 수행하세요.
+## 첫 시험 구성
 
-기본 compose에는 다음 서비스가 포함됩니다.
+### 1. 시험 네트워크 준비
 
-- `control`: UI/API와 agent gRPC endpoint
-- `client`, `server`: 분산 agent fixture
-- `proxy`: HTTP forward/CONNECT 통합 시험 fixture
+![Client와 Server 시험 네트워크 구성](docs/images/proxy-tester-network-profile.png)
 
-실제 관리형 직접 연결 시험을 시작하려면 먼저 UI의 네트워크 준비 화면에서 노드·전용 NIC·주소 풀을 선택하고 Plan→Apply→Diagnose를 완료해야 합니다. 관리 NIC는 시험 인터페이스로 사용할 수 없습니다. 상세 절차와 복구 방법은 [네트워크 구성](docs/NETWORK_CONFIGURATION.md)을 참고하세요.
+Client와 Server Agent, 전용 시험 인터페이스, IP 대역을 선택합니다. **저장 및 계획**을 누른 뒤 상세 명령과 롤백 계획을 검토하고 Apply와 Diagnose를 완료합니다. 관리 인터페이스를 시험 NIC로 선택하지 마세요.
 
-## 트래픽 시나리오
+### 2. 트래픽과 부하 설정
 
-입력 계약은 Scenario v4만 지원합니다. 이전 버전 필드나 알 수 없는 필드는 오류로 거부합니다.
+![프로토콜, Payload와 Stage 설정](docs/images/proxy-tester-traffic-profile.png)
+
+프리셋으로 시작하거나 프로토콜, TLS, 요청·응답 payload와 부하 Stage를 직접 지정합니다. 화면 상단의 한 줄 요약으로 실제 생성될 트래픽을 다시 확인합니다.
+
+### 3. 실행과 결과 확인
+
+**시험 시작**을 누르고 실시간 모니터링에서 CPS/TPS, App·Wire 대역폭, PPS와 오류를 확인합니다. 완료 후 결과 화면에서 Stage별 집계와 오류 상세를 검토하고 JSON 결과가 필요하면 내보냅니다.
+
+인라인과 passive mirror 시험은 도구 관점에서 동일한 직접 Client→Server 트래픽입니다. 브리지, TAP/SPAN과 장비 정책은 외부 환경에서 구성합니다. DLP 탐지·차단 성공 여부는 장비 로그에서 별도로 확인해야 합니다.
+
+자세한 운영 절차는 다음 문서를 참고하세요.
+
+- [설치·업그레이드·제거](docs/INSTALLATION.md)
+- [네트워크 구성과 복구](docs/NETWORK_CONFIGURATION.md)
+- [Scenario와 payload](docs/SCENARIO_V4.md)
+- [계측 지표 해석](docs/TELEMETRY.md)
+- [HTTP/2 지원 범위](docs/HTTP2.md)
+- [저장소와 백업](docs/STORAGE.md)
+
+## Docker 개발·평가 환경
+
+Docker 구성은 기능 확인과 회귀 시험을 위한 환경이며 운영 성능 측정용 배포 방식이 아닙니다. Docker Desktop 또는 Docker Engine과 Compose가 필요합니다.
+
+저장소를 받은 뒤 루트 디렉터리에서 실행합니다.
+
+```bash
+git clone https://github.com/yooseongc/proxy-tester.git
+cd proxy-tester
+docker compose \
+  -f docker/compose.yaml \
+  -f docker/compose.managed-direct.yaml \
+  up -d --build
+```
+
+브라우저에서 `http://localhost:18080`에 접속합니다. 이 구성에는 Control, client Agent, server Agent와 HTTP forward/CONNECT 시험용 proxy fixture가 포함됩니다.
+
+```bash
+# 실행 상태
+docker compose \
+  -f docker/compose.yaml \
+  -f docker/compose.managed-direct.yaml \
+  ps
+
+# 로그
+docker compose \
+  -f docker/compose.yaml \
+  -f docker/compose.managed-direct.yaml \
+  logs -f
+
+# 종료
+docker compose \
+  -f docker/compose.yaml \
+  -f docker/compose.managed-direct.yaml \
+  down
+```
+
+`down -v`는 Docker 평가 환경의 SQLite 데이터까지 삭제하므로 초기화가 필요한 경우에만 사용하세요. Docker bridge의 제약 때문에 실제 다중 source IP, NIC offload, 고속 PPS 결과는 전용 NIC가 있는 Linux 장비에서 검증해야 합니다.
+
+## 지원 범위
 
 - 프로토콜: TCP, HTTP/1.1, TLS 기반 HTTP/2(h2c 제외)
-- 보안: 평문 또는 TLS 1.2/1.3, 인증서 검증 선택
-- 경로: 준비된 직접 연결 또는 명시적 HTTP Proxy/CONNECT
-- Payload: 방향별 empty, fixed, UTF-8 text, artifact file, random
-- 재현: 평문 PCAP/PCAPNG의 양방향 TCP/HTTP 세션
+- 보안: 평문, TLS 1.2/1.3, 인증서 검증 선택
+- 경로: 직접 연결, HTTP Proxy, CONNECT
+- Payload: empty, fixed, UTF-8 text, artifact file, binary·printable ASCII random
+- 재현: 평문 PCAP/PCAPNG에서 추출한 양방향 TCP/HTTP 세션
 - 부하: 가상 연결 수, Stage ramp/hold, keep-alive transaction 수
 
-Random payload는 Run 준비 단계에서 방향별 한 번만 생성해 worker가 공유하며 결과에는 크기·형식·SHA-256만 저장합니다. 업로드 payload는 64 MiB, PCAP/PCAPNG는 512 MiB까지 허용합니다. 암호화된 TLS ciphertext는 복호화하지 않으며, 평문으로 추출한 payload에 TLS를 선택하면 새 TLS 세션에서 다시 암호화합니다. 자세한 계약은 [Scenario v4](docs/SCENARIO_V4.md), [HTTP/2](docs/HTTP2.md)를 참고하세요.
-
-## 개발 및 검증
-
-요구 도구는 Rust 1.93, musl target, Node.js/npm, Docker입니다. 빠른 로컬 검증은 다음 명령 하나로 실행합니다.
-
-```powershell
-.\tests\verify.ps1 -Mode Fast
-```
-
-Fast 모드는 Rust fmt/clippy/unit test와 frontend typecheck/Vitest를 실행합니다. release musl 빌드, compose 구문 검사, frontend production build와 Playwright까지 확인하려면 다음을 사용합니다.
-
-```powershell
-.\tests\verify.ps1 -Mode Full
-```
-
-개별 명령은 다음과 같습니다.
-
-```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cd frontend
-npm run typecheck
-npm test
-npm run build
-```
-
-Playwright는 `localhost:18080`에서 최신 frontend bundle을 제공하는 control 프로세스가 필요합니다. 기존 실행 인스턴스를 대상으로 오래된 정적 자산을 검사하지 않도록 E2E 전에 frontend를 빌드하고 control을 다시 시작하세요.
-
-## 저장소와 호환성
-
-기본 저장소는 SQLite입니다. schema v4가 아닌 기존 DB는 삭제하거나 수정하지 않고 `<원래이름>.schema-4.db`를 새로 사용합니다. `GET /api/health`의 `database_url`, `database_fallback`, `schema_version`으로 실제 선택된 DB를 확인할 수 있습니다. 보존 정책과 향후 PostgreSQL 확장 경계는 [저장소](docs/STORAGE.md)에 정리되어 있습니다.
-
-API 오류는 언어에 독립적인 영문 `code`와 사용자 표시용 `message`를 포함합니다.
-
-```json
-{ "code": "invalid_scenario", "message": "..." }
-```
-
-## 운영 범위와 주의사항
-
-- DLP 탐지·차단 성공 여부와 장비 로그는 자동 판정하지 않습니다. reset, timeout, HTTP 오류는 연결/transaction 오류 지표로 기록합니다.
-- FTP/SMTP, UDP, fragmented 또는 불완전 흐름, L2 원본 packet replay, TLS key-log 복호화, HTTP/3는 지원 범위 밖입니다.
-- Docker Desktop은 기능 시험용입니다. 실제 PPS, offload, 고속 링크 성능은 전용 NIC가 있는 Linux 장비에서 검증하세요.
-- Agent의 network namespace 변경에는 `CAP_NET_ADMIN`이 필요합니다. 서비스 설치와 권한은 [설치](docs/INSTALLATION.md), 패키징은 [패키징](docs/PACKAGING.md)을 참고하세요.
-- App B/W는 애플리케이션 bytes, Wire B/W/PPS는 지정한 observation interface의 커널 통계입니다. 해석 기준은 [계측](docs/TELEMETRY.md)을 참고하세요.
-
-## 주요 API
-
-- 상태: `GET /api/health`, `GET /api/agents`
-- 네트워크: `/api/network/profiles`, `/plan`, `/apply`, `/diagnose`, `/teardown`
-- 시나리오: `GET|POST /api/scenarios`, `POST /api/scenarios/validate`
-- 실행: `POST /api/preflight`, `GET|POST /api/runs`, pause/resume/stop
-- 결과: run detail/summary/samples/export 및 `GET /api/events/ws`
-- Artifact: `GET|POST /api/artifacts?kind=payload|pcap`
-
-전체 설계 진행 상황은 [로드맵](docs/ROADMAP.md), 분산 제어 동작은 [분산 제어](docs/DISTRIBUTED_CONTROL.md), 모듈 책임과 리팩터링 규칙은 [코드 구조](docs/CODE_STRUCTURE.md)에 기록되어 있습니다.
+FTP/SMTP, UDP, L2 원본 packet replay, TLS key-log 복호화와 HTTP/3는 현재 지원하지 않습니다. 업로드 한도는 일반 payload 64 MiB, PCAP/PCAPNG 512 MiB입니다.
