@@ -1,5 +1,37 @@
 # Proxy Tester
 
+## 설치 안내
+
+운영 환경은 GitHub Release의 네이티브 패키지로 설치합니다.
+
+- [최신 릴리스 다운로드](https://github.com/yooseongc/proxy-tester/releases/latest)
+- [전체 설치·업그레이드·제거 가이드](docs/INSTALLATION.md)
+
+### tar.gz 빠른 설치
+
+```bash
+tar -xzf proxy-tester-0.1.1-x86_64-linux-musl.tar.gz
+cd proxy-tester-0.1.1
+
+# Control 서버
+sudo ./install.sh --component control
+
+# 또는 Agent 노드
+sudo ./install.sh --component agent \
+  --control-url http://CONTROL_HOST:50051 \
+  --node-id node-site-a
+```
+
+필요한 OS 의존성까지 설치하려면 `--install-deps`를 추가합니다. 설치기는 서비스를 자동으로 시작하지 않으므로 설정을 검토한 후 필요한 서비스만 활성화하세요.
+
+```bash
+sudo systemctl enable --now proxy-tester-control
+# 또는
+sudo systemctl enable --now proxy-tester-agent
+```
+
+Debian/Ubuntu는 `sudo apt install ./proxy-tester_0.1.1_amd64.deb`, RHEL/Rocky는 `sudo dnf install ./proxy-tester-0.1.1-1.x86_64.rpm`으로 설치할 수 있습니다.
+
 Proxy Tester는 분산 TCP client/server agent와 웹 기반 control plane으로 프록시 성능을 측정하는 도구입니다. 직접 연결(인라인 투명 프록시·passive mirror)과 명시적 HTTP Proxy/CONNECT 경로에서 TCP CPS·대역폭·PPS 및 HTTP TPS를 계측합니다.
 
 ## 구성 요소
