@@ -1,5 +1,4 @@
 use std::{
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -201,14 +200,14 @@ pub(crate) async fn run_server(
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let port = scenario.server_port();
-    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let target = scenario.target_addr();
+    let listener = TcpListener::bind(&target).await?;
     let tls_acceptor = scenario
         .tls
         .enabled
         .then(|| tls::acceptor(scenario))
         .transpose()?;
-    info!(port, "responder listening");
+    info!(%target, "responder listening");
     let duration = Duration::from_millis(scenario.effective_duration_secs() * 1000 + 700);
     let mut active_elapsed = Duration::ZERO;
     let mut last_tick = Instant::now();

@@ -1,4 +1,4 @@
-use proxy_tester_domain::{EndpointProfile, NetworkProfileDraft};
+use proxy_tester_domain::{EndpointProfile, NetworkProfileDraft, NetworkProvisioning};
 use thiserror::Error;
 
 use crate::v1;
@@ -11,6 +11,8 @@ pub enum ConversionError {
     MissingEndpoint(&'static str),
     #[error("diagnostic port is outside the u16 range: {0}")]
     InvalidDiagnosticPort(u32),
+    #[error("network provisioning mode is invalid: {0}")]
+    InvalidProvisioning(String),
 }
 
 fn endpoint_to_wire(value: &EndpointProfile) -> v1::EndpointProfile {
@@ -40,6 +42,11 @@ pub fn network_draft_to_wire(value: NetworkProfileDraft) -> v1::NetworkProfileDr
         mtu: value.mtu,
         diagnostic_port: value.diagnostic_port.into(),
         path_probe_enabled: value.path_probe_enabled,
+        provisioning: match value.provisioning {
+            NetworkProvisioning::ManagedNamespace => "managed_namespace".into(),
+            NetworkProvisioning::OperatorManaged => "operator_managed".into(),
+        },
+        allow_virtual_interfaces: value.allow_virtual_interfaces,
     }
 }
 
@@ -63,6 +70,12 @@ pub fn network_draft_from_wire(
         diagnostic_port: u16::try_from(value.diagnostic_port)
             .map_err(|_| ConversionError::InvalidDiagnosticPort(value.diagnostic_port))?,
         path_probe_enabled: value.path_probe_enabled,
+        provisioning: match value.provisioning.as_str() {
+            "" | "managed_namespace" => NetworkProvisioning::ManagedNamespace,
+            "operator_managed" => NetworkProvisioning::OperatorManaged,
+            _ => return Err(ConversionError::InvalidProvisioning(value.provisioning)),
+        },
+        allow_virtual_interfaces: value.allow_virtual_interfaces,
     })
 }
 

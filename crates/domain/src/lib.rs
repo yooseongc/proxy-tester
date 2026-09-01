@@ -44,17 +44,31 @@ pub struct EndpointProfile {
 pub struct NetworkProfileDraft {
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub provisioning: NetworkProvisioning,
+    #[serde(default)]
+    pub allow_virtual_interfaces: bool,
     pub client_endpoint: EndpointProfile,
     pub server_endpoint: EndpointProfile,
     pub mtu: u32,
     pub diagnostic_port: u16,
     pub path_probe_enabled: bool,
 }
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkProvisioning {
+    #[default]
+    ManagedNamespace,
+    OperatorManaged,
+}
 impl Default for NetworkProfileDraft {
     fn default() -> Self {
         Self {
             id: Uuid::new_v4(),
             name: "Managed direct network".into(),
+            provisioning: NetworkProvisioning::ManagedNamespace,
+            allow_virtual_interfaces: false,
             client_endpoint: EndpointProfile {
                 node_id: "node-1".into(),
                 interface_name: "eth1".into(),

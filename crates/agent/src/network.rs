@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use proxy_tester_domain::{EndpointProfile, NetworkProfileDraft};
+use proxy_tester_domain::{EndpointProfile, NetworkProfileDraft, NetworkProvisioning};
 use proxy_tester_proto::v1 as wire;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio};
@@ -15,6 +15,7 @@ pub struct NodeInventory {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InterfaceInventory {
     pub name: String,
+    pub kind: Option<String>,
     pub mac: Option<String>,
     pub mtu: Option<u32>,
     pub state: Option<String>,
@@ -81,6 +82,7 @@ impl From<NodeInventory> for wire::NodeInventory {
                 .into_iter()
                 .map(|v| wire::InterfaceInventory {
                     name: v.name,
+                    kind: v.kind,
                     mac: v.mac,
                     mtu: v.mtu,
                     state: v.state,
@@ -178,7 +180,7 @@ impl NetworkManager {
     }
 
     pub async fn inventory(&self) -> anyhow::Result<NodeInventory> {
-        let ip = command_output("ip", &["-j", "link", "show"]).await;
+        let ip = command_output("ip", &["-d", "-j", "link", "show"]).await;
         let addresses = command_output("ip", &["-j", "address", "show"]).await;
         let mut capabilities = BTreeMap::new();
         capabilities.insert("ip".into(), ip.is_ok());
@@ -197,6 +199,7 @@ impl NetworkManager {
             for value in serde_json::from_str::<Vec<serde_json::Value>>(&raw).unwrap_or_default() {
                 interfaces.push(InterfaceInventory {
                     name: value["ifname"].as_str().unwrap_or_default().into(),
+                    kind: value["linkinfo"]["info_kind"].as_str().map(str::to_owned),
                     mac: value["address"].as_str().map(str::to_owned),
                     mtu: value["mtu"].as_u64().map(|v| v as u32),
                     state: value["operstate"].as_str().map(str::to_owned),
@@ -238,15 +241,38 @@ impl NetworkManager {
             }
         }
         interfaces.sort_by(|a, b| a.name.cmp(&b.name));
-        let protected_interfaces = command_output("ip", &["-j", "route", "show", "default"])
-            .await
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|route| route["dev"].as_str().map(str::to_owned))
+        let mut protected_interfaces = Vec::new();
+        for args in [
+            &["-j", "-4", "route", "show", "default"][..],
+            &["-j", "-6", "route", "show", "default"][..],
+        ] {
+            protected_interfaces.extend(
+                command_output("ip", args)
+                    .await
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|route| route["dev"].as_str().map(str::to_owned)),
+            );
+        }
+        protected_interfaces.sort();
+        protected_interfaces.dedup();
+        // IPv6 link-local and temporary addresses can change independently of an
+        // IPv4 test plan. Keep them visible in inventory, but exclude them from
+        // the apply precondition so a harmless IPv6 refresh does not stale a plan.
+        let fingerprint_interfaces = interfaces
+            .iter()
+            .cloned()
+            .map(|mut interface| {
+                interface
+                    .addresses
+                    .retain(|address| address_is_ipv4(address));
+                interface
+            })
             .collect::<Vec<_>>();
-        let canonical = serde_json::to_vec(&(interfaces.clone(), protected_interfaces.clone()))?;
+        let canonical =
+            serde_json::to_vec(&(fingerprint_interfaces, protected_interfaces.clone()))?;
         use sha2::{Digest, Sha256};
         let fingerprint = format!("{:x}", Sha256::digest(canonical));
         Ok(NodeInventory {
@@ -291,15 +317,79 @@ impl NetworkManager {
                     endpoint.interface_name
                 )
             }
-            if !current.addresses.is_empty() {
+            let addresses = expand_pool(endpoint)?;
+            if draft.provisioning == NetworkProvisioning::OperatorManaged {
+                let missing = addresses
+                    .iter()
+                    .filter(|address| {
+                        let expected = address.split('/').next().unwrap_or(address);
+                        !current
+                            .addresses
+                            .iter()
+                            .any(|current| current.split('/').next().unwrap_or(current) == expected)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    bail!(
+                        "operator-managed interface {} is missing addresses: {}",
+                        endpoint.interface_name,
+                        missing.join(", ")
+                    )
+                }
+                semantic.push(format!(
+                    "use operator-managed interface {} without changing topology",
+                    endpoint.interface_name
+                ));
+                endpoint_plans.push(EndpointPlan {
+                    role: role.into(),
+                    namespace: String::new(),
+                    interface: endpoint.interface_name.clone(),
+                    addresses,
+                });
+                continue;
+            }
+            if current
+                .addresses
+                .iter()
+                .any(|address| address_is_ipv4(address))
+            {
                 bail!(
-                    "interface {} already has addresses",
+                    "interface {} already has IPv4 addresses",
                     endpoint.interface_name
                 )
             }
+            if let Some(master) = current.master.as_deref() {
+                bail!(
+                    "interface {} is attached to master {}; use an operator-managed path",
+                    endpoint.interface_name,
+                    master
+                )
+            }
+            if !draft.allow_virtual_interfaces
+                && matches!(
+                    current.kind.as_deref(),
+                    Some("veth" | "vxlan" | "bridge" | "macvlan" | "macvtap")
+                )
+            {
+                bail!(
+                    "interface {} is {}; use an operator-managed path",
+                    endpoint.interface_name,
+                    current.kind.as_deref().unwrap_or_default()
+                )
+            }
+            if current
+                .addresses
+                .iter()
+                .any(|address| !address_is_ipv4(address))
+            {
+                warnings.push(format!(
+                    "interface {} has IPv6 addresses; they will be preserved",
+                    endpoint.interface_name
+                ));
+            }
             let namespace = format!("pt-{}-{}", short(revision_id), role);
             validate_identifier(&namespace)?;
-            let addresses = expand_pool(endpoint)?;
             semantic.push(format!(
                 "move {} into {} and assign {} IPv4 addresses",
                 endpoint.interface_name,
@@ -395,6 +485,23 @@ impl NetworkManager {
                         ],
                     ));
                 }
+            }
+            // Remove secondary IPv4 addresses before the primary one. Linux may
+            // otherwise cascade-delete same-subnet secondary addresses when the
+            // primary address is removed first.
+            for address in addresses.iter().rev() {
+                rollback.push(CommandSpec::new(
+                    "ip",
+                    [
+                        "-n",
+                        namespace.as_str(),
+                        "address",
+                        "del",
+                        address.as_str(),
+                        "dev",
+                        endpoint.interface_name.as_str(),
+                    ],
+                ));
             }
             rollback.push(CommandSpec::new(
                 "ip",
@@ -526,6 +633,15 @@ impl NetworkManager {
             let _ = self.rollback(&journal).await;
         }
     }
+    pub async fn recover_on_startup(&self) -> anyhow::Result<()> {
+        if let Some(journal) = self.read_journal().await? {
+            if journal.phase == "prepared" {
+                return Ok(());
+            }
+            self.rollback(&journal).await?;
+        }
+        Ok(())
+    }
     pub async fn recover(&self) -> anyhow::Result<()> {
         if let Some(journal) = self.read_journal().await? {
             self.rollback(&journal).await?;
@@ -534,7 +650,12 @@ impl NetworkManager {
     }
     pub async fn rollback(&self, journal: &NetworkJournal) -> anyhow::Result<()> {
         let mut failures = Vec::new();
+        let mut namespace_cleanup = Vec::new();
         for command in &journal.rollback_commands {
+            if is_namespace_delete(command) {
+                namespace_cleanup.push(command);
+                continue;
+            }
             let mut ok = false;
             for delay in [1, 2, 4] {
                 if execute_rollback(command).await.is_ok() {
@@ -545,6 +666,24 @@ impl NetworkManager {
             }
             if !ok {
                 failures.push(format!("{} {:?}", command.program, command.args));
+            }
+        }
+        // Deleting a namespace that still contains a borrowed veth destroys the
+        // link and its peer. Namespace cleanup is therefore allowed only after
+        // every address/interface restoration command succeeded.
+        if failures.is_empty() {
+            for command in namespace_cleanup {
+                let mut ok = false;
+                for delay in [1, 2, 4] {
+                    if execute_rollback(command).await.is_ok() {
+                        ok = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+                if !ok {
+                    failures.push(format!("{} {:?}", command.program, command.args));
+                }
             }
         }
         if failures.is_empty() {
@@ -579,6 +718,21 @@ impl NetworkManager {
         tokio::fs::rename(temporary, &self.journal_path).await?;
         Ok(())
     }
+}
+
+fn address_is_ipv4(address: &str) -> bool {
+    address
+        .split_once('/')
+        .map_or(address, |(value, _)| value)
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok()
+}
+
+fn is_namespace_delete(command: &CommandSpec) -> bool {
+    command.program == "ip"
+        && command.args.len() >= 3
+        && command.args[0] == "netns"
+        && command.args[1] == "del"
 }
 
 fn validate_identifier(value: &str) -> anyhow::Result<()> {
@@ -656,6 +810,9 @@ async fn execute_rollback(spec: &CommandSpec) -> anyhow::Result<()> {
         "No such file or directory",
         "Cannot find device",
         "does not exist",
+        "Cannot assign requested address",
+        "Address not found",
+        "address not found",
     ]
     .iter()
     .any(|expected| error.contains(expected))
@@ -713,11 +870,22 @@ mod tests {
         assert_eq!(plan.endpoints.len(), 2);
         assert!(plan.commands.iter().all(|c| c.program == "ip"));
         assert_eq!(plan.endpoints[0].addresses.len(), 16);
-        assert!(plan.rollback_commands[0].args.contains(&"link".to_owned()));
-        assert_eq!(
-            plan.rollback_commands[2].args,
-            ["netns", "del", "pt-12345678-client"]
+        assert!(
+            plan.rollback_commands
+                .iter()
+                .any(|command| { command.args == ["netns", "del", "pt-12345678-client"] })
         );
+        assert!(
+            plan.rollback_commands
+                .iter()
+                .any(|command| { command.args.get(3).map(String::as_str) == Some("del") })
+        );
+        let first_address_delete = plan
+            .rollback_commands
+            .iter()
+            .find(|command| command.args.get(3).map(String::as_str) == Some("del"))
+            .unwrap();
+        assert_eq!(first_address_delete.args[4], "10.20.0.25/24");
         assert!(parse_offloads("rx-checksumming: on\ngeneric-receive-offload: off\n")["rx"]);
         inventory.protected_interfaces.push("eth1".into());
         assert!(
@@ -727,5 +895,119 @@ mod tests {
                 .to_string()
                 .contains("management")
         );
+    }
+
+    #[test]
+    fn ipv6_only_interface_is_available_but_virtual_links_are_not_borrowed() {
+        let manager = NetworkManager::new("unused");
+        let draft = NetworkProfileDraft::default();
+        let mut inventory = NodeInventory {
+            interfaces: vec![
+                InterfaceInventory {
+                    name: "eth1".into(),
+                    addresses: vec!["fe80::1/64".into()],
+                    ..Default::default()
+                },
+                InterfaceInventory {
+                    name: "eth2".into(),
+                    ..Default::default()
+                },
+            ],
+            fingerprint: "ipv6-only".into(),
+            ..Default::default()
+        };
+        let plan = manager
+            .plan("node-1", "12345678-revision", &draft, &inventory)
+            .unwrap();
+        assert!(plan.warnings.iter().any(|warning| warning.contains("IPv6")));
+
+        inventory.interfaces[0]
+            .addresses
+            .push("192.0.2.1/24".into());
+        assert!(
+            manager
+                .plan("node-1", "12345678-revision", &draft, &inventory)
+                .unwrap_err()
+                .to_string()
+                .contains("IPv4")
+        );
+        inventory.interfaces[0].addresses.pop();
+        inventory.interfaces[0].kind = Some("veth".into());
+        assert!(
+            manager
+                .plan("node-1", "12345678-revision", &draft, &inventory)
+                .unwrap_err()
+                .to_string()
+                .contains("operator-managed")
+        );
+    }
+
+    #[test]
+    fn operator_managed_plan_never_mutates_existing_virtual_topology() {
+        let manager = NetworkManager::new("unused");
+        let mut draft = NetworkProfileDraft {
+            provisioning: NetworkProvisioning::OperatorManaged,
+            ..Default::default()
+        };
+        draft.client_endpoint.count = 1;
+        draft.server_endpoint.count = 1;
+        let inventory = NodeInventory {
+            interfaces: vec![
+                InterfaceInventory {
+                    name: "eth1".into(),
+                    kind: Some("veth".into()),
+                    master: Some("br-test".into()),
+                    addresses: vec!["10.20.0.10/24".into(), "fe80::10/64".into()],
+                    ..Default::default()
+                },
+                InterfaceInventory {
+                    name: "eth2".into(),
+                    kind: Some("veth".into()),
+                    master: Some("br-test".into()),
+                    addresses: vec!["10.20.0.100/24".into()],
+                    ..Default::default()
+                },
+            ],
+            fingerprint: "operator-managed".into(),
+            ..Default::default()
+        };
+        let plan = manager
+            .plan("node-1", "12345678-revision", &draft, &inventory)
+            .unwrap();
+        assert!(plan.commands.is_empty());
+        assert!(plan.rollback_commands.is_empty());
+        assert!(
+            plan.endpoints
+                .iter()
+                .all(|endpoint| endpoint.namespace.is_empty())
+        );
+        assert!(
+            plan.semantic_changes
+                .iter()
+                .all(|change| change.contains("without changing topology"))
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_a_prepared_network_journal() {
+        let path = std::env::temp_dir().join(format!(
+            "proxy-tester-prepared-journal-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = NetworkManager::new(&path);
+        manager
+            .write_journal(&NetworkJournal {
+                operation_id: "operation".into(),
+                profile_revision_id: "revision".into(),
+                phase: "prepared".into(),
+                lease_expires_unix_ms: 0,
+                rollback_commands: Vec::new(),
+                completed_commands: 0,
+            })
+            .await
+            .unwrap();
+        manager.recover_on_startup().await.unwrap();
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
     }
 }

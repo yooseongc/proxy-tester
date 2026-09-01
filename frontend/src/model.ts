@@ -7,9 +7,11 @@ export type Agent = {
   inventory?: {
     interfaces?: {
       name: string;
+      kind?: string;
       mac?: string;
       mtu?: number;
       state?: string;
+      master?: string;
       addresses?: string[];
     }[];
     protected_interfaces?: string[];

@@ -38,3 +38,17 @@ ENTRYPOINT ["/proxy-client"]
 FROM agent AS server
 COPY --from=release-files /usr/bin/proxy-agent /proxy-server
 ENTRYPOINT ["/proxy-server"]
+
+FROM alpine:3.23 AS vxlan-lab-base
+RUN apk add --no-cache iproute2 ethtool iputils procps
+COPY --from=release-files /usr/bin/proxy-control /proxy-control
+COPY --from=release-files /usr/bin/proxy-agent /proxy-agent
+COPY --from=release-files /usr/share/proxy-tester/frontend/dist /frontend/dist
+COPY tests/vxlan-proxy-entrypoint.sh /vxlan-proxy-entrypoint.sh
+COPY tests/vxlan-meter-entrypoint.sh /vxlan-meter-entrypoint.sh
+
+FROM vxlan-lab-base AS vxlan-proxy-lab
+ENTRYPOINT ["/bin/sh", "/vxlan-proxy-entrypoint.sh"]
+
+FROM vxlan-lab-base AS vxlan-meter-lab
+ENTRYPOINT ["/bin/sh", "/vxlan-meter-entrypoint.sh"]

@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use chrono::Utc;
 use proxy_tester_domain::{
-    NetworkProfileDraft, PayloadKind, PayloadMode, Protocol, Scenario, ScenarioPath,
+    NetworkProfileDraft, NetworkProvisioning, PayloadKind, PayloadMode, Protocol, Scenario,
+    ScenarioPath,
 };
 use proxy_tester_proto::v1::{
     ArtifactChunk, ControlMessage, PrepareRun, SetPaused, StartRun, StopRun, control_message,
@@ -118,6 +119,16 @@ pub(crate) async fn scenario_runtime(
                 .ok_or_else(|| ApiError::bad("invalid server pool"))?;
             let revision = profile_revision_id.to_string();
             let short = &revision[..8];
+            let client_namespace = if draft.provisioning == NetworkProvisioning::ManagedNamespace {
+                format!("pt-{short}-client")
+            } else {
+                String::new()
+            };
+            let server_namespace = if draft.provisioning == NetworkProvisioning::ManagedNamespace {
+                format!("pt-{short}-server")
+            } else {
+                String::new()
+            };
             let (start, _) = draft
                 .client_endpoint
                 .start_cidr
@@ -134,13 +145,13 @@ pub(crate) async fn scenario_runtime(
                 (
                     format!("{address}:{server_port}"),
                     draft.client_endpoint.interface_name,
-                    format!("pt-{short}-client"),
+                    client_namespace,
                     sources,
                 ),
                 (
                     format!("{address}:{server_port}"),
                     draft.server_endpoint.interface_name,
-                    format!("pt-{short}-server"),
+                    server_namespace,
                     Vec::new(),
                 ),
             ))

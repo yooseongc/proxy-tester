@@ -14,10 +14,10 @@ use futures::{Stream, StreamExt};
 use proxy_tester_capture::{CaptureFormat, analyze_capture as analyze_tcp_capture};
 use proxy_tester_domain::{
     MetricsSnapshot, NetworkProfileDraft, NetworkProfileRevision, PayloadKind, PayloadMode,
-    Scenario,
+    Scenario, ScenarioPath,
 };
 use proxy_tester_proto::v1::{
-    AgentMessage, ControlMessage, StopRun,
+    AgentMessage, ControlMessage, PreflightRun, StopRun,
     agent_control_server::{AgentControl, AgentControlServer},
     agent_message, control_message,
 };
@@ -25,7 +25,7 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncWriteExt,
     sync::{broadcast, mpsc, watch},
@@ -480,17 +480,133 @@ async fn preflight(
     orchestration::validate_artifacts(&s.db, &sc).await?;
     let (client_id, server_id, profile_ready) = orchestration::scenario_nodes(&s.db, &sc).await?;
     let agents = s.agents.read().await;
-    let client = agents.get(&client_id);
-    let server = agents.get(&server_id);
-    let checks = vec![
-        serde_json::json!({"name":"client_node","ok":client.is_some(),"detail":client_id}),
-        serde_json::json!({"name":"server_node","ok":server.is_some(),"detail":server_id}),
+    let client = agents.get(&client_id).cloned();
+    let server = agents.get(&server_id).cloned();
+    let online_cutoff = Utc::now().timestamp_millis() - 15_000;
+    let client_online = client
+        .as_ref()
+        .is_some_and(|agent| agent.last_seen_ms >= online_cutoff);
+    let server_online = server
+        .as_ref()
+        .is_some_and(|agent| agent.last_seen_ms >= online_cutoff);
+    let mut checks = vec![
+        serde_json::json!({"name":"client_node","ok":client_online,"detail":if client_online {client_id.clone()} else {format!("{client_id} is offline")}}),
+        serde_json::json!({"name":"server_node","ok":server_online,"detail":if server_online {server_id.clone()} else {format!("{server_id} is offline")}}),
         serde_json::json!({"name":"network_profile","ok":profile_ready,"detail":if profile_ready {"prepared"} else {"not prepared"}}),
     ];
-    let ok = checks.iter().all(|v| v["ok"].as_bool() == Some(true));
+    if let ScenarioPath::ExplicitProxy {
+        client_bind_ip,
+        server_listen_ip,
+        proxy_addr,
+        server_port,
+        ..
+    } = &sc.path
+    {
+        checks.push(serde_json::json!({
+            "name":"client_source_ip",
+            "ok":client.as_ref().is_some_and(|agent| inventory_has_ip(&agent.inventory_json, client_bind_ip)),
+            "detail":client_bind_ip.to_string()
+        }));
+        checks.push(serde_json::json!({
+            "name":"server_listen_ip",
+            "ok":server.as_ref().is_some_and(|agent| inventory_has_ip(&agent.inventory_json, server_listen_ip)),
+            "detail":server_listen_ip.to_string()
+        }));
+        checks.push(serde_json::json!({
+            "name":"proxy_target",
+            "ok":true,
+            "detail":format!("{proxy_addr} -> {server_listen_ip}:{server_port}")
+        }));
+    }
+    drop(agents);
+    if matches!(sc.path, ScenarioPath::ExplicitProxy { .. })
+        && checks
+            .iter()
+            .all(|value| value["ok"].as_bool() == Some(true))
+    {
+        let scenario_json = serde_json::to_string(&sc)?;
+        if let Some(client) = client.as_ref() {
+            let outcome = agent_preflight(&s, client, &scenario_json, 1).await;
+            checks.push(serde_json::json!({
+                "name":"client_agent_probe",
+                "ok":outcome.is_ok(),
+                "detail":outcome.err().unwrap_or_else(|| "source bind and proxy TCP connection succeeded".into())
+            }));
+        }
+        if let Some(server) = server.as_ref() {
+            let outcome = agent_preflight(&s, server, &scenario_json, 2).await;
+            checks.push(serde_json::json!({
+                "name":"server_agent_probe",
+                "ok":outcome.is_ok(),
+                "detail":outcome.err().unwrap_or_else(|| "server address and port bind succeeded".into())
+            }));
+        }
+    }
+    let ok = checks
+        .iter()
+        .all(|value| value["ok"].as_bool() == Some(true));
     Ok(Json(
         serde_json::json!({"ok":ok,"checks":checks,"warnings":["route, MTU, offload와 물리 경로는 Linux 실장비에서 별도 확인해야 합니다"]}),
     ))
+}
+
+async fn agent_preflight(
+    state: &AppState,
+    agent: &AgentSession,
+    scenario_json: &str,
+    endpoint_role: i32,
+) -> Result<(), String> {
+    let command_id = Uuid::new_v4().to_string();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    state
+        .pending_acks
+        .lock()
+        .await
+        .insert(command_id.clone(), sender);
+    let message = ControlMessage {
+        body: Some(control_message::Body::Preflight(PreflightRun {
+            scenario_json: scenario_json.into(),
+            command_id: command_id.clone(),
+            endpoint_role,
+        })),
+    };
+    if agent.tx.send(Ok(message)).await.is_err() {
+        state.pending_acks.lock().await.remove(&command_id);
+        return Err("Agent command channel is closed".into());
+    }
+    let acknowledgement =
+        match tokio::time::timeout(Duration::from_secs(state.command_timeout_secs), receiver).await
+        {
+            Ok(Ok(acknowledgement)) => acknowledgement,
+            Ok(Err(_)) => return Err("Agent preflight response channel closed".into()),
+            Err(_) => {
+                state.pending_acks.lock().await.remove(&command_id);
+                return Err("Agent preflight timed out".into());
+            }
+        };
+    if acknowledgement.ok {
+        Ok(())
+    } else {
+        Err(acknowledgement.error)
+    }
+}
+
+fn inventory_has_ip(inventory_json: &str, expected: &std::net::IpAddr) -> bool {
+    serde_json::from_str::<serde_json::Value>(inventory_json)
+        .ok()
+        .and_then(|inventory| inventory["interfaces"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|network_interface| {
+            network_interface["addresses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|address| address.as_str())
+        .filter_map(|address| address.split('/').next())
+        .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+        .any(|address| address == *expected)
 }
 
 #[derive(Deserialize)]
@@ -1253,8 +1369,8 @@ async fn schedule_disconnect_failure(state: AppState, agent_id: String) {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::{
-        analyze_capture, cleanup_orphan_artifacts, migrate, result_payload_metadata,
-        schema_fallback_url,
+        analyze_capture, cleanup_orphan_artifacts, inventory_has_ip, migrate,
+        result_payload_metadata, schema_fallback_url,
     };
     use chrono::Utc;
     use proxy_tester_domain::{PayloadKind, PayloadProfile, RandomFormat, Scenario};
@@ -1274,6 +1390,28 @@ mod tests {
     #[test]
     fn rejects_unknown_capture() {
         assert!(analyze_capture(b"not a capture file").is_err());
+    }
+
+    #[test]
+    fn preflight_inventory_matches_an_address_without_its_prefix() {
+        let inventory = serde_json::json!({
+            "interfaces": [
+                {"name":"eth0","addresses":["192.0.2.10/24","fe80::10/64"]},
+                {"name":"eth1","addresses":["198.51.100.20/25"]}
+            ]
+        });
+        assert!(inventory_has_ip(
+            &inventory.to_string(),
+            &"192.0.2.10".parse().unwrap()
+        ));
+        assert!(inventory_has_ip(
+            &inventory.to_string(),
+            &"fe80::10".parse().unwrap()
+        ));
+        assert!(!inventory_has_ip(
+            &inventory.to_string(),
+            &"192.0.2.11".parse().unwrap()
+        ));
     }
 
     #[test]

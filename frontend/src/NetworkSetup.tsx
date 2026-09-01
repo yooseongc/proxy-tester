@@ -8,6 +8,8 @@ type Endpoint = { node_id: string; interface_name: string; start_cidr: string; c
 type Draft = {
   id: string;
   name: string;
+  provisioning: "managed_namespace" | "operator_managed";
+  allow_virtual_interfaces: boolean;
   client_endpoint: Endpoint;
   server_endpoint: Endpoint;
   mtu: number;
@@ -44,6 +46,8 @@ export function NetworkSetup({
   const [draft, setDraft] = useState<Draft>(() => ({
     id: crypto.randomUUID(),
     name: "Managed direct network",
+    provisioning: "managed_namespace",
+    allow_virtual_interfaces: false,
     client_endpoint: endpoint(first, "eth1", "10.20.0.10/24"),
     server_endpoint: endpoint(second, "eth1", "10.20.0.100/24"),
     mtu: 1370,
@@ -62,8 +66,28 @@ export function NetworkSetup({
       ),
     [agents],
   );
+  const invalidatePlan = () => {
+    if (plan) {
+      setPlan(null);
+      setMessage("초안 변경 · 재계획 필요");
+    }
+  };
+  const updateDraft = (update: (current: Draft) => Draft) => {
+    invalidatePlan();
+    setDraft(update);
+  };
   const patchEndpoint = (side: "client_endpoint" | "server_endpoint", value: Partial<Endpoint>) =>
-    setDraft((d) => ({ ...d, [side]: { ...d[side], ...value } }));
+    updateDraft((current) => ({
+      ...current,
+      [side]: { ...current[side], ...value },
+    }));
+  const planIsCurrent =
+    !plan ||
+    Object.entries(plan.detail.plans).every(([nodeId, nodePlan]) => {
+      const agent = agents.find((candidate) => candidate.id === nodeId);
+      const current = agent?.inventory?.fingerprint;
+      return !!agent && (!current || current === nodePlan.inventory_fingerprint);
+    });
   const execute = async (action: () => Promise<void>) => {
     setBusy(true);
     setError("");
@@ -77,6 +101,7 @@ export function NetworkSetup({
   };
   const createPlan = () =>
     execute(async () => {
+      setPlan(null);
       await api("/api/network/profiles", { method: "POST", body: JSON.stringify(draft) });
       const value = await api<Plan>(`/api/network/profiles/${draft.id}/plan`, { method: "POST" });
       setPlan(value);
@@ -84,11 +109,18 @@ export function NetworkSetup({
     });
   const apply = () =>
     plan &&
+    planIsCurrent &&
     execute(async () => {
-      await api(`/api/network/operations/${plan.operation_id}/apply`, {
-        method: "POST",
-        body: JSON.stringify({ plan_token: plan.plan_token }),
-      });
+      try {
+        await api(`/api/network/operations/${plan.operation_id}/apply`, {
+          method: "POST",
+          body: JSON.stringify({ plan_token: plan.plan_token }),
+        });
+      } catch (cause) {
+        setPlan(null);
+        setMessage("적용 실패 · 재계획 필요");
+        throw cause;
+      }
       const revisions = await api<Revision[]>(`/api/network/revisions?profile_id=${draft.id}`);
       const selected = revisions.find((r) => r.id === plan.profile_revision_id) ?? null;
       setRevision(selected);
@@ -124,7 +156,11 @@ export function NetworkSetup({
       <SectionTitle
         eyebrow="NETWORK PROFILE"
         title="시험 네트워크 구성"
-        aside={<StatusBadge tone={revision ? "live" : "neutral"}>{message}</StatusBadge>}
+        aside={
+          <StatusBadge tone={revision ? "live" : "neutral"}>
+            {plan && !planIsCurrent ? "Agent 상태 변경 · 재계획 필요" : message}
+          </StatusBadge>
+        }
       />
       <p className="mb-4 text-xs text-dim">
         관리 인터페이스는 보호됩니다. 적용 전 실제 명령과 롤백 계획을 검토하고, 준비된 revision만
@@ -135,9 +171,40 @@ export function NetworkSetup({
           <input
             value={draft.name}
             disabled={!!revision}
-            onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
+            onChange={(e) => updateDraft((current) => ({ ...current, name: e.target.value }))}
           />
         </Field>
+        <Field label="네트워크 소유권">
+          <select
+            value={draft.provisioning}
+            disabled={!!revision}
+            onChange={(event) =>
+              updateDraft((current) => ({
+                ...current,
+                provisioning: event.target.value as Draft["provisioning"],
+              }))
+            }
+          >
+            <option value="managed_namespace">프로그램 관리 namespace</option>
+            <option value="operator_managed">기존 토폴로지 사용 (변경 없음)</option>
+          </select>
+        </Field>
+        {draft.provisioning === "managed_namespace" && (
+          <label className="flex items-center gap-2 rounded-xl border border-warn/30 p-3 text-xs text-warn">
+            <input
+              type="checkbox"
+              checked={draft.allow_virtual_interfaces}
+              disabled={!!revision}
+              onChange={(event) =>
+                updateDraft((current) => ({
+                  ...current,
+                  allow_virtual_interfaces: event.target.checked,
+                }))
+              }
+            />
+            격리된 테스트용 virtual interface 이동 허용
+          </label>
+        )}
         <Field label="MTU">
           <input
             type="number"
@@ -145,7 +212,9 @@ export function NetworkSetup({
             max={9216}
             value={draft.mtu}
             disabled={!!revision}
-            onChange={(e) => setDraft((d) => ({ ...d, mtu: Number(e.target.value) }))}
+            onChange={(e) =>
+              updateDraft((current) => ({ ...current, mtu: Number(e.target.value) }))
+            }
           />
         </Field>
         {(["client_endpoint", "server_endpoint"] as const).map((side) => (
@@ -210,7 +279,13 @@ export function NetworkSetup({
           </div>
         ))}
       </div>
-      {plan && !revision && (
+      {draft.provisioning === "operator_managed" && !revision && (
+        <p className="mt-3 rounded-xl border border-signal/30 bg-signal/5 p-3 text-xs text-dim">
+          선택한 interface와 IP를 그대로 사용합니다. veth·bridge·VXLAN을 이동하거나 삭제하지 않으며,
+          입력한 모든 IPv4 주소가 이미 구성되어 있어야 합니다.
+        </p>
+      )}
+      {plan && planIsCurrent && !revision && (
         <div className="my-4 rounded-xl border border-signal/30 bg-signal/5 p-3 text-xs">
           <strong>적용 계획</strong>
           <NetworkPlanDetails plans={plan.detail.plans} />
@@ -224,8 +299,12 @@ export function NetworkSetup({
       )}
       <div className="mt-4 flex flex-wrap gap-2">
         {!revision && (
-          <Button variant="primary" disabled={busy} onClick={plan ? apply : createPlan}>
-            {plan ? "계획 적용" : "저장 및 계획"}
+          <Button
+            variant="primary"
+            disabled={busy}
+            onClick={plan && planIsCurrent ? apply : createPlan}
+          >
+            {plan && planIsCurrent ? "계획 적용" : "저장 및 계획"}
           </Button>
         )}
         {revision && (

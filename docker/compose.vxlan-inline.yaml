@@ -1,0 +1,44 @@
+name: proxy-tester-vxlan-inline
+
+services:
+  proxy-a:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: vxlan-proxy-lab
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      VXLAN_LOCAL_IP: "${VXLAN_PROXY_IP:-198.19.250.10}"
+      VXLAN_REMOTE_IP: "${VXLAN_METER_IP:-198.19.250.20}"
+    networks:
+      underlay:
+        ipv4_address: "${VXLAN_PROXY_IP:-198.19.250.10}"
+
+  meter-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: vxlan-meter-lab
+    cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    environment:
+      DATABASE_URL: sqlite:///data/proxy-tester.db?mode=rwc
+      PROXY_TESTER_STATIC_DIR: /frontend/dist
+      PROXY_TESTER_CONTROL: http://127.0.0.1:50051
+      PROXY_TESTER_NODE_ID: meter-b
+      PROXY_TESTER_NETWORK_JOURNAL: /data/network-state.json
+      VXLAN_LOCAL_IP: "${VXLAN_METER_IP:-198.19.250.20}"
+      VXLAN_REMOTE_IP: "${VXLAN_PROXY_IP:-198.19.250.10}"
+    ports: ["${VXLAN_LAB_PORT:-18090}:8080"]
+    volumes: [meter-data:/data]
+    networks:
+      underlay:
+        ipv4_address: "${VXLAN_METER_IP:-198.19.250.20}"
+
+networks:
+  underlay:
+    ipam:
+      config:
+        - subnet: "${VXLAN_UNDERLAY_SUBNET:-198.19.250.0/24}"
+
+volumes:
+  meter-data: {}

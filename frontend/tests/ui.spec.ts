@@ -15,6 +15,36 @@ async function expectNoPageOverflow(page: import("@playwright/test").Page) {
   expect(dimensions.body, dimensions.offenders.join("\n")).toBeLessThanOrEqual(dimensions.viewport);
 }
 
+test.beforeEach(async ({ page }) => {
+  let scenarios: unknown[] = [];
+  const agents = ["client-1", "server-1"].map((id, index) => ({
+    id,
+    hostname: id,
+    role: index + 1,
+    interfaces: ["eth0", "eth1"],
+    online: true,
+    inventory: {
+      fingerprint: `${id}-fingerprint`,
+      interfaces: [
+        { name: "eth0", addresses: [`10.0.0.${index + 10}/24`] },
+        { name: "eth1", addresses: [`10.20.0.${index + 10}/24`] },
+      ],
+    },
+  }));
+  await page.route("**/api/scenarios", async (route) => {
+    if (route.request().method() === "POST") {
+      const scenario = route.request().postDataJSON();
+      scenarios = [scenario];
+      await route.fulfill({ json: scenario });
+    } else await route.fulfill({ json: scenarios });
+  });
+  await page.route("**/api/agents", (route) => route.fulfill({ json: agents }));
+  await page.route("**/api/artifacts**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/runs/page**", (route) =>
+    route.fulfill({ json: { items: [], next_cursor: null } }),
+  );
+});
+
 test("technical console setup, local fonts and themes are available", async ({ page }) => {
   const profileName = `Playwright profile ${Date.now()}`;
   await page.setViewportSize({ width: 1440, height: 1000 });
@@ -147,10 +177,13 @@ test("network plan exposes advanced commands and operation timeline on demand", 
     }
   });
   await page.goto("/#setup");
+  const interfaceSelectors = page
+    .locator("label.field", { hasText: "Interface" })
+    .locator("select");
   await page.getByLabel("Node").nth(0).selectOption("client-1");
-  await page.getByLabel("Interface").nth(0).selectOption("eth1");
+  await interfaceSelectors.nth(0).selectOption("eth1");
   await page.getByLabel("Node").nth(1).selectOption("server-1");
-  await page.getByLabel("Interface").nth(1).selectOption("eth1");
+  await interfaceSelectors.nth(1).selectOption("eth1");
   await page.getByRole("button", { name: "저장 및 계획" }).click();
   await expect(page.getByText("move eth1 into pt-test-client")).toBeVisible();
   await expect(page.getByText("ip netns add pt-test-client")).toBeHidden();
@@ -212,7 +245,7 @@ test("traffic-first payload, summary, capture analysis and advanced fields react
   await expect(page.getByLabel("HTTP Proxy 주소")).toBeVisible();
   await expect(page.getByLabel("현재 트래픽 요약")).toContainText("명시적 Proxy");
   await page.getByLabel("Payload 모드").selectOption("capture_replay");
-  await expect(page.getByRole("alert")).toContainText("선택해야");
+  await expect(page.getByRole("alert").filter({ hasText: "선택해야" })).toBeVisible();
   const upload = page.getByLabel("PCAP / PCAPNG 업로드");
   await upload.setInputFiles({
     name: "sessions.pcap",

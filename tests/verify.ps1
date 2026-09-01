@@ -47,8 +47,24 @@ try {
         Assert-NativeSuccess 'managed-direct compose validation'
         Push-Location frontend
         try {
-            npm run test:e2e
-            Assert-NativeSuccess 'Playwright tests'
+            $vite = Start-Process -FilePath (Get-Command node).Source `
+                -ArgumentList @('./node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', '18080', '--strictPort') `
+                -WorkingDirectory (Get-Location) -WindowStyle Hidden -PassThru
+            try {
+                $ready = $false
+                for ($attempt = 0; $attempt -lt 100; $attempt++) {
+                    if ($vite.HasExited) { throw "Vite exited with code $($vite.ExitCode)" }
+                    try {
+                        $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:18080 -TimeoutSec 1
+                        if ($response.StatusCode -eq 200) { $ready = $true; break }
+                    } catch { Start-Sleep -Milliseconds 200 }
+                }
+                if (-not $ready) { throw 'Vite did not become ready on port 18080' }
+                npm run test:e2e
+                Assert-NativeSuccess 'Playwright tests'
+            } finally {
+                if ($vite -and -not $vite.HasExited) { Stop-Process -Id $vite.Id -Force }
+            }
         } finally { Pop-Location }
     }
 } finally { Pop-Location }

@@ -95,6 +95,18 @@ struct Prepared {
     replay: Option<Arc<ReplayPlan>>,
 }
 
+type ActiveRun = (Uuid, Arc<AtomicBool>, Arc<AtomicBool>);
+
+fn active_run_conflicts(
+    active: &HashMap<i32, ActiveRun>,
+    endpoint_role: i32,
+    run_id: Uuid,
+) -> bool {
+    active.iter().any(|(active_role, (active_id, running, _))| {
+        running.load(Ordering::SeqCst) && (*active_id != run_id || *active_role == endpoint_role)
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -109,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .context("PROXY_TESTER_NODE_ID is required")?;
     let network = NetworkManager::new(args.network_journal.clone());
-    if let Err(error) = network.recover().await {
+    if let Err(error) = network.recover_on_startup().await {
         error!(%error,"startup network recovery failed");
     }
     let instance_id = Uuid::new_v4().to_string();
@@ -165,7 +177,6 @@ async fn run_connection(
     let prepared: Arc<Mutex<HashMap<i32, Prepared>>> = Default::default();
     let mut incoming_artifacts = HashMap::new();
     let mut completed_artifacts = HashMap::new();
-    type ActiveRun = (Uuid, Arc<AtomicBool>, Arc<AtomicBool>);
     let active_run: Arc<Mutex<HashMap<i32, ActiveRun>>> = Default::default();
     tx.send(AgentMessage {
         body: Some(agent_message::Body::Status(AgentStatus {
@@ -233,6 +244,28 @@ async fn run_connection(
                 remember_command(&mut completed_commands, &mut command_order, &p.command_id);
                 send_ack(&tx, &p.command_id, &p.run_id, "prepare", true, "").await?;
             }
+            Some(control_message::Body::Preflight(command)) => {
+                if command_seen(&completed_commands, &command.command_id) {
+                    send_ack(&tx, &command.command_id, "", "preflight", true, "").await?;
+                    continue;
+                }
+                let endpoint_role = Role::from_proto(command.endpoint_role)
+                    .context("invalid preflight endpoint role")?;
+                let outcome =
+                    preflight_endpoint(&network, &command.scenario_json, endpoint_role).await;
+                let (ok, error) = match outcome {
+                    Ok(()) => (true, String::new()),
+                    Err(error) => (false, error.to_string()),
+                };
+                if ok {
+                    remember_command(
+                        &mut completed_commands,
+                        &mut command_order,
+                        &command.command_id,
+                    );
+                }
+                send_ack(&tx, &command.command_id, "", "preflight", ok, &error).await?;
+            }
             Some(control_message::Body::ArtifactChunk(chunk)) => {
                 accept_artifact_chunk(&mut incoming_artifacts, &mut completed_artifacts, chunk)
                     .await?;
@@ -257,11 +290,7 @@ async fn run_connection(
                     continue;
                 };
                 let mut active = active_run.lock().await;
-                if active
-                    .values()
-                    .any(|(_, running, _)| running.load(Ordering::SeqCst))
-                    && active.contains_key(&s.endpoint_role)
-                {
+                if active_run_conflicts(&active, s.endpoint_role, job.run_id) {
                     send_ack(
                         &tx,
                         &s.command_id,
@@ -421,6 +450,58 @@ async fn run_connection(
         }
     }
     Ok(())
+}
+
+async fn preflight_endpoint(
+    network: &NetworkManager,
+    scenario_json: &str,
+    role: Role,
+) -> anyhow::Result<()> {
+    let scenario: Scenario = serde_json::from_str(scenario_json)?;
+    scenario.validate()?;
+    let proxy_tester_domain::ScenarioPath::ExplicitProxy {
+        client_bind_ip,
+        server_listen_ip,
+        server_port,
+        proxy_addr,
+        ..
+    } = &scenario.path
+    else {
+        return Ok(());
+    };
+    let expected = match role {
+        Role::Client => client_bind_ip,
+        Role::Server => server_listen_ip,
+    };
+    let inventory = network.inventory().await?;
+    if !inventory.interfaces.iter().any(|network_interface| {
+        network_interface.addresses.iter().any(|address| {
+            address
+                .split('/')
+                .next()
+                .and_then(|address| address.parse::<std::net::IpAddr>().ok())
+                .as_ref()
+                == Some(expected)
+        })
+    }) {
+        anyhow::bail!("{role:?} IP {expected} is not assigned on this Agent")
+    }
+    match role {
+        Role::Client => {
+            connector::preflight_proxy(proxy_addr, *client_bind_ip, scenario.timeouts.connect_ms)
+                .await
+        }
+        Role::Server => {
+            let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::new(
+                *server_listen_ip,
+                *server_port,
+            ))
+            .await
+            .with_context(|| format!("cannot bind {server_listen_ip}:{server_port}"))?;
+            drop(listener);
+            Ok(())
+        }
+    }
 }
 
 fn command_seen(completed: &HashSet<String>, command_id: &str) -> bool {
@@ -758,6 +839,42 @@ mod tests {
         assert_eq!(completed.len(), 256);
         assert!(!command_seen(&completed, "first"));
         assert!(!command_seen(&completed, ""));
+    }
+
+    #[test]
+    fn same_run_can_start_the_other_role_over_a_stale_inactive_entry() {
+        let old_run = Uuid::new_v4();
+        let new_run = Uuid::new_v4();
+        let mut active = HashMap::from([
+            (
+                1,
+                (
+                    old_run,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            ),
+            (
+                2,
+                (
+                    old_run,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            ),
+        ]);
+        active.insert(
+            1,
+            (
+                new_run,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        );
+
+        assert!(!active_run_conflicts(&active, 2, new_run));
+        assert!(active_run_conflicts(&active, 1, new_run));
+        assert!(active_run_conflicts(&active, 2, Uuid::new_v4()));
     }
 
     fn chunk(

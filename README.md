@@ -21,7 +21,7 @@ sha256sum -c SHA256SUMS
 Control과 Agent 실행 파일이 함께 설치됩니다. 설치 후 이 장비에서 사용할 구성만 생성합니다.
 
 ```bash
-sudo apt install ./proxy-tester_0.1.1_amd64.deb
+sudo apt install ./proxy-tester_0.1.2_amd64.deb
 
 # Control 서버인 경우
 sudo proxy-tester-configure control
@@ -35,7 +35,7 @@ sudo proxy-tester-configure agent \
 ### RHEL·Rocky Linux
 
 ```bash
-sudo dnf install ./proxy-tester-0.1.1-1.x86_64.rpm
+sudo dnf install ./proxy-tester-0.1.2-1.x86_64.rpm
 
 # Control 서버인 경우
 sudo proxy-tester-configure control
@@ -49,8 +49,8 @@ sudo proxy-tester-configure agent \
 ### 범용 tar.gz
 
 ```bash
-tar -xzf proxy-tester-0.1.1-x86_64-linux-musl.tar.gz
-cd proxy-tester-0.1.1
+tar -xzf proxy-tester-0.1.2-x86_64-linux-musl.tar.gz
+cd proxy-tester-0.1.2
 
 # Control 서버인 경우
 sudo ./install.sh --component control

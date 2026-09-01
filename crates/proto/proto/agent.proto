@@ -5,7 +5,7 @@ service AgentControl { rpc AgentStream(stream AgentMessage) returns (stream Cont
 
 enum AgentRole { AGENT_ROLE_UNSPECIFIED = 0; AGENT_ROLE_CLIENT = 1; AGENT_ROLE_SERVER = 2; }
 
-message InterfaceInventory { string name = 1; optional string mac = 2; optional uint32 mtu = 3; optional string state = 4; optional string master = 5; repeated string addresses = 6; bool link_up = 7; map<string,bool> offloads = 8; }
+message InterfaceInventory { string name = 1; optional string mac = 2; optional uint32 mtu = 3; optional string state = 4; optional string master = 5; repeated string addresses = 6; bool link_up = 7; map<string,bool> offloads = 8; optional string kind = 9; }
 message NodeInventory { repeated InterfaceInventory interfaces = 1; map<string,bool> capabilities = 2; repeated string protected_interfaces = 3; string fingerprint = 4; }
 message AgentHello { string node_id = 1; string hostname = 2; string version = 3; string instance_id = 4; NodeInventory inventory = 5; }
 message Heartbeat { int64 unix_ms = 1; }
@@ -19,8 +19,9 @@ message PrepareRun { string run_id = 1; string scenario_json = 2; string command
 message StartRun { string run_id = 1; int64 start_unix_ms = 2; string command_id = 3; AgentRole endpoint_role = 4; }
 message StopRun { string run_id = 1; string command_id = 2; AgentRole endpoint_role = 3; }
 message SetPaused { string run_id = 1; bool paused = 2; string command_id = 3; AgentRole endpoint_role = 4; }
+message PreflightRun { string scenario_json = 1; string command_id = 2; AgentRole endpoint_role = 3; }
 message EndpointProfile { string node_id = 1; string interface_name = 2; string start_cidr = 3; uint32 count = 4; }
-message NetworkProfileDraft { string id = 1; string name = 2; EndpointProfile client_endpoint = 3; EndpointProfile server_endpoint = 4; uint32 mtu = 5; uint32 diagnostic_port = 6; bool path_probe_enabled = 7; }
+message NetworkProfileDraft { string id = 1; string name = 2; EndpointProfile client_endpoint = 3; EndpointProfile server_endpoint = 4; uint32 mtu = 5; uint32 diagnostic_port = 6; bool path_probe_enabled = 7; string provisioning = 8; bool allow_virtual_interfaces = 9; }
 message CommandSpec { string program = 1; repeated string args = 2; }
 message EndpointPlan { string role = 1; string namespace = 2; string interface = 3; repeated string addresses = 4; }
 message NetworkPlan { string profile_revision_id = 1; string node_id = 2; string inventory_fingerprint = 3; repeated EndpointPlan endpoints = 4; repeated string semantic_changes = 5; repeated CommandSpec commands = 6; repeated CommandSpec rollback_commands = 7; repeated string warnings = 8; }
@@ -38,4 +39,4 @@ message ArtifactChunk {
   bool eof = 6;
   string artifact_kind = 7;
 }
-message ControlMessage { oneof body { PrepareRun prepare = 1; StartRun start = 2; StopRun stop = 3; SetPaused set_paused = 4; ArtifactChunk artifact_chunk = 5; NetworkCommand network = 6; } }
+message ControlMessage { oneof body { PrepareRun prepare = 1; StartRun start = 2; StopRun stop = 3; SetPaused set_paused = 4; ArtifactChunk artifact_chunk = 5; NetworkCommand network = 6; PreflightRun preflight = 7; } }

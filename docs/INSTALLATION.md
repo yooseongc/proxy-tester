@@ -12,8 +12,8 @@ Control은 UI, REST/WebSocket, agent gRPC와 SQLite를 제공합니다. 모든 �
 
 ```bash
 sha256sum -c SHA256SUMS
-tar -xzf proxy-tester-0.1.1-x86_64-linux-musl.tar.gz
-cd proxy-tester-0.1.1
+tar -xzf proxy-tester-0.1.2-x86_64-linux-musl.tar.gz
+cd proxy-tester-0.1.2
 ```
 
 Control 호스트는 다음처럼 설치합니다.
@@ -42,10 +42,10 @@ Agent 도구가 없으면 installer는 누락 목록을 출력하고 중단합�
 
 ```bash
 # Debian/Ubuntu
-sudo apt install ./proxy-tester_0.1.1_amd64.deb
+sudo apt install ./proxy-tester_0.1.2_amd64.deb
 
 # RHEL/Rocky
-sudo dnf install ./proxy-tester-0.1.1-1.x86_64.rpm
+sudo dnf install ./proxy-tester-0.1.2-1.x86_64.rpm
 
 # 필요한 구성 요소 설정
 sudo proxy-tester-configure control

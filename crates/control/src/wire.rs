@@ -96,7 +96,7 @@ pub(crate) fn plan_to_json(value: NetworkPlan) -> serde_json::Value {
 
 pub(crate) fn inventory_to_json(value: proxy_tester_proto::v1::NodeInventory) -> serde_json::Value {
     serde_json::json!({
-        "interfaces": value.interfaces.into_iter().map(|interface| serde_json::json!({"name":interface.name,"mac":interface.mac,"mtu":interface.mtu,"state":interface.state,"master":interface.master,"addresses":interface.addresses,"link_up":interface.link_up,"offloads":interface.offloads})).collect::<Vec<_>>(),
+        "interfaces": value.interfaces.into_iter().map(|interface| serde_json::json!({"name":interface.name,"kind":interface.kind,"mac":interface.mac,"mtu":interface.mtu,"state":interface.state,"master":interface.master,"addresses":interface.addresses,"link_up":interface.link_up,"offloads":interface.offloads})).collect::<Vec<_>>(),
         "capabilities": value.capabilities,
         "protected_interfaces": value.protected_interfaces,
         "fingerprint": value.fingerprint,

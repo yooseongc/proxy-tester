@@ -8,6 +8,8 @@ The `path` is either `managed_direct`, pinned to an immutable prepared network r
 
 Supported protocols are TCP, HTTP/1.1, and TLS-only HTTP/2. Explicit proxy TCP and TLS use CONNECT; plaintext HTTP/1.1 uses absolute-form requests. h2c is unsupported.
 
+For `explicit_proxy`, `proxy_addr` is the proxy listener reached by the Client Agent. `server_listen_ip:server_port` is a separate destination owned by the Server Agent: plaintext HTTP/1.1 uses it in the absolute-form target, while TCP, TLS, and HTTP/2 use it as the CONNECT authority. The Server Agent binds that exact address and port. Preflight verifies that both endpoint IPs are locally assigned, the Client Agent can bind its source address and connect to the proxy, and the Server Agent can bind the destination port.
+
 ## TCP direct and TCP CONNECT
 
 `managed_direct` TCP와 explicit-proxy TCP는 같은 application payload를 생성하지만 네트워크 경로는 다르다.

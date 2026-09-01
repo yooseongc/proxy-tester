@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-test_prefix="${PROXY_TESTER_TEST_IPV4_PREFIX:-172.31.}"
+test_prefix="${PROXY_TESTER_TEST_IPV4_PREFIX:-198.18.200.}"
 test_interface="$({
   ip -o -4 address show
 } | awk -v prefix="$test_prefix" '$4 ~ ("^" prefix) { print $2; exit }')"

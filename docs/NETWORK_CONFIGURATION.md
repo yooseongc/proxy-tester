@@ -2,9 +2,14 @@
 
 Scenario v4 separates a reusable network profile from the traffic scenario. A managed-direct scenario references an immutable, prepared profile revision; an explicit-proxy scenario continues to use operator-managed addresses and does not mutate interfaces.
 
+A managed-direct profile has an explicit provisioning policy:
+
+- `managed_namespace` borrows a dedicated, unaddressed physical interface, moves it into a Proxy Tester namespace, and assigns the configured IPv4 pool. Bridge members and virtual links are rejected by default. Disposable container/test environments may explicitly enable `allow_virtual_interfaces`; never enable it for operator-owned veth/VXLAN topology.
+- `operator_managed` uses interfaces and IPv4 addresses already configured by the operator. It never moves links, changes offloads, assigns addresses, or deletes namespaces. Use this policy for veth, bridge, VXLAN, macvlan, or other externally owned topology.
+
 ## Safety model
 
-The Agent inventories Linux interfaces, addresses, link state, MTU and the default-route interface. The default-route interface is protected and cannot be selected. Planning rejects an occupied interface, overlapping pools, pools outside one IPv4 subnet, an MTU outside 576–9216, or more than 4096 addresses per endpoint.
+The Agent inventories Linux interfaces, IPv4/IPv6 addresses, link kind, bridge master, link state, MTU, and both IPv4 and IPv6 default-route interfaces. A default-route interface is protected and cannot be selected. In `managed_namespace`, planning rejects an existing IPv4 address, an externally owned virtual/enslaved link, overlapping pools, pools outside one IPv4 subnet, an MTU outside 576–9216, or more than 4096 addresses per endpoint. IPv6-only interfaces are accepted and their IPv6 addresses are preserved. In `operator_managed`, every configured pool address must already exist on the selected interface.
 
 `Plan` is read-only. It returns exact commands, semantic changes, warnings, an inventory fingerprint, and a single-use token valid for five minutes. `Apply` uses a two-phase operation across every participating Node:
 
@@ -12,7 +17,7 @@ The Agent inventories Linux interfaces, addresses, link state, MTU and the defau
 2. If all Nodes staged successfully, Control commits them. Any stage or commit failure requests rollback from every staged Node.
 3. An uncommitted lease expires after 180 seconds and the Agent rolls it back locally.
 
-The Agent journal is written atomically to `/var/lib/proxy-tester/network-state.json`. Agent restart rolls back journaled state before reconnecting. Teardown retries every rollback command three times; an unrecoverable teardown is marked `quarantined` for operator reconciliation.
+The Agent journal is written atomically to `/var/lib/proxy-tester/network-state.json`. Agent restart rolls back only incomplete `applying` or `staged` work; a committed `prepared` configuration survives restart until explicit Teardown or Reconcile. Teardown retries every rollback command three times. Namespace deletion is skipped if any borrowed-interface restoration fails, preventing a remaining veth and its peer from being destroyed. An unrecoverable teardown is marked `quarantined` for operator reconciliation.
 
 ## Linux data plane
 
@@ -30,7 +35,7 @@ The packaged Agent needs `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_SYS_ADMIN` (fo
 
 `GET /api/network/audit` returns operations with their ordered, per-Node stage events. `POST /api/network/diagnose` verifies revision validity, Node liveness and current inventory availability; run preflight performs the final namespace path check. `POST /api/network/nodes/{id}/reconcile` requests local journal reconciliation after an interrupted operation.
 
-An Agent restart rolls back a prepared local journal before reconnecting. Control does not resume traffic workers automatically; use Teardown or Reconcile before planning another revision. Inventory is captured when the Agent connects, so a namespace-changing recovery must finish before reconnect or be followed by an Agent reconnect to refresh the UI snapshot.
+An Agent restart preserves a prepared local journal and does not resume traffic workers automatically. Use Teardown or Reconcile to remove the prepared configuration. Inventory is captured when the Agent connects, so a namespace-changing recovery must finish before reconnect or be followed by an Agent reconnect to refresh the UI snapshot.
 
 The plan review UI shows endpoint, namespace, address assignment, semantic changes and warnings per Node. Actual commands, rollback commands and the inventory fingerprint stay collapsed under advanced details. `GET /api/network/operations/{id}` backs the contextual diagnostics drawer with an ordered event timeline; the drawer refreshes from persisted state whenever a matching WebSocket event arrives.
 

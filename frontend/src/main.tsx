@@ -41,6 +41,7 @@ import {
   initialScenario,
   recentActiveMaximum,
   type Artifact,
+  type Agent,
   type LoadStage,
   type PayloadProfile,
   type Scenario,
@@ -72,6 +73,12 @@ const initialTheme = (): Theme => {
       ? "light"
       : "dark";
 };
+
+const agentIpv4Addresses = (agent: Agent | undefined): string[] =>
+  (agent?.inventory?.interfaces ?? [])
+    .flatMap((networkInterface) => networkInterface.addresses ?? [])
+    .map((address) => address.split("/")[0])
+    .filter((address) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address));
 
 function App() {
   const {
@@ -139,11 +146,20 @@ function App() {
     setPoints([]);
     setStatus("준비 중");
     try {
-      const preflight = await api<{ ok: boolean }>("/api/preflight", {
+      const preflight = await api<{
+        ok: boolean;
+        checks: { name: string; ok: boolean; detail: unknown }[];
+      }>("/api/preflight", {
         method: "POST",
         body: JSON.stringify(scenario),
       });
-      if (!preflight.ok) throw new Error("사전 검사에 실패했습니다.");
+      if (!preflight.ok) {
+        const failures = preflight.checks
+          .filter((check) => !check.ok)
+          .map((check) => `${check.name}: ${String(check.detail)}`)
+          .join(" · ");
+        throw new Error(`사전 검사 실패 — ${failures}`);
+      }
       await api("/api/scenarios", {
         method: "POST",
         body: JSON.stringify(scenario),
@@ -309,6 +325,16 @@ function App() {
   const networkRevisionMissing =
     scenario.path.kind === "managed_direct" &&
     scenario.path.profile_revision_id === "00000000-0000-0000-0000-000000000000";
+  const explicitPath = scenario.path.kind === "explicit_proxy" ? scenario.path : null;
+  const explicitPathBlocked =
+    explicitPath !== null &&
+    (!explicitPath.client_node_id ||
+      !explicitPath.client_bind_ip ||
+      !explicitPath.server_node_id ||
+      !explicitPath.server_listen_ip ||
+      !explicitPath.proxy_addr ||
+      !agents.some((agent) => agent.id === explicitPath.client_node_id && agent.online) ||
+      !agents.some((agent) => agent.id === explicitPath.server_node_id && agent.online));
   const tabs: [Tab, string, React.ElementType][] = [
     ["setup", "시험 구성", Layers3],
     ["live", "실시간 모니터링", Activity],
@@ -504,15 +530,19 @@ function App() {
                               patch({
                                 path:
                                   e.target.value === "explicit_proxy"
-                                    ? {
-                                        kind: "explicit_proxy",
-                                        client_node_id: agents[0]?.id ?? "node-1",
-                                        client_bind_ip: "192.0.2.10",
-                                        server_node_id: agents[1]?.id ?? agents[0]?.id ?? "node-2",
-                                        server_listen_ip: "192.0.2.20",
-                                        server_port: 8080,
-                                        proxy_addr: "proxy:3128",
-                                      }
+                                    ? (() => {
+                                        const client = agents[0];
+                                        const server = agents[1] ?? agents[0];
+                                        return {
+                                          kind: "explicit_proxy" as const,
+                                          client_node_id: client?.id ?? "",
+                                          client_bind_ip: agentIpv4Addresses(client)[0] ?? "",
+                                          server_node_id: server?.id ?? "",
+                                          server_listen_ip: agentIpv4Addresses(server)[0] ?? "",
+                                          server_port: 8080,
+                                          proxy_addr: "proxy:3128",
+                                        };
+                                      })()
                                     : {
                                         kind: "managed_direct",
                                         profile_revision_id: "00000000-0000-0000-0000-000000000000",
@@ -526,17 +556,96 @@ function App() {
                           </select>
                         </Field>
                         {scenario.path.kind === "explicit_proxy" && (
-                          <Field label="HTTP Proxy 주소">
-                            <input
-                              value={scenario.path.proxy_addr}
-                              onChange={(e) =>
-                                scenario.path.kind === "explicit_proxy" &&
-                                patch({ path: { ...scenario.path, proxy_addr: e.target.value } })
-                              }
-                            />
-                          </Field>
+                          <div className="grid gap-3 rounded-xl border border-line bg-inset p-3 sm:grid-cols-2">
+                            <Field label="Client Agent">
+                              <select
+                                value={scenario.path.client_node_id}
+                                onChange={(e) => {
+                                  if (scenario.path.kind !== "explicit_proxy") return;
+                                  const agent = agents.find((item) => item.id === e.target.value);
+                                  patch({
+                                    path: {
+                                      ...scenario.path,
+                                      client_node_id: e.target.value,
+                                      client_bind_ip: agentIpv4Addresses(agent)[0] ?? "",
+                                    },
+                                  });
+                                }}
+                              >
+                                <option value="">선택</option>
+                                {agents.map((agent) => (
+                                  <option key={agent.id} value={agent.id}>
+                                    {agent.id} · {agent.hostname}
+                                  </option>
+                                ))}
+                              </select>
+                            </Field>
+                            <Field label="Client source IP">
+                              <input
+                                value={scenario.path.client_bind_ip}
+                                placeholder="예: 10.10.1.10"
+                                onChange={(e) =>
+                                  scenario.path.kind === "explicit_proxy" &&
+                                  patch({
+                                    path: { ...scenario.path, client_bind_ip: e.target.value },
+                                  })
+                                }
+                              />
+                            </Field>
+                            <Field label="HTTP Proxy 주소">
+                              <input
+                                value={scenario.path.proxy_addr}
+                                placeholder="proxy.example:3128"
+                                onChange={(e) =>
+                                  scenario.path.kind === "explicit_proxy" &&
+                                  patch({ path: { ...scenario.path, proxy_addr: e.target.value } })
+                                }
+                              />
+                            </Field>
+                            <Field label="Server Agent">
+                              <select
+                                value={scenario.path.server_node_id}
+                                onChange={(e) => {
+                                  if (scenario.path.kind !== "explicit_proxy") return;
+                                  const agent = agents.find((item) => item.id === e.target.value);
+                                  patch({
+                                    path: {
+                                      ...scenario.path,
+                                      server_node_id: e.target.value,
+                                      server_listen_ip: agentIpv4Addresses(agent)[0] ?? "",
+                                    },
+                                  });
+                                }}
+                              >
+                                <option value="">선택</option>
+                                {agents.map((agent) => (
+                                  <option key={agent.id} value={agent.id}>
+                                    {agent.id} · {agent.hostname}
+                                  </option>
+                                ))}
+                              </select>
+                            </Field>
+                            <Field label="Server listen IP">
+                              <input
+                                value={scenario.path.server_listen_ip}
+                                placeholder="예: 10.20.1.20"
+                                onChange={(e) =>
+                                  scenario.path.kind === "explicit_proxy" &&
+                                  patch({
+                                    path: { ...scenario.path, server_listen_ip: e.target.value },
+                                  })
+                                }
+                              />
+                            </Field>
+                          </div>
                         )}
-                        <Field label="Server port">
+                        <Field
+                          label={
+                            scenario.path.kind === "explicit_proxy"
+                              ? "Server Agent 수신 포트"
+                              : "Server port"
+                          }
+                        >
                           <input
                             type="number"
                             min="1"
@@ -551,6 +660,12 @@ function App() {
                               })
                             }
                           />
+                          {scenario.path.kind === "explicit_proxy" && (
+                            <span className="mt-1 block text-[10px] text-dim">
+                              Proxy가 전달하거나 CONNECT할 Server Agent의 목적지 포트입니다. Proxy
+                              수신 포트와는 별개입니다.
+                            </span>
+                          )}
                         </Field>
                         <Field label="Wire 계측 인터페이스">
                           <input
@@ -1069,12 +1184,25 @@ function App() {
                     : "분석된 PCAP/PCAPNG를 선택해야 실행할 수 있습니다."}
                 </p>
               )}
+              {explicitPathBlocked && (
+                <p
+                  role="alert"
+                  className="mt-4 rounded-xl border border-warn/30 bg-warn/10 p-3 text-xs text-warn"
+                >
+                  명시적 프록시를 사용하려면 온라인 Client/Server Agent, 양쪽 IPv4 주소와 Proxy
+                  주소를 모두 입력해야 합니다.
+                </p>
+              )}
               <Button
                 variant="primary"
                 className="mt-5 w-full py-3"
                 onClick={start}
                 disabled={
-                  !!activeRun || agents.length < 2 || captureBlocked || networkRevisionMissing
+                  !!activeRun ||
+                  agents.length === 0 ||
+                  captureBlocked ||
+                  networkRevisionMissing ||
+                  explicitPathBlocked
                 }
               >
                 <Play size={15} />

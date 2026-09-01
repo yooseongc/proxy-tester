@@ -10,3 +10,6 @@ Run the basic environment from the repository root:
 docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml build
 docker compose -f docker/compose.yaml -f docker/compose.managed-direct.yaml up -d
 ```
+
+For the two-container VXLAN inline topology, see
+[`docs/VXLAN_INLINE_LAB.md`](../docs/VXLAN_INLINE_LAB.md).

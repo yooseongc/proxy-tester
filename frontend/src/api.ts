@@ -35,6 +35,11 @@ const apiMessageTranslations: Record<string, string> = {
   "IP pool overflows": "IP 풀 범위가 허용 가능한 주소 범위를 초과합니다.",
   "IP pool includes network/broadcast or leaves subnet":
     "IP 풀에 네트워크·브로드캐스트 주소가 포함되었거나 서브넷 범위를 벗어났습니다.",
+  "network plan token is single-use": "이 계획은 이미 사용되었습니다. 현재 상태로 다시 계획하세요.",
+  "invalid plan token": "계획과 적용 토큰이 일치하지 않습니다. 현재 상태로 다시 계획하세요.",
+  "network plan expired": "계획 토큰이 만료되었습니다. 현재 상태로 다시 계획하세요.",
+  "inventory changed after plan; create a new plan":
+    "계획 이후 인터페이스 상태가 변경되었습니다. 현재 상태로 다시 계획하세요.",
 };
 
 export function localizeApiMessage(message: string): string {

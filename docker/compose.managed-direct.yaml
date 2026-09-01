@@ -3,25 +3,25 @@ services:
     entrypoint: ["/bin/sh", "/managed-direct-entrypoint.sh"]
     command: ["/proxy-client"]
     environment:
-      PROXY_TESTER_TEST_IPV4_PREFIX: "172.31."
+      PROXY_TESTER_TEST_IPV4_PREFIX: "${PROXY_TESTER_TEST_IPV4_PREFIX:-198.18.200.}"
     networks:
       default: {}
       test-plane:
-        ipv4_address: 172.31.0.10
+        ipv4_address: "${PROXY_TESTER_TEST_CLIENT_IPV4:-198.18.200.10}"
 
   server:
     entrypoint: ["/bin/sh", "/managed-direct-entrypoint.sh"]
     command: ["/proxy-server"]
     environment:
-      PROXY_TESTER_TEST_IPV4_PREFIX: "172.31."
+      PROXY_TESTER_TEST_IPV4_PREFIX: "${PROXY_TESTER_TEST_IPV4_PREFIX:-198.18.200.}"
     networks:
       default: {}
       test-plane:
-        ipv4_address: 172.31.0.20
+        ipv4_address: "${PROXY_TESTER_TEST_SERVER_IPV4:-198.18.200.20}"
 
 networks:
   test-plane:
     internal: true
     ipam:
       config:
-        - subnet: 172.31.0.0/24
+        - subnet: "${PROXY_TESTER_TEST_SUBNET:-198.18.200.0/24}"

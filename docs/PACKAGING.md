@@ -16,8 +16,8 @@
 `packaging/build-release.sh`는 Docker의 고정 Rust 1.93 builder를 사용해 `x86_64-unknown-linux-musl` 바이너리와 frontend를 만들고 고정된 nfpm v2.43.4 container로 deb/rpm을 생성합니다.
 
 ```bash
-./packaging/build-release.sh 0.1.1
-./tests/native-package-smoke.sh dist/release/0.1.1
+./packaging/build-release.sh 0.1.2
+./tests/native-package-smoke.sh dist/release/0.1.2
 ```
 
 빌드 script는 요청 버전과 Cargo workspace 버전이 다르면 중단합니다. build commit은 바이너리에 주입되며 `proxy-control --version`, `/api/health`와 Agent 등록 정보로 확인할 수 있습니다.

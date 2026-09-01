@@ -9,6 +9,27 @@ use tokio::{
 
 use crate::{telemetry::Counters, tls};
 
+pub(crate) async fn preflight_proxy(
+    proxy_addr: &str,
+    source_ip: std::net::IpAddr,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let remote = tokio::net::lookup_host(proxy_addr)
+        .await?
+        .find(|address| address.is_ipv4() == source_ip.is_ipv4())
+        .context("proxy address has no route-compatible address")?;
+    let socket = if remote.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.bind(SocketAddr::new(source_ip, 0))?;
+    tokio::time::timeout(Duration::from_millis(timeout_ms), socket.connect(remote))
+        .await?
+        .context("proxy TCP preflight failed")?;
+    Ok(())
+}
+
 pub(crate) trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
@@ -156,5 +177,19 @@ mod tests {
         assert!(request.starts_with(b"CONNECT "));
         assert_eq!(counters.tx.load(Ordering::Relaxed), request.len() as u64);
         assert_eq!(counters.rx.load(Ordering::Relaxed), 45);
+    }
+
+    #[tokio::test]
+    async fn proxy_preflight_binds_the_requested_source_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.unwrap().1 });
+        preflight_proxy(&address.to_string(), "127.0.0.1".parse().unwrap(), 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.await.unwrap().ip(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 }
